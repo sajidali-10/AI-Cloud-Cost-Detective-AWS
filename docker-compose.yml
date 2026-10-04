@@ -1,0 +1,153 @@
+# docker-compose.yml — AI Cloud Cost Detective (Phase 0)
+# Single-host Docker Compose. Only nginx publishes port 80 publicly.
+# postgres and litellm are reachable only on the internal `internal` network.
+
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    container_name: cost-detective-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      POSTGRES_DB: postgres
+      COST_DETECTIVE_DB: ${COST_DETECTIVE_DB}
+      COST_DETECTIVE_DB_USER: ${COST_DETECTIVE_DB_USER}
+      COST_DETECTIVE_DB_PASSWORD: ${COST_DETECTIVE_DB_PASSWORD}
+      LITELLM_DB: ${LITELLM_DB}
+      LITELLM_DB_USER: ${LITELLM_DB_USER}
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init/create-databases.sh:/docker-entrypoint-initdb.d/10-create-databases.sh:ro
+    networks:
+      - internal
+    # No `ports:` — PostgreSQL is internal-only.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  litellm:
+    # Pinned LiteLLM Gateway image (recorded in docs/phase0-report.md).
+    image: ghcr.io/berriai/litellm:v1.104.0
+    container_name: cost-detective-litellm
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://${LITELLM_DB_USER}:${LITELLM_DB_PASSWORD}@postgres:5432/${LITELLM_DB}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    networks:
+      - internal
+    # No `ports:` — LiteLLM is internal-only. Local debug via `docker compose exec`.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/localhost/4000 || exit 1; printf 'GET /health/readiness HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; grep -i ready <&3 || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: cost-detective-backend:phase0
+    container_name: cost-detective-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_started
+      litellm:
+        condition: service_started
+    environment:
+      APP_ENV: ${APP_ENV}
+      APP_SECRET_KEY: ${APP_SECRET_KEY}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_ADMIN_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_ADMIN_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      COST_DETECTIVE_DB: ${COST_DETECTIVE_DB}
+      COST_DETECTIVE_DB_USER: ${COST_DETECTIVE_DB_USER}
+      COST_DETECTIVE_DB_PASSWORD: ${COST_DETECTIVE_DB_PASSWORD}
+      LITELLM_DB: ${LITELLM_DB}
+      LITELLM_DB_USER: ${LITELLM_DB_USER}
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD}
+      LITELLM_HOST: ${LITELLM_HOST}
+      LITELLM_PORT: ${LITELLM_PORT}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    networks:
+      - internal
+    # No `ports:` — backend is reached only via Nginx.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=3); sys.exit(0 if r.status==200 else 1)\""
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: cost-detective-frontend:phase0
+    container_name: cost-detective-frontend
+    restart: unless-stopped
+    networks:
+      - internal
+    # No `ports:` — frontend is served by Nginx on /.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -qO- http://localhost:8080/ || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  nginx:
+    image: nginx:1.27.4-alpine
+    container_name: cost-detective-nginx
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - internal
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -qO- http://localhost:80/ || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: cost-detective-pgdata

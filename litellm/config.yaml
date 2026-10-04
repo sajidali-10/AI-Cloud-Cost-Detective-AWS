@@ -1,0 +1,27 @@
+# litellm/config.yaml — Phase 0 minimal configuration.
+#
+# Zero configured provider models on purpose: Phase 0 must NOT call any LLM,
+# must NOT spend any AI API credits, and must NOT contain fake API keys or
+# fake mock responses. The gateway is exercised only by its /health/readiness
+# endpoint against the `litellm` PostgreSQL database.
+#
+# In later phases this file will define model aliases such as:
+#   cost-detective-free
+#   cost-detective-balanced
+#   cost-detective-premium
+# wired to real providers (OpenRouter, Google Gemini, OpenAI, Anthropic,
+# AWS Bedrock, Ollama). None of that is implemented here.
+
+model_list: []
+
+litellm_settings:
+  drop_params: true
+  telemetry: false
+
+general_settings:
+  # Persist LiteLLM metadata + spend tracking in the litellm PostgreSQL DB.
+  database_url_env: DATABASE_URL
+
+router_settings:
+  num_retries: 1
+  timeout: 30
