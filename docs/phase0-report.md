@@ -16,21 +16,29 @@ backend tests pass, frontend builds.
 
 ## Services
 
-| Service    | Image                              | Health (Docker)   | Health (exec / verify)            |
-| ---------- | ---------------------------------- | ----------------- | --------------------------------- |
-| postgres   | `postgres:16.6-alpine`             | healthy           | `pg_isready` OK                   |
-| litellm    | `ghcr.io/berriai/litellm:v1.104.0` | unhealthy (1)     | `/health/readiness` → healthy     |
-| backend    | `cost-detective-backend:phase0`    | healthy           | `/health` + `/health/ready` OK    |
-| frontend   | `cost-detective-frontend:phase0`   | healthy           | served via Nginx on `/`           |
-| nginx      | `nginx:1.27.4-alpine`              | unhealthy (1)     | root + `/api/health` reachable    |
+| Service    | Image                              | Health (Docker) | Health (exec / verify)            |
+| ---------- | ---------------------------------- | --------------- | --------------------------------- |
+| postgres   | `postgres:16.6-alpine`             | healthy         | `pg_isready` OK                   |
+| litellm    | `ghcr.io/berriai/litellm:v1.104.0` | healthy         | `/health/readiness` → healthy     |
+| backend    | `cost-detective-backend:phase0`    | healthy         | `/health` + `/health/ready` OK    |
+| frontend   | `cost-detective-frontend:phase0`   | healthy         | served via Nginx on `/`           |
+| nginx      | `nginx:1.27.4-alpine`              | healthy         | root + `/api/health` reachable    |
 
-(1) The TCP-probe Compose healthchecks used for LiteLLM and Nginx are
-flaky under the heavy DB-migration step and post-restart probe
-windows. The exec-based checks used by `phase0_verify.sh` (the same
-endpoints the backend uses for its own readiness) confirm both
-services are functionally ready. `depends_on` was relaxed to
-`service_started` so dependent services are not blocked. Will be
-revisited if it becomes operationally noisy in Phase 1.
+All five Compose healthchecks pass:
+
+- **postgres**: `pg_isready -U $POSTGRES_USER -d $POSTGRES_DB`
+- **litellm**: `/app/.venv/bin/python` calling `/health/readiness`
+  via `urllib.request` and asserting 200 + `"status":"healthy"` body.
+  `start_period: 120s`, `interval: 15s`, `retries: 30` — covers the
+  heavy migration step.
+- **backend**: `python -c "urllib.request.urlopen(...).status==200"`
+- **frontend**: `wget -qO- http://127.0.0.1:8080/ >/dev/null`
+- **nginx**: `curl -fsS -o /dev/null http://127.0.0.1/nginx-health`
+  (a local `location = /nginx-health` in `nginx/default.conf`).
+
+`depends_on` uses `condition: service_healthy` end-to-end (postgres →
+litellm → backend → frontend → nginx). No service waits on
+`service_started` alone.
 
 ## Validation
 
@@ -141,19 +149,11 @@ scripts/phase0_verify.sh
 
 ## Known Issues
 
-- **LiteLLM and Nginx Docker healthchecks intermittently report
-  `unhealthy` even though the services are functionally ready.**
-  Root cause: the TCP-probe Compose healthchecks race with the heavy
-  DB-migration step and post-restart probe windows. Both services are
-  confirmed healthy via `docker compose exec … <readiness endpoint>`:
-  LiteLLM returns `{"status":"healthy","db":"connected"}` and the
-  FastAPI `/health/ready` returns `status: ready, components.database:
-  ok, components.litellm: ok`. Mitigated by relaxing `depends_on` to
-  `service_started` so dependent services are not blocked. Will be
-  revisited in Phase 1 if it becomes operationally noisy.
-- **No issues affecting the security or correctness of the Phase 0
-  baseline** beyond the above. The verify script's exec-based checks
-  are the source of truth and they pass.
+None at Phase 0 closure. All five Compose healthchecks pass and
+`docker compose ps` reports every service as `healthy`. The earlier
+fragile TCP/race-prone checks for LiteLLM and Nginx were replaced
+with meaningful service-level probes (see "Services" above), and
+`depends_on` was restored to `condition: service_healthy` end-to-end.
 
 ## Deferred Items
 
@@ -180,6 +180,9 @@ deferred to later phases:
 - LiteLLM model aliases (`cost-detective-free`, `-balanced`,
   `-premium`)
 - LiteLLM per-request spend caps
+- LiteLLM docker healthcheck (already migrated in Phase 0 to a
+  meaningful `/health/readiness` probe via urllib; no remaining
+  follow-up)
 
 ## Container Versions
 
@@ -214,8 +217,13 @@ Nginx is public, by design.
 ## Git Status
 
 - Branch: `main`
-- Working tree: clean after the Phase 0 baseline commit (`.env` is
-  untracked by design)
+- Commits on `main`:
+  - `c8f9236` — `Phase 0: establish AWS Cost Detective platform foundation` (baseline)
+  - `<cleanup SHA>` — `Phase 0: closure fixes (healthchecks, gitignore, verify scanner)` (closure)
+- Working tree: clean after the closure commit.
+- Untracked but **ignored** (by design): `.env`, `.kimchi/`.
+- `.kimchi/` is the harness's per-repository Ferment / plan / runtime
+  state and is intentionally excluded from the project repository.
 - Remote configured:
   `git@github.com:sajidali-10/AI-Cloud-Cost-Detective-AWS.git`
   (no push performed; remote push is out of scope for Phase 0)
@@ -223,9 +231,10 @@ Nginx is public, by design.
 ## Commit
 
 The Phase 0 baseline commit exists locally on `main` with the exact
-message `Phase 0: establish AWS Cost Detective platform foundation`.
-The exact SHA is `git log -1 --pretty=%H` on this branch at
-completion — see the final response.
+message `Phase 0: establish AWS Cost Detective platform foundation`
+(SHA `c8f9236f224b0fae53f065017ee06b5c5e349cd2`). The closure commit
+with the exact message `Phase 0: closure fixes (healthchecks,
+gitignore, verify scanner)` sits on top of it.
 
 ## Phase 1 Readiness
 

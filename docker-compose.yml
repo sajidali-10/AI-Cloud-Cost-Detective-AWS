@@ -52,12 +52,14 @@ services:
     # No `ports:` — LiteLLM is internal-only. Local debug via `docker compose exec`.
     healthcheck:
       test:
-        - CMD-SHELL
-        - "exec 3<>/dev/tcp/localhost/4000 || exit 1; printf 'GET /health/readiness HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; grep -i ready <&3 || exit 1"
+        - CMD
+        - /app/.venv/bin/python
+        - -c
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:4000/health/readiness',timeout=5); b=r.read().lower(); sys.exit(0 if r.status==200 and (b'\"status\":\"healthy\"' in b or b'ready' in b) else 1)"
       interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 60s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
 
   backend:
     build:
@@ -68,9 +70,9 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
       litellm:
-        condition: service_started
+        condition: service_healthy
     environment:
       APP_ENV: ${APP_ENV}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
@@ -94,8 +96,10 @@ services:
     # No `ports:` — backend is reached only via Nginx.
     healthcheck:
       test:
-        - CMD-SHELL
-        - "python -c \"import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=3); sys.exit(0 if r.status==200 else 1)\""
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=3); sys.exit(0 if r.status==200 else 1)"
       interval: 15s
       timeout: 5s
       retries: 10
@@ -114,7 +118,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - "wget -qO- http://localhost:8080/ || exit 1"
+        - "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"
       interval: 15s
       timeout: 5s
       retries: 10
@@ -126,9 +130,9 @@ services:
     restart: unless-stopped
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
       frontend:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "80:80"
     volumes:
@@ -137,8 +141,12 @@ services:
       - internal
     healthcheck:
       test:
-        - CMD-SHELL
-        - "wget -qO- http://localhost:80/ || exit 1"
+        - CMD
+        - curl
+        - -fsS
+        - -o
+        - /dev/null
+        - http://127.0.0.1/nginx-health
       interval: 15s
       timeout: 5s
       retries: 10

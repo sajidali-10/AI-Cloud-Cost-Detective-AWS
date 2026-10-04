@@ -114,7 +114,19 @@ if [[ -z "${PUB}" ]]; then ok "litellm not publicly exposed"; else bad "litellm 
 
 # ---------- 7. Secret scan ----------
 note "Secret-pattern scan of Git-tracked files"
-SECRET_HITS=$(git -C "${REPO_ROOT}" grep -nIE 'AKIA|AWS_SECRET_ACCESS_KEY=|OPENAI_API_KEY=|ANTHROPIC_API_KEY=|GEMINI_API_KEY=|LITELLM_MASTER_KEY=sk-[A-Za-z0-9]{20,}' 2>/dev/null || true)
+# Look for real-looking secret values (variable name = sufficiently long value).
+# Exclude this scanner itself and the docs that legitimately describe the patterns.
+SECRET_HITS=$(git -C "${REPO_ROOT}" grep -nIE \
+  --exclude='phase0_verify.sh' \
+  --exclude='security.md' \
+  --exclude='phase0-report.md' \
+  -e 'AKIA[0-9A-Z]{16}' \
+  -e 'AWS_SECRET_ACCESS_KEY=[A-Za-z0-9/+=]{40}' \
+  -e 'OPENAI_API_KEY=[A-Za-z0-9_\-]{20,}' \
+  -e 'ANTHROPIC_API_KEY=[A-Za-z0-9_\-]{20,}' \
+  -e 'GEMINI_API_KEY=[A-Za-z0-9_\-]{20,}' \
+  -e 'LITELLM_MASTER_KEY=sk-[A-Za-z0-9_\-]{20,}' \
+  2>/dev/null || true)
 if [[ -z "${SECRET_HITS}" ]]; then
   ok "no obvious secrets in tracked files"
 else
