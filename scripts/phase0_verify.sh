@@ -142,6 +142,22 @@ else
   bad "backend tests failed"
 fi
 
+# ---------- 8a. Phase 1: AWS identity smoke ----------
+note "Phase 1: AWS identity endpoint reachable"
+# NOTE: do NOT use `-f` here - the endpoint returns HTTP 502 (sanitized) when
+# AWS credentials are absent, and we still want to read the body.
+AWS_IDENTITY=$(curl -sS --max-time 10 http://127.0.0.1/api/aws/identity 2>/dev/null || true)
+# Accept either a real STS success (HTTP 200 with account/arn/user_id) or a
+# sanitized credential error (HTTP 502 with error_code). The route never 500s
+# when no credentials are present.
+if echo "${AWS_IDENTITY}" | grep -q '"account":'; then
+  ok "AWS identity resolved (real STS call)"
+elif echo "${AWS_IDENTITY}" | grep -q '"error_code"'; then
+  ok "AWS identity endpoint reachable (sanitized credential error)"
+else
+  bad "AWS identity endpoint unreachable: ${AWS_IDENTITY:0:200}"
+fi
+
 # ---------- 9. Frontend build ----------
 note "Frontend production build"
 cd "${REPO_ROOT}/frontend"

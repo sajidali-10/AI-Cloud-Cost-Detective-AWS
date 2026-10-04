@@ -18,6 +18,7 @@ from fastapi import FastAPI, Response
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.aws import router as aws_router
 from app.core.config import get_settings
 
 # --- Structured logging (JSON-ish key=value lines) ---
@@ -33,6 +34,11 @@ app = FastAPI(
     version="0.1.0",
     description="Phase 0 platform foundation. No AWS / no LLM calls.",
 )
+
+# Phase 1: read-only AWS identity + resource discovery router.
+# Mounted at /aws/identity and /aws/resources. Nginx strips the /api/ prefix
+# before proxying, so /api/aws/identity (public) becomes /aws/identity inside.
+app.include_router(aws_router)
 
 
 def _safe_component_status(name: str, exc: Exception) -> str:

@@ -83,6 +83,17 @@ under "Deferred to later phase" in `docs/phase0-report.md`.
 
 ## Next planned phase
 
-Phase 1 will add read-only AWS integration via the standard credential provider
-chain (preferring an EC2 IAM instance role), plus minimal JWT auth and the
-report history foundation. None of that is implemented yet.
+Phase 1 slice (1) — **AWS Identity and Resource Discovery** — is shipped:
+
+- `GET /api/aws/identity` returns STS caller identity (Account / ARN / UserId) via the
+  Boto3 default credential chain (no AWS keys in env).
+- `GET /api/aws/resources` enumerates EC2, EBS, Elastic IPs, NAT Gateways, ELBv2,
+  RDS, Lambda, and S3 bucket metadata, with optional Resource Explorer + Resource
+  Groups Tagging API enrichment. Per-service Boto3 errors stay in the response
+  body instead of failing the call.
+- Region is selectable per request via `?region=` with fallback to `AWS_DEFAULT_REGION`.
+- Fully mock-tested; live validation is a documented runbook (`docs/phase1-aws-discovery.md`).
+
+Still deferred: JWT auth / signup / login, report history persistence, Cost Explorer,
+CloudWatch, Compute Optimizer, Cost Optimization Hub, AI/LLM analysis, frontend
+dashboard, WebSockets, Terraform/IaC, automated AWS remediation, multi-region fanout.
