@@ -49,10 +49,14 @@ CE_DATE_FORMAT: str = "%Y-%m-%d"
 # meaning of every dollar figure, so the metric is hard-coded here.
 COST_METRIC: str = "UnblendedCost"
 
-# Per-Cost-Explorer-page maximum.  We keep it below the documented
-# service maximum so a single response always fits comfortably inside
-# FastAPI's default JSON body budget.
-CE_PAGE_SIZE: int = 100000
+# Cost Explorer paginates ``get_cost_and_usage`` via ``NextPageToken``
+# only — the operation does NOT accept ``MaxResults`` as a request
+# parameter (it would be rejected by ParamValidator with a
+# ``ValidationException``).  Page size is controlled server-side; we
+# just keep walking ``NextPageToken`` until it is empty.  This constant
+# is retained only for backward-compatibility (tests import it); it is
+# no longer sent on the wire.
+CE_PAGE_SIZE: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -219,14 +223,20 @@ def _paginate(
 
 
 def _sum_unblended_cost(results_by_time: List[dict[str, Any]]) -> Decimal:
+    """Sum the period-level ``Total[UnblendedCost].Amount`` across pages.
+
+    This helper exists for *ungrouped* ``GetCostAndUsage`` responses
+    (e.g. ``get_total_and_previous``).  In an ungrouped response every
+    ``ResultsByTime`` block has ``Groups == []`` and a single ``Total``
+    field that already reflects the whole account for that period.
+    Summing ``Groups`` here would be wrong on two counts: (a) the
+    grouped response is handled by ``_aggregate_grouped`` instead, and
+    (b) iterating Groups on an ungrouped response always yields zero.
+    For grouped responses the caller MUST use ``_aggregate_grouped``
+    and never reach into ``_sum_unblended_cost``.
+    """
     total = Decimal("0")
     for period_block in results_by_time:
-        for group in period_block.get("Groups", []) or []:
-            metrics = group.get("Metrics", {}) or {}
-            unblended = metrics.get(COST_METRIC, {}) or {}
-            amount = unblended.get("Amount", "0")
-            total += Decimal(str(amount))
-        # Periods with no groups still carry a Total at the period level.
         total_block = period_block.get("Total", {}) or {}
         unblended = total_block.get(COST_METRIC, {}) or {}
         amount = unblended.get("Amount", "0")
@@ -258,7 +268,6 @@ def get_total_and_previous(
         "TimePeriod": {"Start": cur_str[0], "End": cur_str[1]},
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
-        "MaxResults": CE_PAGE_SIZE,
     }
     pages = list(_paginate(client=client, method_name="get_cost_and_usage", base_kwargs=base))
     current_total = _sum_unblended_cost(pages[0].get("ResultsByTime", []) if pages else [])
@@ -267,7 +276,6 @@ def get_total_and_previous(
         "TimePeriod": {"Start": prev_str[0], "End": prev_str[1]},
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
-        "MaxResults": CE_PAGE_SIZE,
     }
     pages_prev = list(
         _paginate(client=client, method_name="get_cost_and_usage", base_kwargs=base_prev)
@@ -288,7 +296,6 @@ def get_daily_trend(
         "TimePeriod": {"Start": cur_str[0], "End": cur_str[1]},
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
-        "MaxResults": CE_PAGE_SIZE,
     }
     out: List[Tuple[date, Decimal, str]] = []
     unit: str = "USD"
@@ -318,7 +325,6 @@ def get_by_service(
         "Granularity": "MONTHLY",
         "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
         "Metrics": [COST_METRIC],
-        "MaxResults": CE_PAGE_SIZE,
     }
     return _aggregate_grouped(client, base)
 
@@ -339,7 +345,6 @@ def get_by_region(
         "Granularity": "MONTHLY",
         "GroupBy": [{"Type": "DIMENSION", "Key": "REGION"}],
         "Metrics": [COST_METRIC],
-        "MaxResults": CE_PAGE_SIZE,
     }
     return _aggregate_grouped(client, base)
 
