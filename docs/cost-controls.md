@@ -81,3 +81,21 @@ Phase 1 and later phases will:
 - Cap LiteLLM per-request spend in `litellm/config.yaml` once provider
   models are introduced.
 - Surface per-account daily/weekly spend summaries in the application UI.
+
+## Phase 3 additions
+
+* **Compute Optimizer.** Free at the API level for `Get*` / `List*`
+  calls.  We never call `UpdateEnrollmentStatus`, which can opt the
+  account into enhanced infrastructure metrics (a paid feature).
+* **Cost Optimization Hub.** Free for AWS-managed recommendations.
+  `ListRecommendations` and `ListRecommendationSummaries` are
+  paginated with a small `MaxResults` cap (100) so we stay well
+  under any rate limit.  We never call `UpdatePreferences` or the
+  `*RecommendationPreferences` family of operations.
+* **No local pricing calculations.** The deterministic rule engine
+  never computes a dollar savings figure.  When AWS supplies one
+  we surface it; when it does not, `savings_source=UNKNOWN` is
+  recorded so the savings aggregate stays accurate.
+* **CloudWatch reuse.** The optimization route reuses the Phase 2
+  `batch_query` path so we do not double-bill for the same metric
+  data.

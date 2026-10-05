@@ -50,8 +50,8 @@ make up
 # 3. Apply the Alembic migrations (creates cost_cache)
 make migrate
 
-# 4. Run the Phase 2 verifier end-to-end (Phase 1 -> Phase 2)
-make verify-phase2
+# 4. Run the Phase 3 verifier end-to-end (Phase 1 -> Phase 2 -> Phase 3)
+make verify-phase3
 
 # 5. Open http://localhost (or your server's public IP, port 80)
 ```
@@ -76,6 +76,9 @@ never as a 5xx that destroys valid data from other sources.
 | GET    | `/api/aws/costs`      | `?days=7\|30\|60\|90`                     | Cost Explorer aggregate (total / daily / by-service / by-region) with read-through cache |
 | POST   | `/api/aws/utilization`| `{region, lookback_days, resource_types?}` | CloudWatch utilization per resource with data_quality    |
 | POST   | `/api/aws/evidence`   | `{region, days, resource_types?}`         | Phase 1 + Cost Explorer + CloudWatch, composed deterministically |
+| GET    | `/api/aws/optimization/capabilities`  | `?region=us-east-1` (optional)            | Compute Optimizer + Cost Optimization Hub enrollment state + supported resource types / lookbacks |
+| GET    | `/api/aws/optimization/recommendations` | `?region=&days=7\|30\|60\|90`           | Deduplicated recommendations from CO + COH + deterministic rules |
+| GET    | `/api/aws/optimization/summary`       | `?region=&days=7\|30\|60\|90`           | Aggregated counts + savings by resource type / action / source / confidence |
 
 ### `/api/aws/costs` example
 
@@ -116,6 +119,7 @@ make migrate         # apply Alembic migrations (Phase 2 cost_cache)
 make verify          # Phase 0 verifier (platform foundation)
 make verify-phase1   # Phase 1 verifier (AWS identity + resource discovery)
 make verify-phase2   # Phase 2 verifier (cost + utilization + evidence + cache)
+make verify-phase3   # Phase 3 verifier (optimization intelligence)
 make down            # stop the stack (keeps volumes)
 make clean           # stop AND remove volumes (destructive; 5s grace)
 ```

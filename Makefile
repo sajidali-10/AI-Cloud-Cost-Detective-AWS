@@ -52,6 +52,9 @@ verify-phase1:
 verify-phase2:
 	bash scripts/phase2_verify.sh
 
+verify-phase3:
+	bash scripts/phase3_verify.sh
+
 secrets:
 	bash scripts/generate_dev_secrets.sh
 

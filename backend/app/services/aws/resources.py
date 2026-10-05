@@ -113,12 +113,15 @@ def list_ebs_volumes(region: Optional[str]) -> ServiceResult:
         items = []
         resp = client.describe_volumes()
         for v in resp.get("Volumes", []):
+            attachments = v.get("Attachments") or []
             items.append(
                 EbsVolume(
                     volume_id=v.get("VolumeId"),
                     size_gb=v.get("Size"),
                     state=v.get("State"),
                     region=region,
+                    attachments=len(attachments),
+                    availability_zone=v.get("AvailabilityZone"),
                     tags=_normalize_tags(v.get("Tags")),
                 ).model_dump(mode="json")
             )
@@ -139,6 +142,10 @@ def list_elastic_ips(region: Optional[str]) -> ServiceResult:
                     public_ip=a.get("PublicIp"),
                     allocation_id=a.get("AllocationId"),
                     region=region,
+                    association_id=a.get("AssociationId"),
+                    instance_id=a.get("InstanceId"),
+                    network_interface_id=a.get("NetworkInterfaceId"),
+                    private_ip_address=a.get("PrivateIpAddress"),
                     tags=_normalize_tags(a.get("Tags")),
                 ).model_dump(mode="json")
             )

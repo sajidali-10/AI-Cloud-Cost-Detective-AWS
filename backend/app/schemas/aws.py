@@ -34,12 +34,22 @@ class EbsVolume(_TaggedModel):
     size_gb: Optional[int] = None
     state: Optional[str] = None
     region: Optional[str] = None
+    # Phase 3 — additive fields for the deterministic EBS rule.
+    attachments: Optional[int] = None
+    availability_zone: Optional[str] = None
 
 
 class ElasticIp(_TaggedModel):
     public_ip: str
     allocation_id: Optional[str] = None
     region: Optional[str] = None
+    # Phase 3 — additive fields so the deterministic EIP rule has a
+    # real signal for ``associated vs. unassociated``.  ``describe_addresses``
+    # already returns these; Phase 1 simply was not surfacing them.
+    association_id: Optional[str] = None
+    instance_id: Optional[str] = None
+    network_interface_id: Optional[str] = None
+    private_ip_address: Optional[str] = None
 
 
 class NatGateway(_TaggedModel):

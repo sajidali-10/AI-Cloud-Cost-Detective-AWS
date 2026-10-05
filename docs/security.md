@@ -106,3 +106,33 @@ if any match is found:
 - WAF, rate limiting beyond Nginx defaults, or DDoS protection.
 - Intrusion detection, audit logging at the application layer.
 - AWS IAM role provisioning (will be done in Phase 1 on the EC2 host).
+
+## Phase 3 additions
+
+* **No AWS mutation API is ever called.** The Phase 3 verifier
+  explicitly greps the source tree for the four forbidden
+  optimization operations — `update_enrollment_status`,
+  `update_preferences`, `put_recommendation_preferences`,
+  `delete_recommendation_preferences` — and any other call site
+  whose prefix matches `create_`, `delete_`, `put_`, `update_`,
+  `modify_`, `terminate`, `stop_`, `start_`, `attach_`, `detach_`,
+  `associate_`, `disassociate_`, `release_`, `enable_`, `disable_`,
+  `reboot_`, `restore_`, `reset_`, `cancel_`, `send_`,
+  `publish_`, `invoke_`.  Database writes (the Phase 2 cost cache)
+  are unaffected.
+* **No AI / LiteLLM call paths in Phase 3.** The verifier greps the
+  Phase 3 source tree for `litellm`, `openai`, `openrouter`,
+  `gemini`, `anthropic`, `LLM`, `completion`.  Phase 3 is purely
+  deterministic and AWS-native.
+* **Recommendation IDs are stable and never expose AWS keys.** The
+  public `recommendation_id` is a SHA-256 of
+  `(account_id, region, resource_id, action.value)`; AWS
+  `recommendationId` is captured only in the `aws_recommendation_ids`
+  list (not used as a primary key) and never persisted.
+* **Per-source failures never destroy valid recommendations.** Each
+  AWS-native source emits a structured `OptimizationWarning` on
+  failure and the orchestrator continues to compose the deduplicated
+  list from the remaining sources.
+* **Capabilities endpoint is the truth source.** It surfaces the
+  enrollment state of every AWS-native source so a caller can
+  decide whether deterministic rules are the only signal available.

@@ -26,6 +26,7 @@ from app.api.aws import router as aws_router
 from app.api import aws_costs  # noqa: F401  (registers /api/aws/costs)
 from app.api import aws_utilization  # noqa: F401  (registers /api/aws/utilization)
 from app.api import aws_evidence  # noqa: F401  (registers /api/aws/evidence)
+from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimization/*)
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -40,7 +41,7 @@ settings = get_settings()
 app = FastAPI(
     title="AI Cloud Cost Detective — Backend",
     version="0.1.0",
-    description="Phase 0 platform foundation. No AWS / no LLM calls.",
+    description="Phase 3 AWS optimization intelligence (read-only).",
 )
 
 # Phase 1: read-only AWS identity + resource discovery router.
