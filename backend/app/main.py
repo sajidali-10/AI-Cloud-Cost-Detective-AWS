@@ -15,11 +15,19 @@ from typing import Any, Dict
 
 import httpx
 from fastapi import FastAPI, Response
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.aws import router as aws_router
+# Phase 2: cost + utilization + evidence routes.  Importing these
+# modules is what triggers their @aws_router.<verb> decorators, which
+# in turn registers the routes on the FastAPI app.  The modules are
+# ordered to match the spec (costs -> utilization -> evidence).
+from app.api import aws_costs  # noqa: F401  (registers /api/aws/costs)
+from app.api import aws_utilization  # noqa: F401  (registers /api/aws/utilization)
+from app.api import aws_evidence  # noqa: F401  (registers /api/aws/evidence)
 from app.core.config import get_settings
+from app.db.session import get_engine
 
 # --- Structured logging (JSON-ish key=value lines) ---
 logging.basicConfig(
@@ -51,12 +59,19 @@ def _safe_component_status(name: str, exc: Exception) -> str:
 
 
 def _check_database() -> str:
-    """Return 'ok' if SELECT 1 succeeds, else 'error'."""
+    """Return 'ok' if SELECT 1 succeeds, else 'error'.
+
+    Phase 2: reuses the process-wide engine from :mod:`app.db.session`
+    rather than building a throwaway engine per probe.  The engine is
+    created once at import time and shared with the cost-cache layer
+    added by Phase 2.  ``engine.dispose()`` is intentionally NOT
+    called here — disposing would invalidate the cache layer's
+    connection pool.
+    """
     try:
-        engine = create_engine(settings.database_url, pool_pre_ping=True)
+        engine = get_engine()
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        engine.dispose()
         return "ok"
     except (SQLAlchemyError, OSError) as exc:
         return _safe_component_status("database", exc)

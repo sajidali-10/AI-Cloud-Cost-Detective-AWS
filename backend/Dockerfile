@@ -20,6 +20,21 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Copy the rest of the source.
 COPY app /app/app
+COPY alembic /app/alembic
+COPY alembic.ini /app/alembic.ini
+COPY tests /app/tests
+COPY pytest.ini /app/pytest.ini
+
+# Pre-create ``/app/.pytest_cache`` so the non-root ``app`` user can
+# write pytest's runtime cache without having to ``chmod 777`` on
+# ``/app``.  The parent directory ``/app`` stays root-owned so the
+# running application cannot mutate its own source tree; only the
+# cache subdirectory is handed over to ``app``.  pytest.ini leaves
+# ``cache_dir`` at its default (``<rootdir>/.pytest_cache``) so
+# local development and CI share the same configuration.
+RUN mkdir -p /app/.pytest_cache \
+    && chown app:app /app/.pytest_cache \
+    && chmod 755 /app/.pytest_cache
 
 # Drop privileges.
 USER app

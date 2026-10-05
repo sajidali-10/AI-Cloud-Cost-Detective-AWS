@@ -16,7 +16,6 @@ htmlcov
 *.log
 .idea
 .vscode
-tests
 *.md
 .git
 .gitignore
