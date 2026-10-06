@@ -27,11 +27,13 @@ from decimal import Decimal
 from typing import Any, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
 
 from app.api.aws import router as aws_router
+from app.api.deps import require_role
 from app.core.config import get_settings
+from app.db.models import AppUser
 from app.schemas.cost import (
     CacheStatus,
     CostPeriod,
@@ -94,6 +96,7 @@ def get_aws_costs(
             f"{sorted(ALLOWED_LOOKBACK_DAYS)}. Any other value yields 422."
         ),
     ),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     """Return the Cost Explorer report for the requested lookback window."""
     if days not in ALLOWED_LOOKBACK_DAYS:

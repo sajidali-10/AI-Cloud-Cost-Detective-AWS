@@ -18,10 +18,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
 
+from app.api.deps import require_role
 from app.core.config import get_settings
+from app.db.models import AppUser
 from app.services.aws.enrichment import collect_enrichment
 from app.services.aws.identity import AwsIdentityError, get_caller_identity
 from app.services.aws.resources import enumerate_all_services
@@ -43,6 +45,7 @@ def get_aws_identity(
             "Single-region only: multi-region discovery is deferred."
         ),
     ),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     """Return the caller's AWS identity resolved via the default credential chain.
 
@@ -80,6 +83,7 @@ def get_aws_resources(
             "Single-region only: multi-region discovery is deferred."
         ),
     ),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     """Aggregate per-service resource inventory plus optional enrichment.
 

@@ -14,7 +14,8 @@ import os
 from typing import Any, Dict
 
 import httpx
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -30,6 +31,11 @@ from app.api import aws_costs  # noqa: F401  (registers /api/aws/costs)
 from app.api import aws_utilization  # noqa: F401  (registers /api/aws/utilization)
 from app.api import aws_evidence  # noqa: F401  (registers /api/aws/evidence)
 from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimization/*)
+# Phase 5A: authentication + admin user management routers.  These
+# are mounted with their own prefixes (/auth, /admin/users); nginx
+# strips /api/ as usual.
+from app.api.auth import router as auth_router
+from app.api.admin_users import router as admin_users_router
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -57,6 +63,33 @@ app.include_router(aws_router)
 
 # Phase 4: AI Cost Analyst router (own /ai prefix; Nginx strips /api/).
 app.include_router(ai_routes.router)
+
+# Phase 5A: authentication + admin user management routers.  Mounted
+# with their own prefixes (/auth, /admin/users); nginx strips /api/.
+app.include_router(auth_router)
+app.include_router(admin_users_router)
+
+
+# ---------------------------------------------------------------------------
+# Flatten HTTPException ``detail`` dicts into the top-level response
+# body so auth/RBAC errors share the same envelope as the rest of
+# the API (``{status, error_code, message, ...}``).
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail
+    if isinstance(detail, dict) and {"status", "error_code", "message"}.issubset(set(detail.keys())):
+        body: Dict[str, Any] = {k: v for k, v in detail.items() if k != "headers"}
+    else:
+        body = {
+            "status": "error",
+            "error_code": "HTTPError",
+            "message": str(detail) if detail is not None else "request failed",
+        }
+    headers = getattr(exc, "headers", None)
+    return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 
 
 def _safe_component_status(name: str, exc: Exception) -> str:

@@ -10,6 +10,10 @@ Phase 0 and Phase 1 do not own any DB tables.  This module is the
 first persistence surface introduced by Phase 2.  The actual schema
 is created and migrated by Alembic (``backend/alembic/versions/
 0001_cost_cache.py``); this ORM is for application reads/writes only.
+
+Phase 5A adds the ``app_users`` table backing local application
+authentication and RBAC.  The schema is created and migrated by
+``backend/alembic/versions/0002_app_users.py``.
 """
 from __future__ import annotations
 
@@ -18,10 +22,11 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
     Index,
     Integer,
-    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -124,4 +129,69 @@ class CostCache(Base):
         return ts >= expires_at
 
 
-__all__ = ["Base", "CostCache", "Decimal"]
+# Phase 5A — application users (local authentication + RBAC).
+#
+# The role is constrained at the database level by a CHECK so a
+# programming bug cannot insert an unrecognised value.  Email is
+# stored normalised (lowercased, trimmed) by the application layer
+# before insertion; we still keep a UNIQUE constraint as a belt-and-
+# braces invariant.  Password hashes are NEVER read back into the
+# API surface — see :mod:`app.schemas.auth`.
+APP_USER_ROLES: tuple[str, ...] = ("ADMIN", "ANALYST", "VIEWER")
+
+
+class AppUser(Base):
+    """Application user identity for local authentication + RBAC.
+
+    The model is intentionally minimal: it stores enough to
+    authenticate, authorise, and audit a login.  It deliberately does
+    NOT store personal profile fields, profile pictures, SSO
+    identities, MFA secrets, refresh tokens, or conversation history —
+    those belong to later phases (5B/5C) and are out of scope for the
+    Phase 5A authentication foundation.
+    """
+
+    __tablename__ = "app_users"
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_app_users_email"),
+        CheckConstraint(
+            "role IN ('ADMIN', 'ANALYST', 'VIEWER')",
+            name="ck_app_users_role",
+        ),
+        Index("ix_app_users_role", "role"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    # RFC 5321 caps local + domain at 320 chars; we never accept
+    # anything longer so the column can be UNIQUE-indexed cheaply.
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    # Argon2id encoded hash.  Typical PHC string:
+    # ``$argon2id$v=19$m=65536,t=3,p=2$<salt>$<hash>``.  Always treat
+    # as opaque — the only consumer is :class:`PasswordHasher`.
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover — debug helper
+        # Deliberately omits password_hash so a stray ``print(user)``
+        # in a debugger cannot leak the secret.
+        return (
+            f"AppUser(id={self.id!r}, email={self.email!r}, "
+            f"role={self.role!r}, is_active={self.is_active!r})"
+        )
+
+
+__all__ = ["APP_USER_ROLES", "Base", "CostCache", "AppUser", "Decimal"]

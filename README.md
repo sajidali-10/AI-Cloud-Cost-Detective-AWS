@@ -15,6 +15,12 @@ Gateway reachable only on the internal Docker network.
 > fully validated via mocked LiteLLM responses. Phase 1–3 endpoints
 > remain fully functional regardless of the AI layer's state.
 
+> **Phase 5A status**: application-local authentication + RBAC foundation
+> is shipped. Phase 0–4 endpoints stay open when `AUTH_ENABLED=false`
+> (the default). When `AUTH_ENABLED=true`, every business request must
+> carry a valid bearer token issued via `POST /api/auth/login`. AWS
+> credentials, AI grounding, and the read-only guard are unchanged.
+
 ## Architecture
 
 ```

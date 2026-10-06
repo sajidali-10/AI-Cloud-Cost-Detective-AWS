@@ -18,11 +18,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.aws import router as aws_router
+from app.api.deps import require_role
+from app.db.models import AppUser
 from app.schemas.evidence import (
     EvidenceResponse,
     Warning,
@@ -68,7 +70,10 @@ class EvidenceRequest(BaseModel):
     "/evidence",
     summary="Cost + CloudWatch + resource evidence for the selected region/days",
 )
-async def post_aws_evidence(payload: EvidenceRequest) -> Any:
+async def post_aws_evidence(
+    payload: EvidenceRequest,
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+) -> Any:
     if payload.days not in ALLOWED_LOOKBACK_DAYS:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

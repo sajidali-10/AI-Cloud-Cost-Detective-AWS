@@ -80,6 +80,40 @@ only and points at the Compose service name `backend`, never at a public IP.
 - **No JWT auth in Phase 0.** Authentication is documented under "Deferred
   to later phase" in `docs/phase0-report.md`.
 
+## Phase 5A additions (Authentication + RBAC)
+
+- **Argon2id password hashing.** All passwords are stored as Argon2id
+  PHC strings (defaults `t=3, m=64MiB, p=2`). The Argon2id verifier is
+  the only module that ever compares a plaintext password to a stored
+  hash; routes never see either the plaintext or the hash.
+- **Stateless bearer JWT (HS256 default).** Tokens carry `sub`, `role`
+  (hint only), `iat`, `exp`, `iss`, `aud`, `jti`. The auth layer
+  re-loads the user from the DB on every request and uses the DB
+  role for authorization — a forged role claim cannot escalate.
+- **Fail-closed secret validation.** When `AUTH_ENABLED=true`, the
+  application refuses to start unless `JWT_SECRET` is at least 32
+  characters and not a documented placeholder. The error message is
+  sanitized; it never includes the secret value.
+- **User-enumeration defence.** Every login failure (unknown email,
+  wrong password, inactive account) returns an identical
+  `InvalidCredentials` 401 with the same `message` value.
+- **AWS credentials are unchanged.** Backend AWS access continues via
+  EC2 IAM Role + IMDSv2. JWT claims never translate to AWS IAM
+  permissions. Application `ADMIN` is **not** AWS administrator. AWS
+  APIs remain read-only — Phase 5A introduces no mutation endpoints.
+- **Log safety.** Logs may include user_id, role, and request id, but
+  never passwords, JWTs, Authorization headers, password hashes, or
+  the JWT signing secret. `phase5a_verify.sh` scans the last 1000
+  lines of backend logs and fails on any credential pattern.
+- **No auto-generated admin.** The first administrator is created via
+  `scripts/create_admin.py`; the application does NOT create a
+  default admin on startup.
+- **Backward compatibility.** `AUTH_ENABLED=false` keeps the
+  Phase 0-4 verification suite working unchanged.
+
+See `docs/phase5a-auth-rbac.md` for the full architecture, role
+matrix, and API surface.
+
 ## Automated remediation
 
 - **No automated AWS remediation in Phase 0.** All AWS calls (none in

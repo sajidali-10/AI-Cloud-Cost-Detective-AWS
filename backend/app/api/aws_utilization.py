@@ -19,10 +19,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
 from app.api.aws import router as aws_router
+from app.api.deps import require_role
+from app.db.models import AppUser
 from app.schemas.utilization import (
     Datapoint,
     MetricSeries,
@@ -134,7 +136,10 @@ def _type_for_resource(resources_by_id: Dict[str, ResourceDescriptor], resource_
     "/utilization",
     summary="CloudWatch utilization for the selected resource scope",
 )
-async def post_aws_utilization(payload: UtilizationRequest) -> Any:
+async def post_aws_utilization(
+    payload: UtilizationRequest,
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+) -> Any:
     """Return CloudWatch utilization for the requested resource scope."""
     if payload.lookback_days not in ALLOWED_LOOKBACK_DAYS:
         return JSONResponse(

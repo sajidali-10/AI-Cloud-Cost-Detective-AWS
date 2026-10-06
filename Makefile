@@ -58,6 +58,12 @@ verify-phase3:
 verify-phase4:
 	bash scripts/phase4_verify.sh
 
+verify-phase5a:
+	bash scripts/phase5a_verify.sh
+
+create-admin:
+	$(COMPOSE) exec backend python scripts/create_admin.py
+
 secrets:
 	bash scripts/generate_dev_secrets.sh
 

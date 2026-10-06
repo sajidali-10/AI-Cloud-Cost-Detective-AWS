@@ -69,6 +69,22 @@ class Settings(BaseSettings):
     ai_max_context_regions: int = Field(default=10, ge=1, le=50)
     ai_max_question_length: int = Field(default=2000, ge=1, le=10000)
 
+    # --- Phase 5A: Authentication & RBAC ---
+    # Master switch. When False, business APIs behave exactly like
+    # Phase 0-4: anonymous access is permitted (a synthetic ADMIN
+    # user is injected for backward compatibility). When True, every
+    # business route requires a valid bearer token.
+    auth_enabled: bool = Field(default=False)
+    # Symmetric HMAC secret for JWT signing. Required (length >= 32)
+    # when ``auth_enabled=True``. MUST be supplied via environment
+    # variables in every non-test deployment; the validator below
+    # refuses to start with placeholder or short values.
+    jwt_secret: str = Field(default="")
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_access_token_minutes: int = Field(default=60, ge=1, le=24 * 60)
+    jwt_issuer: str = Field(default="ai-cloud-cost-detective")
+    jwt_audience: str = Field(default="ai-cloud-cost-detective-api")
+
     @model_validator(mode="after")
     def _resolve_litellm_base_url(self) -> "Settings":
         """Fill ``litellm_base_url`` from host+port when unset.
@@ -82,6 +98,49 @@ class Settings(BaseSettings):
                 self,
                 "litellm_base_url",
                 f"http://{self.litellm_host}:{self.litellm_port}",
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_auth_secret(self) -> "Settings":
+        """Fail closed on missing/unsafe JWT secrets.
+
+        When ``AUTH_ENABLED=true``, ``JWT_SECRET`` must be set, must be
+        at least 32 characters long, and must not match any of the
+        documented placeholders. The validator raises ``ValueError``
+        with a SAFE message (never the secret value).
+
+        When ``AUTH_ENABLED=false``, this is a no-op so existing
+        Phase 0-4 development flows keep working unchanged.
+        """
+        if not self.auth_enabled:
+            return self
+        secret = (self.jwt_secret or "").strip()
+        forbidden = {
+            "",
+            "change-me",
+            "change_me",
+            "changeme",
+            "dev-only-change-me",
+            "dev_only_change_me",
+            "your-secret",
+            "your_secret",
+            "yoursecret",
+            "test",
+            "test-secret",
+            "test_secret",
+        }
+        if secret.lower() in forbidden:
+            raise ValueError(
+                "AUTH_ENABLED=true but JWT_SECRET is empty or set to a "
+                "documented placeholder. Provide a unique JWT_SECRET of "
+                "at least 32 characters via the environment."
+            )
+        if len(secret) < 32:
+            raise ValueError(
+                "AUTH_ENABLED=true but JWT_SECRET is shorter than 32 "
+                "characters. Provide a longer unique secret via the "
+                "environment."
             )
         return self
 

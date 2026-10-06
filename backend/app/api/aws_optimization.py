@@ -21,12 +21,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
 
 from app.api.aws import router as aws_router
 from app.api.aws_utilization import _descriptors_from_phase1
+from app.api.deps import require_role
 from app.core.config import get_settings
+from app.db.models import AppUser
 from app.schemas.optimization import (
     CapabilitiesResponse,
     RecommendationsResponse,
@@ -141,6 +143,7 @@ def _fetch_utilization(
 )
 def get_optimization_capabilities(
     region: Optional[str] = Query(default=None),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     settings = _settings()
     effective_region = region or settings.aws_default_region
@@ -162,6 +165,7 @@ def get_optimization_capabilities(
 def get_optimization_recommendations(
     region: Optional[str] = Query(default=None),
     days: int = Query(default=30),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     bad_lookback = _validate_lookback(days)
     if bad_lookback is not None:
@@ -237,6 +241,7 @@ def get_optimization_recommendations(
 def get_optimization_summary(
     region: Optional[str] = Query(default=None),
     days: int = Query(default=30),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
 ) -> Any:
     bad_lookback = _validate_lookback(days)
     if bad_lookback is not None:

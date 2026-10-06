@@ -20,9 +20,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 
+from app.api.deps import require_role
+from app.db.models import AppUser
 from app.schemas.ai import (
     AnalyzeRequest,
     AIGenerationStatus,
@@ -66,7 +68,10 @@ def ai_status() -> Any:
     "/executive-summary",
     summary="Grounded executive FinOps summary",
 )
-def ai_executive_summary(payload: ExecutiveSummaryRequest) -> Any:
+def ai_executive_summary(
+    payload: ExecutiveSummaryRequest,
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST")),
+) -> Any:
     """Produce the executive summary for ``region`` + ``days``."""
     service: AIService = _service_factory()
     try:
@@ -95,7 +100,10 @@ def ai_executive_summary(payload: ExecutiveSummaryRequest) -> Any:
     "/analyze",
     summary="Grounded Q&A against the evidence package",
 )
-def ai_analyze(payload: AnalyzeRequest) -> Any:
+def ai_analyze(
+    payload: AnalyzeRequest,
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST")),
+) -> Any:
     """Answer a user question grounded in the Phase 2/3 evidence."""
     service: AIService = _service_factory()
     try:
@@ -131,6 +139,7 @@ def ai_analyze(payload: AnalyzeRequest) -> Any:
 def ai_recommendation_explain(
     recommendation_id: str,
     payload: ExecutiveSummaryRequest,
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST")),
 ) -> Any:
     """Explain the recommendation identified by ``recommendation_id``."""
     service: AIService = _service_factory()
