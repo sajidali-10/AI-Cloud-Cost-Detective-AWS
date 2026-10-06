@@ -140,31 +140,50 @@ def get_compute_optimizer_client(region: Optional[str] = None) -> BaseClient:
 def get_enrollment_status(client: BaseClient, *, account_id: Optional[str] = None) -> str:
     """Return the account-level enrollment status.
 
-    ``account_id`` is optional: when omitted, Compute Optimizer falls
-    back to the caller's account.  We never fabricate a status — if
-    AWS denies the call, we raise a sanitized ``ComputeOptimizerError``
-    with ``code="AccessDeniedException"`` so the caller can map it to
+    ``GetEnrollmentStatus`` is an account-scoped call: AWS accepts no
+    parameters and returns the caller's enrollment state.  The
+    ``account_id`` argument is retained for API symmetry with the
+    orchestrator (and kept as a positional-or-keyword hook so future
+    organization-scope endpoints can wire it through), but it MUST
+    NOT be sent on the wire for this particular operation — passing
+    it produces a ``ParamValidationError`` and the account would be
+    permanently misclassified as ``UNAVAILABLE``.
+
+    We never fabricate a status — if AWS denies the call, we raise a
+    sanitized ``ComputeOptimizerError`` with
+    ``code="AccessDeniedException"`` so the caller can map it to
     ``CapabilityStatus.ACCESS_DENIED``.
     """
     assert_read_only(client, "get_enrollment_status")
-    params: dict[str, Any] = {}
-    if account_id:
-        params["accountIds"] = [account_id]
     try:
-        response = client.get_enrollment_status(**params)
+        # ``account_id`` is intentionally NOT forwarded — the AWS
+        # ``GetEnrollmentStatus`` operation rejects unknown params.
+        # See the docstring above.
+        response = client.get_enrollment_status()
     except (ClientError, BotoCoreError) as exc:
         raise _sanitize_boto_error(exc) from None
-    accounts = response.get("accountEnrollmentStatuses") or []
-    if not accounts:
-        return "UNAVAILABLE"
-    # Single-account scope: pick the requested account or the first row.
-    status_raw: Optional[str] = None
-    for row in accounts:
-        if account_id is None or row.get("accountId") == account_id:
-            status_raw = row.get("status")
-            break
-    if status_raw is None and accounts:
-        status_raw = accounts[0].get("status")
+    # ``GetEnrollmentStatus`` returns one of two shapes depending on
+    # the AWS account configuration:
+    #
+    # * Single-account call (the Phase 3 default):
+    #     ``{"status": "Inactive", "memberAccountsEnrolled": false}``
+    # * Organization-scope variant (future Phase 4+):
+    #     ``{"accountEnrollmentStatuses": [{"accountId": "...", "status": "..."}]}``
+    #
+    # Both shapes are handled here so the same code path covers the
+    # simple case and any future organization-scope expansion.
+    status_raw: Optional[str] = response.get("status")
+    if status_raw is None:
+        accounts = response.get("accountEnrollmentStatuses") or []
+        if not accounts:
+            return "UNAVAILABLE"
+        # Single-account scope: pick the requested account or the first row.
+        for row in accounts:
+            if account_id is None or row.get("accountId") == account_id:
+                status_raw = row.get("status")
+                break
+        if status_raw is None and accounts:
+            status_raw = accounts[0].get("status")
     return _map_status_to_capability(status_raw)
 
 

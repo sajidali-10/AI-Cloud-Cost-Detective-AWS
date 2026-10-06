@@ -22,10 +22,14 @@ mocked unit tests and live AWS calls.
 
 ## Compute Optimizer
 
-* **Enrollment:** AWS rejected the call in this account
-  (`InternalError` from the live API).  The capabilities endpoint
-  surfaces `UNAVAILABLE` and continues to function on deterministic
-  rules + Cost Optimization Hub.
+* **Enrollment:** `Inactive` (the account has not opted Compute
+  Optimizer in).  The capabilities endpoint surfaces
+  `CapabilityStatus.INACTIVE` and the orchestrator does NOT call any
+  of `GetEC2InstanceRecommendations`,
+  `GetEBSVolumeRecommendations`, `GetLambdaFunctionRecommendations`,
+  or `GetRDSDatabaseRecommendations` — the enrollment state short-
+  circuits the fetcher before any AWS call is attempted, so no
+  spurious `AccessDeniedException` warning is emitted.
 * **EC2:** wrapper built and tested (`get_ec2_instance_recommendations`).
 * **EBS:** wrapper built and tested (`get_ebs_volume_recommendations`).
 * **Lambda:** wrapper built and tested
@@ -37,8 +41,18 @@ mocked unit tests and live AWS calls.
   cases (NAT, LB) directly from Phase 2 evidence.
 * **Pagination:** walked transparently via `nextToken`; verified
   with a multi-page fake client.
-* **Live validation:** enrollment surfaces an `UNAVAILABLE` status;
-  the wrapper sanitizes the error and the engine continues.
+* **Live validation:** `Inactive` is surfaced as `INACTIVE`; the
+  orchestrator's capability gate suppresses any fetcher call so the
+  recommendations endpoint stays at `SUCCESS` and emits zero
+  warnings.  The single-account `GetEnrollmentStatus` response shape
+  (``{"status": "Inactive"}``) is parsed alongside the multi-account
+  ``accountEnrollmentStatuses`` shape so both forms map to the
+  correct `CapabilityStatus`.
+* **Param-validation fix:** earlier versions of the wrapper sent
+  `accountIds=[account_id]` to `GetEnrollmentStatus`; the operation
+  rejects unknown parameters and the account was permanently
+  misclassified as `UNAVAILABLE`.  The closure pins the call to its
+  parameterless form.
 
 ## Cost Optimization Hub
 
@@ -53,8 +67,11 @@ mocked unit tests and live AWS calls.
   no AWS-supplied savings figures flow through Phase 3 in the live
   run.  When AWS supplies savings, the orchestrator prefers COH
   over Compute Optimizer and over deterministic UNKNOWN values.
-* **Live validation:** `NOT_ENROLLED` reported; deterministic rules
-  continue.
+* **Live validation:** `NOT_ENROLLED` reported; the orchestrator's
+  capability gate skips `ListRecommendations`,
+  `ListRecommendationSummaries`, and `GetRecommendation` so no
+  warning is emitted and the recommendations endpoint stays at
+  `SUCCESS`.
 
 ## Deterministic Engine
 
@@ -114,19 +131,58 @@ mocked unit tests and live AWS calls.
 
 ## API
 
-* **Capabilities:** 200 with `compute_optimizer=UNAVAILABLE`,
+* **Capabilities:** 200 with `compute_optimizer=INACTIVE`,
   `cost_optimization_hub=NOT_ENROLLED`,
   `deterministic_engine=AVAILABLE`.  7 resource types supported,
-  lookback `{7, 30, 60, 90}`.
-* **Recommendations:** 200 with `status=PARTIAL_SUCCESS`,
-  `count=30`, `warnings=2` (one per AWS-native source).  Returns a
-  deduplicated `List[Recommendation]`.
+  lookback `{7, 30, 60, 90}`.  Zero warnings.
+* **Recommendations:** 200 with `status=SUCCESS`, `count=30`,
+  `warnings=[]`.  Returns a deduplicated `List[Recommendation]`.
 * **Summary:** 200 with `total_recommendations=30`,
   `recommendations_without_savings=30`,
   `total_estimated_monthly_savings=null`,
   by-resource-type / by-action / by-source / by-confidence
-  breakdowns all present.
+  breakdowns all present.  Zero warnings.
 * Invalid `?days=15` → 422 `InvalidLookbackDays`.
+
+## Enrollment-State Closure
+
+The closure pins the behavior required by the Phase 3 closure
+contract:
+
+1. Compute Optimizer `Inactive` → `CapabilityStatus.INACTIVE` (not
+   `UNAVAILABLE`).  Verified live and pinned by unit tests for both
+   `Active` / `Inactive` / `Pending` / `Failed` / `Garbage` / empty
+   inputs and for both single-account (``{"status": "..."}``) and
+   multi-account (``{"accountEnrollmentStatuses": [...]}``) response
+   shapes.
+2. When CO is `INACTIVE` / `PENDING` / `FAILED` the engine does NOT
+   call `GetEC2InstanceRecommendations`,
+   `GetEBSVolumeRecommendations`, `GetLambdaFunctionRecommendations`,
+   or `GetRDSDatabaseRecommendations`.  Pinned by parametrized
+   regression tests.
+3. Cost Optimization Hub empty `items` →
+   `CapabilityStatus.NOT_ENROLLED`.  Pinned by unit test.
+4. When COH is `INACTIVE` / `NOT_ENROLLED` / `PENDING` / `FAILED`
+   the engine does NOT call `ListRecommendations`,
+   `ListRecommendationSummaries`, or `GetRecommendation`.  Pinned by
+   parametrized regression tests.
+5. No `AccessDeniedException` / `ComputeOptimizerError` /
+   `CostOptimizationHubError` warnings are emitted for the expected
+   non-active states.  Pinned by regression tests.
+6. Deterministic recommendations continue to run regardless of AWS
+   enrollment state.  The deterministic rule engine is fully
+   independent of AWS-native sources.
+7. `PARTIAL_SUCCESS` is preserved only when an actual source fails
+   (e.g. `AccessDeniedException` from a fetcher call that bypasses
+   the gate).  Defense-in-depth regression tests verify that real
+   failures still surface as warnings.
+
+The capability gate is implemented in
+`app/services/optimization_engine.py` via
+`_should_fetch_aws_source(status)`, which returns `True` only for
+`ACTIVE`.  The orchestrator calls `_co_capability` / `_coh_capability`
+before each AWS fetcher; the expected non-active set is
+`{"INACTIVE", "NOT_ENROLLED", "PENDING", "FAILED"}`.
 
 ## Tests
 
@@ -134,17 +190,14 @@ mocked unit tests and live AWS calls.
 * **Phase 1 regression:** 12 passed (AWS identity + discovery).
 * **Phase 2 regression:** 21 passed (cost + utilization + cache +
   evidence).
-* **Phase 3 tests:** 74 passed
-  (`test_compute_optimizer_service.py` 17,
+* **Phase 3 tests:** 91 passed
+  (`test_compute_optimizer_service.py` 19,
   `test_cost_optimization_hub_service.py` 17,
   `test_optimization_rules.py` 30,
-  `test_optimization_engine.py` 10).
-* **`phase3_verify.sh`:** 14 / 15 checks pass.  The one
-  intermittent regression in Phase 0 (`/api/health` and
-  `/health/ready`) was caused by the backend container restarting
-  mid-suite; re-running the verifier after a settle period exits
-  0.  The Phase 3 endpoints, regression chain, and container
-  health are all green.
+  `test_optimization_engine.py` 10,
+  `test_enrollment_state_closure.py` 15 — Phase 3 closure).
+* **`phase3_verify.sh`:** 15 / 15 checks pass.  The Phase 3
+  endpoints, regression chain, and container health are all green.
 * **Read-only guard:** Phase 3 Boto3 operations are classified as
   read-only; `update_enrollment_status`, `update_preferences`,
   `put_recommendation_preferences`,
@@ -161,9 +214,12 @@ mocked unit tests and live AWS calls.
 
 ## Known Issues
 
-1. The Phase 1 read-only IAM role does not grant
-   `compute-optimizer:*` or `cost-optimization-hub:*`.  Adding the
-   permissions unblocks live recommendations without code changes.
+1. The Phase 1 read-only IAM role grants
+   `compute-optimizer:GetEnrollmentStatus` and
+   `cost-optimization-hub:ListEnrollmentStatuses` (verified live),
+   but does NOT grant the per-resource recommendation APIs.  This
+   is fine for the closure — the capability gate short-circuits
+   before those APIs would be invoked.
 2. `GetIdleRecommendations` from Compute Optimizer is not wired in
    Phase 3 — the deterministic rule engine already covers the
    "idle NAT / idle LB" cases from Phase 2 evidence, so the wire-up

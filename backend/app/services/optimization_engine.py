@@ -579,6 +579,46 @@ def _candidate_to_recommendation(
 
 
 # ---------------------------------------------------------------------------
+# Capability gating — expected non-active AWS-native source states.
+# ---------------------------------------------------------------------------
+
+# These ``CapabilityStatus`` values represent legitimate, expected
+# enrollment / availability states for an AWS-native source.  When
+# the resolved status falls into this set the engine MUST NOT:
+#   * call any of the source's recommendation APIs
+#     (``GetEC2InstanceRecommendations``,
+#      ``GetEBSVolumeRecommendations``,
+#      ``GetLambdaFunctionRecommendations``,
+#      ``GetRDSDatabaseRecommendations`` for Compute Optimizer;
+#      ``ListRecommendations`` / ``ListRecommendationSummaries`` /
+#      ``GetRecommendation`` for Cost Optimization Hub)
+#   * emit a spurious ``OptimizationNotice`` (no
+#     ``AccessDeniedException`` / ``ComputeOptimizerError`` warnings)
+# Only ``ACTIVE`` triggers a real fetcher call.  ``ACCESS_DENIED``
+# and ``UNAVAILABLE`` are NOT in this set — they represent actual
+# failures and the existing fetcher-error path still emits a
+# warning for them, but only when the engine has no prior knowledge
+# of the enrollment state (defense-in-depth).
+_EXPECTED_NON_ACTIVE_STATES: frozenset[str] = frozenset(
+    {"INACTIVE", "NOT_ENROLLED", "PENDING", "FAILED"}
+)
+
+
+def _should_fetch_aws_source(status: Optional[str]) -> bool:
+    """Return ``True`` only when an AWS-native source is fully ACTIVE.
+
+    The orchestrator uses this gate before calling any of the
+    per-source recommendation APIs so an expected ``INACTIVE`` /
+    ``NOT_ENROLLED`` enrollment state never produces a real AWS call
+    (and therefore never a spurious ``AccessDeniedException``
+    warning).
+    """
+    if status is None:
+        return False
+    return str(status).strip().upper() == "ACTIVE"
+
+
+# ---------------------------------------------------------------------------
 # Source fetchers (one per AWS service).  Each returns a list of
 # ``RecommendationCandidate`` or raises its own sanitized error.
 # ---------------------------------------------------------------------------
@@ -796,6 +836,16 @@ def build_recommendations(
     Each AWS-native source is tried independently; a failure becomes
     a structured ``Warning`` and is NOT fatal.  Deterministic rules
     are always attempted (they have no remote dependency).
+
+    Expected non-active enrollment states (``INACTIVE``,
+    ``NOT_ENROLLED``, ``PENDING``, ``FAILED``) are checked FIRST
+    using the resolved capability status from
+    :func:`_co_capability` / :func:`_coh_capability`.  When the
+    status is in that set the engine does NOT call the source's
+    recommendation APIs and does NOT emit a warning — these are
+    legitimate, non-error capability states.  Only ``ACTIVE`` (or an
+    undetected status that happens to come back clean) triggers a
+    real fetcher call.
     """
     warnings: List[OptimizationNotice] = []
     candidates: List[RecommendationCandidate] = []
@@ -805,56 +855,66 @@ def build_recommendations(
     coh_candidates: List[RecommendationCandidate] = []
 
     if inputs.include_compute_optimizer:
-        try:
-            co_candidates = _fetch_compute_optimizer_candidates(
-                region=inputs.region,
-                account_id=inputs.account_id,
-            )
-        except ComputeOptimizerError as exc:
-            warnings.append(
-                OptimizationNotice(
-                    source="compute_optimizer",
-                    code=exc.code,
-                    message="Compute Optimizer recommendations were not available.",
+        # Resolve the capability FIRST.  An expected non-active
+        # status short-circuits before any recommendation API is
+        # touched and produces no warning.
+        co_cap, _co_err = _co_capability(inputs.region, inputs.account_id)
+        if _should_fetch_aws_source(co_cap.status.value):
+            try:
+                co_candidates = _fetch_compute_optimizer_candidates(
                     region=inputs.region,
+                    account_id=inputs.account_id,
                 )
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.append(
-                OptimizationNotice(
-                    source="compute_optimizer",
-                    code=type(exc).__name__,
-                    message="Compute Optimizer recommendations were not available.",
-                    region=inputs.region,
+            except ComputeOptimizerError as exc:
+                warnings.append(
+                    OptimizationNotice(
+                        source="compute_optimizer",
+                        code=exc.code,
+                        message="Compute Optimizer recommendations were not available.",
+                        region=inputs.region,
+                    )
                 )
-            )
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.append(
+                    OptimizationNotice(
+                        source="compute_optimizer",
+                        code=type(exc).__name__,
+                        message="Compute Optimizer recommendations were not available.",
+                        region=inputs.region,
+                    )
+                )
     candidates.extend(co_candidates)
 
     if inputs.include_cost_optimization_hub:
-        try:
-            hub_rows = _fetch_cost_optimization_hub_candidates(
-                region=inputs.region,
-                account_id=inputs.account_id,
-            )
-            coh_candidates = [_coh_to_candidate(r) for r in hub_rows]
-        except CostOptimizationHubError as exc:
-            warnings.append(
-                OptimizationNotice(
-                    source="cost_optimization_hub",
-                    code=exc.code,
-                    message="Cost Optimization Hub recommendations were not available.",
+        # Same gating as Compute Optimizer: empty enrollment list
+        # (``NOT_ENROLLED``) and ``INACTIVE`` are expected states
+        # and must not surface as warnings.
+        coh_cap, _coh_err = _coh_capability(inputs.region, inputs.account_id)
+        if _should_fetch_aws_source(coh_cap.status.value):
+            try:
+                hub_rows = _fetch_cost_optimization_hub_candidates(
                     region=inputs.region,
+                    account_id=inputs.account_id,
                 )
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.append(
-                OptimizationNotice(
-                    source="cost_optimization_hub",
-                    code=type(exc).__name__,
-                    message="Cost Optimization Hub recommendations were not available.",
-                    region=inputs.region,
+                coh_candidates = [_coh_to_candidate(r) for r in hub_rows]
+            except CostOptimizationHubError as exc:
+                warnings.append(
+                    OptimizationNotice(
+                        source="cost_optimization_hub",
+                        code=exc.code,
+                        message="Cost Optimization Hub recommendations were not available.",
+                        region=inputs.region,
+                    )
                 )
-            )
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.append(
+                    OptimizationNotice(
+                        source="cost_optimization_hub",
+                        code=type(exc).__name__,
+                        message="Cost Optimization Hub recommendations were not available.",
+                        region=inputs.region,
+                    )
+                )
     candidates.extend(coh_candidates)
 
     # Deterministic rules.  Always run; pure local code.

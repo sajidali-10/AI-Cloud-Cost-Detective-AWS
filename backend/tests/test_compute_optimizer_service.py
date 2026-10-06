@@ -133,6 +133,26 @@ class TestEnrollment:
         )
         assert get_enrollment_status(client) == "UNAVAILABLE"
 
+    def test_top_level_status_shape_inactive(self) -> None:
+        """AWS's single-account ``GetEnrollmentStatus`` returns the
+        enrollment state as a top-level ``status`` field, NOT inside
+        ``accountEnrollmentStatuses``.  Phase 3 closure pins both
+        shapes to ``CapabilityStatus.INACTIVE``."""
+        client = _make_client(
+            page_factory=lambda op, kw: {"status": "Inactive", "memberAccountsEnrolled": False}
+            if op == "get_enrollment_status"
+            else {}
+        )
+        assert get_enrollment_status(client) == "INACTIVE"
+
+    def test_top_level_status_shape_active(self) -> None:
+        client = _make_client(
+            page_factory=lambda op, kw: {"status": "Active", "memberAccountsEnrolled": True}
+            if op == "get_enrollment_status"
+            else {}
+        )
+        assert get_enrollment_status(client) == "ACTIVE"
+
     def test_access_denied_raises_sanitized(self) -> None:
         def _page(op: str, kw: Dict[str, Any]) -> Dict[str, Any]:
             if op == "get_enrollment_status":
