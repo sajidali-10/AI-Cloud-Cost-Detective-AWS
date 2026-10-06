@@ -222,6 +222,11 @@ Message history:
   test_conversation_migration_ddl, test_conversation_service,
   test_conversation_routes, test_conversation_ai_integration,
   test_conversation_security).
+* Full backend pytest regression: **542 passed, 0 warnings**
+  (Phase 0–5B combined, including the Phase 5B closure that
+  fixes the `coroutine 'to_thread' was never awaited` warning
+  by giving `_fetch_utilization` a proper async variant for
+  callers running inside an event loop).
 * Phase 5A regression: **21 passed** (delegated via
   `phase5a_verify.sh`; re-run after Phase 5B migration changes —
   still green).
@@ -258,12 +263,6 @@ Coverage includes:
 
 ## Known Issues
 
-* `tests/test_conversation_ai_integration.py` emits a
-  `RuntimeWarning: coroutine 'to_thread' was never awaited` line.
-  This is a harmless pre-existing artifact of the Phase 4
-  `_gather_async` helper when the recommendations sub-call fails
-  in the test environment; the call site falls back to an empty
-  list and the route still returns a controlled response.
 * The Phase 5B migration adds `token_usage` JSONB column. We use
   it for `token_usage` provenance only (no raw provider payload).
   The conversation analyze path currently leaves `token_usage`

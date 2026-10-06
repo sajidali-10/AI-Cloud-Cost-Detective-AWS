@@ -98,27 +98,151 @@ def _fetch_utilization(
 ) -> Dict[str, list]:
     """Return ``{resource_id: [MetricSeries, ...]}`` for the request.
 
-    Returns an empty dict on CloudWatch failure (with a logged warning).
-    The orchestrator treats an empty utilization map as "no coverage"
-    and downgrades the deterministic confidence accordingly.
+    Sync entry point used by the FastAPI ``def`` route handlers.
+    Returns an empty dict on CloudWatch failure (with a logged
+    warning).  The orchestrator treats an empty utilization map
+    as "no coverage" and downgrades the deterministic confidence
+    accordingly.
+
+    Callers already running inside an event loop (e.g. Phase 4
+    ``AIService._gather_async``) MUST use
+    :func:`_fetch_utilization_async` instead — calling this sync
+    wrapper from an async context would deadlock the loop on
+    ``asyncio.run``.
     """
     descriptors = _descriptors_from_phase1(phase1_services, region=region, types_filter=None)
     if not descriptors:
         return {}
+    queries = build_metric_queries(descriptors)
+    cw_client = get_cloudwatch_client(region=region)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    period = period_seconds_for(days)
     try:
-        queries = build_metric_queries(descriptors)
-        cw_client = get_cloudwatch_client(region=region)
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=days)
-        period = period_seconds_for(days)
-        results = asyncio.run(
-            asyncio.to_thread(
-                batch_query, cw_client, queries, start=start, end=end, period_seconds=period
-            )
+        results = _run_batch_query_blocking(
+            cw_client=cw_client,
+            queries=queries,
+            start=start,
+            end=end,
+            period=period,
         )
     except (CloudWatchError, ClientError, BotoCoreError) as exc:
         logger.warning("aws.optimization cloudwatch error=%s", type(exc).__name__)
         return {}
+    return _aggregate_batch_results(
+        results=results,
+        queries=queries,
+        descriptors=descriptors,
+        days=days,
+        period=period,
+    )
+
+
+async def _fetch_utilization_async(
+    *,
+    region: str,
+    days: int,
+    phase1_services: Dict[str, Any],
+) -> Dict[str, list]:
+    """Async variant of :func:`_fetch_utilization`.
+
+    Used by :func:`app.services.ai_service._gather_async` which is
+    itself running inside an event loop.  Awaits
+    ``asyncio.to_thread(...)`` so the underlying coroutine is
+    actually consumed — ``asyncio.run(asyncio.to_thread(...))`` is
+    a bug because ``to_thread`` returns a coroutine that never gets
+    awaited.
+    """
+    descriptors = _descriptors_from_phase1(phase1_services, region=region, types_filter=None)
+    if not descriptors:
+        return {}
+    queries = build_metric_queries(descriptors)
+    cw_client = get_cloudwatch_client(region=region)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    period = period_seconds_for(days)
+    try:
+        results = await _run_batch_query_async(
+            cw_client=cw_client,
+            queries=queries,
+            start=start,
+            end=end,
+            period=period,
+        )
+    except (CloudWatchError, ClientError, BotoCoreError) as exc:
+        logger.warning("aws.optimization cloudwatch error=%s", type(exc).__name__)
+        return {}
+    return _aggregate_batch_results(
+        results=results,
+        queries=queries,
+        descriptors=descriptors,
+        days=days,
+        period=period,
+    )
+
+
+def _run_batch_query_blocking(
+    *,
+    cw_client: Any,
+    queries: list,
+    start: datetime,
+    end: datetime,
+    period: int,
+) -> Dict[str, list]:
+    """Run ``batch_query`` in a fresh event loop (sync context).
+
+    Used by the FastAPI ``def`` route handlers which run outside an
+    existing event loop.  Spins up a dedicated loop with
+    ``asyncio.run`` and awaits ``asyncio.to_thread`` inside it so
+    the underlying coroutine is consumed properly.
+    """
+
+    async def _runner() -> Dict[str, list]:
+        return await asyncio.to_thread(
+            batch_query,
+            cw_client,
+            queries,
+            start=start,
+            end=end,
+            period_seconds=period,
+        )
+
+    return asyncio.run(_runner())
+
+
+async def _run_batch_query_async(
+    *,
+    cw_client: Any,
+    queries: list,
+    start: datetime,
+    end: datetime,
+    period: int,
+) -> Dict[str, list]:
+    """Run ``batch_query`` in the current event loop.
+
+    Used by callers already inside an event loop (Phase 4
+    ``AIService._gather_async``).  Awaits ``asyncio.to_thread`` so
+    the underlying coroutine is actually consumed.
+    """
+    return await asyncio.to_thread(
+        batch_query,
+        cw_client,
+        queries,
+        start=start,
+        end=end,
+        period_seconds=period,
+    )
+
+
+def _aggregate_batch_results(
+    *,
+    results: Any,
+    queries: list,
+    descriptors: list,
+    days: int,
+    period: int,
+) -> Dict[str, list]:
+    """Aggregate ``batch_query`` results into the ``{rid: [series]}`` shape."""
     series = aggregate_results(
         results,
         queries=queries,

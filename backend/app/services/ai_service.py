@@ -121,7 +121,10 @@ async def _gather_async(
     # the AWS-side service modules raise at import time (e.g. tests
     # that stub out boto3).
     from app.api.aws_costs import _build_cache_key, _to_pydantic_report
-    from app.api.aws_optimization import _fetch_utilization, _resolve_identity
+    from app.api.aws_optimization import (
+        _fetch_utilization_async,
+        _resolve_identity,
+    )
     from app.services.aws.cost_explorer import (
         aggregate_cost_report,
         get_cost_explorer_client,
@@ -172,7 +175,7 @@ async def _gather_async(
     if account_id is not None:
         try:
             phase1_services = enumerate_all_services(region=region)
-            utilization = _fetch_utilization(
+            utilization = await _fetch_utilization_async(
                 region=region,
                 days=days,
                 phase1_services=phase1_services,
