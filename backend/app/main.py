@@ -36,6 +36,8 @@ from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimiza
 # strips /api/ as usual.
 from app.api.auth import router as auth_router
 from app.api.admin_users import router as admin_users_router
+# Phase 5B: durable conversation + AI history routes.
+from app.api.conversations import router as conversations_router
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -68,6 +70,11 @@ app.include_router(ai_routes.router)
 # with their own prefixes (/auth, /admin/users); nginx strips /api/.
 app.include_router(auth_router)
 app.include_router(admin_users_router)
+
+# Phase 5B: conversation + AI history router (own /conversations
+# prefix; nginx strips /api/).  Requires AUTH_ENABLED=true; returns
+# a controlled ``AuthDisabled`` response otherwise.
+app.include_router(conversations_router)
 
 
 # ---------------------------------------------------------------------------

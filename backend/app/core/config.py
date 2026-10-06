@@ -69,6 +69,22 @@ class Settings(BaseSettings):
     ai_max_context_regions: int = Field(default=10, ge=1, le=50)
     ai_max_question_length: int = Field(default=2000, ge=1, le=10000)
 
+    # --- Phase 5B: Conversation & AI history persistence ---
+    # Bounding for the prior-turn history attached to a /conversations
+    # analyze request.  History is untrusted text and may never be
+    # promoted into the system channel — it is rendered inside the
+    # user-message body and capped so the LiteLLM call stays within
+    # the existing Phase 4 token budget.  Defaults are conservative.
+    ai_max_history_messages: int = Field(default=10, ge=0, le=200)
+    ai_max_history_chars: int = Field(default=12000, ge=0, le=200000)
+    # Conversation-level limits for the API (independent of the
+    # context-builder AI limits above).  Both paginated endpoints use
+    # these as the hard ceiling on ``limit``.
+    conversation_list_max_limit: int = Field(default=100, ge=1, le=500)
+    conversation_messages_max_limit: int = Field(default=200, ge=1, le=1000)
+    # Title length cap — matches the DB column width.
+    conversation_title_max_length: int = Field(default=200, ge=16, le=500)
+
     # --- Phase 5A: Authentication & RBAC ---
     # Master switch. When False, business APIs behave exactly like
     # Phase 0-4: anonymous access is permitted (a synthetic ADMIN

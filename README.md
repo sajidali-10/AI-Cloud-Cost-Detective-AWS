@@ -21,6 +21,15 @@ Gateway reachable only on the internal Docker network.
 > carry a valid bearer token issued via `POST /api/auth/login`. AWS
 > credentials, AI grounding, and the read-only guard are unchanged.
 
+> **Phase 5B status**: durable, authenticated, user-owned conversation +
+> AI history persistence is shipped. Conversation history is data, not
+> authoritative AWS evidence — Phase 1–3 remain the only trusted source.
+> Endpoints under `/api/conversations/*` (create / list / get / rename /
+> archive / delete / messages / analyze) require `AUTH_ENABLED=true`;
+> with auth disabled they return a controlled `503 AuthDisabled` response
+> rather than inventing anonymous persistent ownership. The Phase 4
+> grounding contract and Phase 5A RBAC are preserved end-to-end.
+
 ## Architecture
 
 ```
@@ -137,6 +146,8 @@ make verify-phase1   # Phase 1 verifier (AWS identity + resource discovery)
 make verify-phase2   # Phase 2 verifier (cost + utilization + evidence + cache)
 make verify-phase3   # Phase 3 verifier (optimization intelligence)
 make verify-phase4   # Phase 4 verifier (grounded AI Cost Analyst + LiteLLM)
+make verify-phase5a  # Phase 5A verifier (auth + RBAC)
+make verify-phase5b  # Phase 5B verifier (conversation + AI history persistence)
 make down            # stop the stack (keeps volumes)
 make clean           # stop AND remove volumes (destructive; 5s grace)
 ```
@@ -183,6 +194,50 @@ All knobs are environment-driven (see `.env.example`):
 The full grounding contract, prompt-injection defense, citation
 validation, and cost controls are documented in
 `docs/phase4-ai-cost-analyst.md`.
+
+## Phase 5B Conversation & AI History Persistence
+
+Phase 5B adds durable, authenticated, user-owned conversations on
+top of the Phase 4 grounded AI. **Conversation history is data, not
+authoritative AWS evidence** — Phase 1–3 evidence is fetched fresh
+on every AI call, and prior turns are wrapped in
+`<conversation_history>…</conversation_history>` delimiters so they
+cannot override the system prompt.
+
+| Method | Path                                                       | Body / Query                                                              | Purpose                                                |
+| ------ | ---------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------ |
+| POST   | `/api/conversations`                                       | `{title?}`                                                                | Create a conversation (default title `New Cost Analysis`) |
+| GET    | `/api/conversations`                                       | `?limit=&offset=&archived=`                                               | List the user's conversations (paginated)              |
+| GET    | `/api/conversations/{conversation_id}`                     | -                                                                         | Detail + message count                                  |
+| PATCH  | `/api/conversations/{conversation_id}`                     | `{title?, is_archived?}`                                                  | Rename and/or archive                                   |
+| DELETE | `/api/conversations/{conversation_id}`                     | -                                                                         | Hard delete (CASCADE removes messages)                  |
+| GET    | `/api/conversations/{conversation_id}/messages`            | `?limit=&offset=`                                                         | Paginated messages (oldest first)                       |
+| POST   | `/api/conversations/{conversation_id}/analyze`             | `{region?, days: 7\|30\|60\|90, question}`                                | Grounded AI Q&A in an existing conversation             |
+
+All conversation endpoints require `AUTH_ENABLED=true`. When
+`AUTH_ENABLED=false`, durable endpoints return a controlled
+`503 AuthDisabled` response rather than creating anonymous
+persistent ownership.
+
+RBAC is identical to the Phase 4 `/api/ai/*` policy: ADMIN and
+ANALYST have full personal access; VIEWER is denied every route
+(including `/analyze`).
+
+### Phase 5B configuration
+
+| Variable                          | Default | Description                                       |
+| --------------------------------- | ------- | ------------------------------------------------- |
+| `AI_MAX_HISTORY_MESSAGES`         | `10`    | Max prior USER/ASSISTANT turns attached to a request |
+| `AI_MAX_HISTORY_CHARS`            | `12000` | Max total chars of the history text               |
+| `CONVERSATION_LIST_MAX_LIMIT`     | `100`   | Ceiling for `/conversations?limit=`               |
+| `CONVERSATION_MESSAGES_MAX_LIMIT` | `200`   | Ceiling for `/messages?limit=`                    |
+| `CONVERSATION_TITLE_MAX_LENGTH`   | `200`   | Matches the DB column width                       |
+
+The full conversation contract, ownership model, RBAC matrix,
+persistence flow, failure semantics, and prompt-injection
+defense are documented in
+`docs/phase5b-conversation-persistence.md` and
+`docs/phase5b-report.md`.
 
 ## How secrets are generated
 

@@ -170,3 +170,78 @@ if any match is found:
 * **Capabilities endpoint is the truth source.** It surfaces the
   enrollment state of every AWS-native source so a caller can
   decide whether deterministic rules are the only signal available.
+
+## Phase 5B additions (Conversation + AI history persistence)
+
+* **Per-user ownership enforced at the SQL layer.** Every query
+  that reads or writes a conversation includes
+  `WHERE id = :cid AND user_id = :uid`. A conversation that does
+  not exist OR is owned by another user returns the same
+  `ConversationNotFound` error; the API returns a 404 envelope
+  with no information leak about whether the ID exists.
+* **IDOR defence.** Tests
+  `tests/test_conversation_security.py` and
+  `tests/test_conversation_routes.py` assert that cross-user
+  read, update, delete, and analyze attempts are all denied with
+  404 (read/analyze) / 400 (rename on missing title) envelopes.
+* **RBAC centralization.** All conversation routes use
+  `Depends(require_role("ADMIN", "ANALYST"))`. VIEWER is denied
+  every conversation route — including `/analyze`, which means a
+  VIEWER cannot use the conversation layer to bypass Phase 4's
+  AI RBAC.
+* **AUTH_DISABLED handling.** With `AUTH_ENABLED=false`, every
+  durable conversation endpoint returns a controlled
+  `503 AuthDisabled` response. There is no anonymous persistent
+  ownership; the verifier asserts this end-to-end.
+* **Prompt-injection defence for stored history.** Historical
+  user/assistant turns are wrapped in
+  `<conversation_history>…</conversation_history>` delimiters in
+  the user-message body. They are never promoted to the system
+  channel. Test
+  `test_stored_history_prompt_injection_does_not_override_system_prompt`
+  plants an adversarial historical message and asserts the
+  message stays inside the history block (data) and does NOT
+  appear in the system prompt or in the question block.
+* **Savings protection preserved.** Phase 3 null-savings
+  protection is unchanged. There is no `AI_ESTIMATE` token
+  anywhere in the code, schema, responses, or persisted rows
+  (the verifier greps for it).
+* **No raw provider payload persisted.** The conversation
+  message rows store only safe provenance
+  (`operation_type`, `model_alias`, `grounding_metadata`,
+  `evidence_references`, `warnings`). `token_usage` is left NULL
+  by the analyze path; `LiteLLMClient.raw` is intentionally never
+  stored. Test
+  `test_no_raw_provider_payload_persisted` asserts that the
+  `choices` field and full token-usage strings do not appear in
+  any persisted message row.
+* **No secrets persisted.** Conversation messages never carry
+  Authorization headers, JWTs, AWS credentials, IMDS tokens, or
+  provider keys. Test `test_no_jwt_or_authorization_persisted`
+  plants the caller's own JWT in the question and asserts the
+  JWT does not appear in the assistant row or its grounding
+  metadata.
+* **Log privacy.** The conversation service logger emits
+  `conversation_id`, `user_id`, `message_id`, `role`, and
+  `operation` only. It never logs `content`, JWTs, AWS
+  credentials, full prompts, or raw provider payloads.
+* **Failure semantics.** On a LiteLLM failure, a `SYSTEM_EVENT`
+  row is persisted with a sanitized stable code
+  (`LITELLM_TIMEOUT`, `LITELLM_UNAVAILABLE`, `LITELLM_RATE_LIMIT`,
+  `LITELLM_AUTH`, `LITELLM_QUOTA_EXHAUSTED`,
+  `LITELLM_PROVIDER_ERROR`, `LITELLM_MALFORMED_RESPONSE`,
+  `LITELLM_EMPTY_COMPLETION`, `AI_UNAVAILABLE` fallback). The raw
+  provider message is NEVER persisted. The user message is
+  always persisted before the AI call so a LiteLLM failure does
+  not lose user input.
+* **Hard delete with CASCADE.** `DELETE /conversations/{id}`
+  removes the row; the FK cascade removes every message. No soft
+  delete in Phase 5B. Archive (`PATCH is_archived=true`) is
+  separate from delete.
+* **No WebSockets, no streaming, no SSE, no Redis pub/sub.**
+  Phase 5B is REST only. The verifier greps `backend/app` for
+  `WebSocket`, `StreamingResponse`, `EventSourceResponse`,
+  `Socket.IO`, `redis.pubsub`, `aioredis` and fails if any are
+  present.
+* **No AI_ESTIMATE token.** The verifier greps the source tree
+  for `AI_ESTIMATE` and fails if it appears anywhere.

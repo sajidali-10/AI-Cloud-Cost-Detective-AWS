@@ -14,6 +14,13 @@ is created and migrated by Alembic (``backend/alembic/versions/
 Phase 5A adds the ``app_users`` table backing local application
 authentication and RBAC.  The schema is created and migrated by
 ``backend/alembic/versions/0002_app_users.py``.
+
+Phase 5B adds the ``conversations`` and ``conversation_messages``
+tables backing durable, user-owned AI conversation history.  The
+schema is created and migrated by
+``backend/alembic/versions/0003_conversations.py``.  Conversation
+history is non-authoritative: Phase 1–3 evidence remains the only
+trusted AWS source.
 """
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -194,4 +202,194 @@ class AppUser(Base):
         )
 
 
-__all__ = ["APP_USER_ROLES", "Base", "CostCache", "AppUser", "Decimal"]
+# Phase 5B — conversations + AI message history.
+#
+# Design principles (mirrored from the Phase 5A block above):
+#
+#   * BigInt primary keys via ``BigIntPK`` so the SQLite unit tests
+#     stay compatible with the Postgres production DSN.
+#   * UTC datetimes + ``server_default=func.now()`` so a
+#     misconfigured application clock cannot poison ordering.
+#   * The dialect-aware ``_JSONBType`` for metadata columns.
+#   * FKs declared with ``ON DELETE CASCADE`` so deleting a user
+#     (or a conversation) is hard-delete with a deterministic
+#     cascade — no orphan rows.
+#   * CHECK constraints at the database level so a programming bug
+#     cannot insert an unrecognised role.
+#
+# Conversation storage is private.  Every service-layer query is
+# scoped by ``user_id``; ownership is part of the WHERE clause, not
+# a post-fetch check.  Phase 4 authoritative evidence is preserved
+# by the AI service layer; the message table is for *history*, not
+# for evidence.
+
+# Controlled role set for ``conversation_messages.role``.
+CONVERSATION_MESSAGE_ROLES: tuple[str, ...] = ("USER", "ASSISTANT", "SYSTEM_EVENT")
+
+# Bounded default title — the API layer rejects empty / oversized
+# titles before they ever reach the ORM.
+DEFAULT_CONVERSATION_TITLE: str = "New Cost Analysis"
+
+
+class Conversation(Base):
+    """A single AI Cost Analyst conversation owned by one user.
+
+    Ownership is enforced at the service layer through every query
+    (``WHERE id = :cid AND user_id = :uid``).  This table never
+    carries messages — those live in :class:`ConversationMessage`
+    so listing a conversation does not force a join.
+    """
+
+    __tablename__ = "conversations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(title) > 0 AND length(title) <= 200",
+            name="ck_conversations_title_length",
+        ),
+        # Owner-scope index: every list/get-by-id query is keyed by
+        # ``user_id``; an index on (user_id) is the minimum.
+        Index("ix_conversations_user_id", "user_id"),
+        # (user_id, updated_at DESC) supports the default
+        # "newest/most-recently-active first" list ordering.
+        Index(
+            "ix_conversations_user_updated",
+            "user_id", "updated_at",
+        ),
+        # (user_id, is_archived, last_message_at DESC) supports the
+        # ``archived`` filter + activity sort.
+        Index(
+            "ix_conversations_user_archived_lastmsg",
+            "user_id", "is_archived", "last_message_at",
+        ),
+        # FK declared inline so the table-level constraint shows up
+        # in pg_constraint.  CASCADE keeps ownership deletion safe.
+        ForeignKeyConstraint(
+            ["user_id"],
+            ["app_users.id"],
+            name="fk_conversations_user_id",
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(
+        String(200), nullable=False, server_default=DEFAULT_CONVERSATION_TITLE
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    is_archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+
+    def touch(self, *, message_at: datetime | None = None) -> None:
+        """Bump ``updated_at`` (and optionally ``last_message_at``).
+
+        Called by the service layer after a successful message
+        insert.  Uses a UTC ``now()`` so application clocks cannot
+        skew the timestamp.
+        """
+        now = datetime.now(timezone.utc)
+        self.updated_at = now
+        if message_at is not None:
+            self.last_message_at = message_at
+
+    def __repr__(self) -> str:  # pragma: no cover — debug helper
+        return (
+            f"Conversation(id={self.id!r}, user_id={self.user_id!r}, "
+            f"title={self.title!r}, is_archived={self.is_archived!r})"
+        )
+
+
+class ConversationMessage(Base):
+    """A single message inside a conversation.
+
+    Role is constrained to ``USER``, ``ASSISTANT`` or
+    ``SYSTEM_EVENT``.  ``SYSTEM_EVENT`` rows are created by the
+    service layer for safe failure metadata (a sanitized
+    ``error_code``); they are NEVER used to push arbitrary system
+    instructions into the model's history — they are excluded from
+    history rendering.
+
+    Metadata columns are intentionally narrow JSONB blobs.  We do
+    NOT store the raw LiteLLM response, the Authorization header,
+    or any credential material.  The application layer validates
+    the shape before insertion.
+    """
+
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('USER', 'ASSISTANT', 'SYSTEM_EVENT')",
+            name="ck_conversation_messages_role",
+        ),
+        Index(
+            "ix_conversation_messages_conv_created",
+            "conversation_id", "created_at",
+        ),
+        Index(
+            "ix_conversation_messages_conv_role",
+            "conversation_id", "role",
+        ),
+        ForeignKeyConstraint(
+            ["conversation_id"],
+            ["conversations.id"],
+            name="fk_conversation_messages_conv_id",
+            ondelete="CASCADE",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(String, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # Optional provenance for ASSISTANT rows.  All nullable; the
+    # service layer only writes these for assistant messages.
+    operation_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model_alias: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    grounding_metadata: Mapped[dict | None] = mapped_column(_JSONBType, nullable=True)
+    evidence_references: Mapped[list | None] = mapped_column(_JSONBType, nullable=True)
+    warnings: Mapped[list | None] = mapped_column(_JSONBType, nullable=True)
+    token_usage: Mapped[dict | None] = mapped_column(_JSONBType, nullable=True)
+
+    # Sanitized error code for SYSTEM_EVENT rows (e.g. ``LITELLM_TIMEOUT``).
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover — debug helper
+        return (
+            f"ConversationMessage(id={self.id!r}, conversation_id={self.conversation_id!r}, "
+            f"role={self.role!r})"
+        )
+
+
+__all__ = [
+    "APP_USER_ROLES",
+    "CONVERSATION_MESSAGE_ROLES",
+    "Base",
+    "Conversation",
+    "ConversationMessage",
+    "CostCache",
+    "AppUser",
+    "DEFAULT_CONVERSATION_TITLE",
+    "Decimal",
+]

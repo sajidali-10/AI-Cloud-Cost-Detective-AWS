@@ -25,6 +25,12 @@ EVIDENCE_DELIMITER_OPEN: Final[str] = "<aws_evidence>"
 EVIDENCE_DELIMITER_CLOSE: Final[str] = "</aws_evidence>"
 USER_QUESTION_DELIMITER_OPEN: Final[str] = "<user_question>"
 USER_QUESTION_DELIMITER_CLOSE: Final[str] = "</user_question>"
+# Phase 5B — bounded prior-conversation history.  History is
+# treated as UNTRUSTED DATA; the delimiters identify the block so
+# the verification scripts can assert the model is never given
+# unflagged raw user history.
+HISTORY_DELIMITER_OPEN: Final[str] = "<conversation_history>"
+HISTORY_DELIMITER_CLOSE: Final[str] = "</conversation_history>"
 SAVINGS_PROTECTION_SENTINEL: Final[str] = (
     "Authoritative monthly savings are not available for this recommendation."
 )
@@ -141,14 +147,33 @@ def user_question_block(question: str) -> str:
     )
 
 
+def history_block(history_text: str) -> str:
+    """Wrap rendered conversation history in the stable delimiters.
+
+    The block is empty when ``history_text`` is empty so callers can
+    safely call this unconditionally.  This is the only place the
+    history delimiters are emitted; the AI service includes the
+    rendered output in the user-message body.
+    """
+    text = (history_text or "").strip()
+    if not text:
+        return ""
+    return (
+        f"{HISTORY_DELIMITER_OPEN}\n{text}\n{HISTORY_DELIMITER_CLOSE}"
+    )
+
+
 __all__ = [
     "EVIDENCE_DELIMITER_CLOSE",
     "EVIDENCE_DELIMITER_OPEN",
+    "HISTORY_DELIMITER_CLOSE",
+    "HISTORY_DELIMITER_OPEN",
     "SAVINGS_PROTECTION_SENTINEL",
     "SYSTEM_PROMPT",
     "USER_QUESTION_DELIMITER_CLOSE",
     "USER_QUESTION_DELIMITER_OPEN",
     "build_system_prompt",
     "evidence_block",
+    "history_block",
     "user_question_block",
 ]
