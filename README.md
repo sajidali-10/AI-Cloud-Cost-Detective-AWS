@@ -1,16 +1,19 @@
 # AI Cloud Cost Detective — AWS Edition
 
-Phase 2 cost & utilization intelligence on top of a secure, reproducible,
+Phase 4 grounded AI Cost Analyst on top of a secure, reproducible,
 low-cost Docker Compose stack: Nginx (public :80) fronting a FastAPI backend
 and a React+Vite+TS frontend, with PostgreSQL (Alembic-migrated) and LiteLLM
 Gateway reachable only on the internal Docker network.
 
-> **Phase 2 status**: cost & utilization intelligence is shipped.
-> Cost Explorer aggregation, CloudWatch utilization, an evidence layer that
-> joins Phase 1 resource metadata with cost + utilization, and a read-through
-> cache with TTL + probabilistic GC are all live. The implementation is
-> **strictly read-only**: no Boto3 call site mutates AWS state, and every
-> call site is wrapped by an application-layer guard.
+> **Phase 4 status**: grounded AI Cost Analyst is shipped.
+> Phase 1–3 evidence (read-only AWS inventory, Cost Explorer + CloudWatch,
+> optimization recommendations) is fed to a LiteLLM Gateway-backed
+> advisory AI. The AI layer is **strictly grounded**: it can only
+> explain, summarize, prioritize, and answer FinOps questions — it can
+> never invent resources, costs, savings, or recommendation sources.
+> Phase 4 ships **disabled by default** (`AI_ENABLED=false`) and is
+> fully validated via mocked LiteLLM responses. Phase 1–3 endpoints
+> remain fully functional regardless of the AI layer's state.
 
 ## Architecture
 
@@ -22,12 +25,19 @@ Browser → Nginx (public :80)
                               │     └── cost_cache (Alembic-managed)
                               └── LiteLLM Gateway (internal :4000)
 
-Phase 2 reads from AWS (no writes):
+Phase 1–3 read from AWS (no writes):
    /api/aws/identity     → STS GetCallerIdentity
    /api/aws/resources    → EC2/EBS/EIP/NAT/ELBv2/RDS/Lambda/S3 + Resource Explorer + Tagging
    /api/aws/costs        → Cost Explorer GetCostAndUsage (UnblendedCost)
    /api/aws/utilization  → CloudWatch GetMetricData (batched)
    /api/aws/evidence     → Phase 1 + Cost Explorer + CloudWatch, composed
+   /api/aws/optimization/*  → CO + COH + deterministic recommendations
+
+Phase 4 (advisory AI, grounded in Phase 1–3 evidence):
+   /api/ai/status                              → AI capability / readiness
+   /api/ai/executive-summary                   → Grounded executive FinOps summary
+   /api/ai/analyze                             → Grounded Q&A against the evidence
+   /api/ai/recommendations/{id}/explain        → Single-recommendation explanation
 ```
 
 ## Prerequisites
@@ -50,8 +60,8 @@ make up
 # 3. Apply the Alembic migrations (creates cost_cache)
 make migrate
 
-# 4. Run the Phase 3 verifier end-to-end (Phase 1 -> Phase 2 -> Phase 3)
-make verify-phase3
+# 4. Run the Phase 4 verifier end-to-end (Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 4)
+make verify-phase4
 
 # 5. Open http://localhost (or your server's public IP, port 80)
 ```
@@ -120,9 +130,53 @@ make verify          # Phase 0 verifier (platform foundation)
 make verify-phase1   # Phase 1 verifier (AWS identity + resource discovery)
 make verify-phase2   # Phase 2 verifier (cost + utilization + evidence + cache)
 make verify-phase3   # Phase 3 verifier (optimization intelligence)
+make verify-phase4   # Phase 4 verifier (grounded AI Cost Analyst + LiteLLM)
 make down            # stop the stack (keeps volumes)
 make clean           # stop AND remove volumes (destructive; 5s grace)
 ```
+
+## Phase 4 AI Cost Analyst
+
+Phase 4 ships **disabled by default**.  The AI layer is built and
+fully validated via mocked LiteLLM responses so no paid provider
+is contacted during development.  All Phase 1–3 endpoints remain
+fully functional regardless of the AI layer's state.
+
+| Method | Path                                          | Body / Query                                                          | Purpose                                                  |
+| ------ | --------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------- |
+| GET    | `/api/ai/status`                              | -                                                                     | AI capability / readiness snapshot (no secrets exposed)  |
+| POST   | `/api/ai/executive-summary`                   | `{region?, days: 7\|30\|60\|90}`                                      | Grounded executive FinOps summary                        |
+| POST   | `/api/ai/analyze`                             | `{region?, days: 7\|30\|60\|90, question: string}`                    | Grounded Q&A against the evidence package                |
+| POST   | `/api/ai/recommendations/{recommendation_id}/explain` | `{region?, days: 7\|30\|60\|90}`                                | Single-recommendation explanation                        |
+
+When `AI_ENABLED=false`, every generation endpoint returns
+HTTP 200 with a controlled envelope (`status=DISABLED`).
+
+When `AI_ENABLED=true`, all backend LLM traffic flows through the
+LiteLLM Gateway (`LITELLM_BASE_URL` / `LITELLM_MODEL`).  The
+backend never imports any provider SDK; provider portability
+belongs behind LiteLLM.
+
+### Phase 4 configuration
+
+All knobs are environment-driven (see `.env.example`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `AI_ENABLED` | `false` | Master switch. |
+| `LITELLM_BASE_URL` | `http://litellm:4000` | Internal LiteLLM Gateway URL. |
+| `LITELLM_MODEL` | `cost-detective-free` | Logical model alias. |
+| `LITELLM_API_KEY` | empty | Optional API key for the gateway. |
+| `AI_REQUEST_TIMEOUT_SECONDS` | `30` | Hard timeout on every completion call. |
+| `AI_MAX_OUTPUT_TOKENS` | `800` | Bounded output budget. |
+| `AI_MAX_CONTEXT_RECOMMENDATIONS` | `20` | Cap on recommendations in the prompt. |
+| `AI_MAX_CONTEXT_SERVICES` | `15` | Cap on services in the prompt. |
+| `AI_MAX_CONTEXT_REGIONS` | `10` | Cap on regions in the prompt. |
+| `AI_MAX_QUESTION_LENGTH` | `2000` | Maximum user-question length. |
+
+The full grounding contract, prompt-injection defense, citation
+validation, and cost controls are documented in
+`docs/phase4-ai-cost-analyst.md`.
 
 ## How secrets are generated
 
@@ -158,14 +212,14 @@ and **never** echoed or committed.
 
 ## Phase boundary
 
-Phase 2 does **not** include: Compute Optimizer, Cost Optimization Hub,
-LiteLLM/AI analysis of cost data, JWT auth, signup/login, report-history
-persistence, the production dashboard, WebSockets, Terraform/IaC, automated
-AWS remediation, or multi-region fanout. These are documented under
-"Deferred to later phase" in `docs/phase2-cost-intelligence.md`.
+Phase 4 does **not** include: JWT auth, RBAC, user accounts, conversation
+persistence, WebSockets, a professional AI dashboard/chat frontend, Terraform
+or other IaC, automated AWS remediation, agents, vector databases, embeddings,
+RAG infrastructure, scheduled AI jobs, or multi-model fanout.  These are
+documented under "Deferred" in `docs/phase4-report.md`.
 
 ## Next planned phase
 
-Phase 3 will add the Compute Optimizer + Cost Optimization Hub surfaces
-on top of the Phase 2 evidence layer.  Phase 3 is **not** part of this
-slice.
+Phase 5 (and beyond) would add authentication, RBAC, conversation
+persistence, and a polished AI chat experience on top of the Phase 4
+grounded AI layer.  Phase 5 is **not** part of this slice.

@@ -9,7 +9,7 @@ No AWS credentials or paid AI provider keys are required in Phase 0.
 from functools import lru_cache
 from typing import List
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +51,40 @@ class Settings(BaseSettings):
     # --- AWS region (no AWS keys in Phase 0) ---
     aws_default_region: str = Field(default="us-east-1")
 
+    # --- Phase 4: AI Cost Analyst (LiteLLM Gateway) ---
+    # Master switch. When False, every /api/ai/* generation endpoint
+    # returns a controlled "AI_DISABLED" response without contacting
+    # any provider. The status endpoint still reports the disabled
+    # state so operators can confirm the configuration.
+    ai_enabled: bool = Field(default=False)
+    # Base URL for the LiteLLM gateway. When LITELLM_BASE_URL is unset
+    # we fall back to http://<litellm_host>:<litellm_port> below.
+    litellm_base_url: str = Field(default="")
+    litellm_model: str = Field(default="cost-detective-free")
+    litellm_api_key: str = Field(default="")
+    ai_request_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    ai_max_output_tokens: int = Field(default=800, ge=1, le=4000)
+    ai_max_context_recommendations: int = Field(default=20, ge=1, le=100)
+    ai_max_context_services: int = Field(default=15, ge=1, le=50)
+    ai_max_context_regions: int = Field(default=10, ge=1, le=50)
+    ai_max_question_length: int = Field(default=2000, ge=1, le=10000)
+
+    @model_validator(mode="after")
+    def _resolve_litellm_base_url(self) -> "Settings":
+        """Fill ``litellm_base_url`` from host+port when unset.
+
+        Keeps the existing Phase 0/1/2/3 internal Docker URL the
+        default, while letting operators override via LITELLM_BASE_URL
+        for tests or alternate deployments.
+        """
+        if not self.litellm_base_url:
+            object.__setattr__(
+                self,
+                "litellm_base_url",
+                f"http://{self.litellm_host}:{self.litellm_port}",
+            )
+        return self
+
     @property
     def cors_allowed_origins_list(self) -> List[str]:
         if not self.cors_allowed_origins:
@@ -65,10 +99,6 @@ class Settings(BaseSettings):
             f"{self.cost_detective_db_password}@{self.postgres_host}:"
             f"{self.postgres_port}/{self.cost_detective_db}"
         )
-
-    @property
-    def litellm_base_url(self) -> str:
-        return f"http://{self.litellm_host}:{self.litellm_port}"
 
 
 @lru_cache(maxsize=1)

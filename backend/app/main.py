@@ -19,6 +19,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.aws import router as aws_router
+# Phase 4: AI Cost Analyst router (own /ai prefix).  Imported for
+# its side-effect of registering @router.<verb> decorators.
+from app.api import ai as ai_routes  # noqa: F401  (registers /api/ai/*)
 # Phase 2: cost + utilization + evidence routes.  Importing these
 # modules is what triggers their @aws_router.<verb> decorators, which
 # in turn registers the routes on the FastAPI app.  The modules are
@@ -41,13 +44,19 @@ settings = get_settings()
 app = FastAPI(
     title="AI Cloud Cost Detective — Backend",
     version="0.1.0",
-    description="Phase 3 AWS optimization intelligence (read-only).",
+    description=(
+        "Phase 4 AI Cost Analyst + LiteLLM Gateway integration "
+        "(read-only AWS evidence + grounded advisory AI)."
+    ),
 )
 
 # Phase 1: read-only AWS identity + resource discovery router.
 # Mounted at /aws/identity and /aws/resources. Nginx strips the /api/ prefix
 # before proxying, so /api/aws/identity (public) becomes /aws/identity inside.
 app.include_router(aws_router)
+
+# Phase 4: AI Cost Analyst router (own /ai prefix; Nginx strips /api/).
+app.include_router(ai_routes.router)
 
 
 def _safe_component_status(name: str, exc: Exception) -> str:
