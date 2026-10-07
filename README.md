@@ -30,6 +30,16 @@ Gateway reachable only on the internal Docker network.
 > rather than inventing anonymous persistent ownership. The Phase 4
 > grounding contract and Phase 5A RBAC are preserved end-to-end.
 
+> **Phase 5C status**: a single, secure, single-conversation WebSocket
+> endpoint is shipped at `/api/ws/conversations/{conversation_id}`. The
+> bearer token travels in the `Sec-WebSocket-Protocol` header (never in
+> the URL — nginx `access_log` would record it). JWT validation reuses
+> Phase 5A; the authoritative DB role is used for authorization; VIEWER
+> is denied; cross-user and nonexistent conversations collapse to the
+> same 4404 close code. Conversation history remains untrusted data and
+> fresh Phase 1–3 evidence is gathered on every AI call. `AUTH_ENABLED=false`
+> closes the upgrade with 1008. nginx is the only publicly exposed service.
+
 ## Architecture
 
 ```
@@ -148,6 +158,7 @@ make verify-phase3   # Phase 3 verifier (optimization intelligence)
 make verify-phase4   # Phase 4 verifier (grounded AI Cost Analyst + LiteLLM)
 make verify-phase5a  # Phase 5A verifier (auth + RBAC)
 make verify-phase5b  # Phase 5B verifier (conversation + AI history persistence)
+make verify-phase5c  # Phase 5C verifier (secure WebSocket realtime layer)
 make down            # stop the stack (keeps volumes)
 make clean           # stop AND remove volumes (destructive; 5s grace)
 ```
@@ -238,6 +249,36 @@ persistence flow, failure semantics, and prompt-injection
 defense are documented in
 `docs/phase5b-conversation-persistence.md` and
 `docs/phase5b-report.md`.
+
+## Phase 5C Secure WebSocket Realtime Layer
+
+Phase 5C adds a single, secure, single-conversation WebSocket
+endpoint on top of the Phase 5B durable conversation surface
+and the Phase 4 grounded AI. The full protocol is versioned
+(`v1`) and documented in `docs/phase5c-websocket-realtime.md`.
+
+| Surface                                                    | Behaviour                                                              |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `WS /api/ws/conversations/{conversation_id}`               | Authenticated, ownership-scoped, single-conversation realtime channel  |
+
+The bearer token travels in the `Sec-WebSocket-Protocol` header
+(`bearer.<jwt>`) — NEVER in the URL — so nginx `access_log`
+does not record it. Non-browser clients that CAN set the
+`Authorization` header continue to work; the same
+`SecurityCore.decode_token` validates either source.
+
+Auth, RBAC, ownership, and prompt-injection defenses are
+identical to the Phase 5B REST surface. The DB role is
+authoritative; VIEWER is denied; cross-user and nonexistent
+conversations collapse to the same 4404 close code. Fresh
+Phase 1–3 evidence is gathered on every AI call; conversation
+history is untrusted data wrapped in
+`<conversation_history>…</conversation_history>` delimiters.
+`AUTH_ENABLED=false` closes the upgrade with 1008.
+
+The full protocol (events, close codes, error-code registry,
+input limits, failure matrix) is documented in
+`docs/phase5c-websocket-realtime.md` and `docs/phase5c-report.md`.
 
 ## How secrets are generated
 

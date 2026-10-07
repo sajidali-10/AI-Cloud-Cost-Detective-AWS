@@ -38,6 +38,13 @@ from app.api.auth import router as auth_router
 from app.api.admin_users import router as admin_users_router
 # Phase 5B: durable conversation + AI history routes.
 from app.api.conversations import router as conversations_router
+# Phase 5C: secure WebSocket realtime conversation transport.
+# Mounted under its own prefix (/ws/conversations) so the public path
+# becomes /api/ws/conversations/{id} after nginx strips /api/.  The
+# WebSocket router does NOT inherit the JSON ``HTTPException``
+# handler below because it sends structured events, not HTTP
+# responses.
+from app.api.ws_conversations import router as ws_conversations_router
 from app.core.config import get_settings
 from app.db.session import get_engine
 
@@ -75,6 +82,13 @@ app.include_router(admin_users_router)
 # prefix; nginx strips /api/).  Requires AUTH_ENABLED=true; returns
 # a controlled ``AuthDisabled`` response otherwise.
 app.include_router(conversations_router)
+
+# Phase 5C: realtime conversation WebSocket router (own
+# /ws/conversations prefix; nginx strips /api/).  The endpoint
+# requires AUTH_ENABLED=true and closes the upgrade with a 1008
+# policy-violation code when authentication is disabled.  nginx is
+# responsible for the WebSocket upgrade headers.
+app.include_router(ws_conversations_router)
 
 
 # ---------------------------------------------------------------------------

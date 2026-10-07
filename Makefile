@@ -61,6 +61,12 @@ verify-phase4:
 verify-phase5a:
 	bash scripts/phase5a_verify.sh
 
+verify-phase5b:
+	bash scripts/phase5b_verify.sh
+
+verify-phase5c:
+	bash scripts/phase5c_verify.sh
+
 create-admin:
 	$(COMPOSE) exec backend python scripts/create_admin.py
 

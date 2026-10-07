@@ -1,7 +1,9 @@
-# Security — Phase 0
+# Security
 
-This document records the security decisions implemented in Phase 0 and the
-threats that are explicitly **out of scope** for this phase.
+This document records the security decisions implemented across phases
+0–5C and the threats that are explicitly **out of scope**. Each phase
+section is self-contained and additive — older decisions are NOT
+overridden by newer phases.
 
 ## Network isolation
 
@@ -245,3 +247,79 @@ if any match is found:
   present.
 * **No AI_ESTIMATE token.** The verifier greps the source tree
   for `AI_ESTIMATE` and fails if it appears anywhere.
+
+## Phase 5C additions (Secure WebSocket realtime layer)
+
+* **JWT validation reuses Phase 5A.** The WS layer calls
+  `SecurityCore.decode_token` from
+  `app/core/security.py`; no JWT parsing, signature
+  verification, or role decision is duplicated.
+* **Token transport is a header, never the URL.** Native browser
+  `WebSocket` cannot set the `Authorization` header freely, so
+  the bearer token travels in the `Sec-WebSocket-Protocol`
+  header (`bearer.<jwt>`). nginx `access_log` records the URL
+  on every request, so a token in the query would leak into
+  log aggregation. The token is NEVER echoed in any response
+  event and is NEVER logged.
+* **Authoritative DB role, not JWT role claim.** The
+  `resolve_ws_principal` helper loads the user via
+  `AuthService.get_active_user` and rejects users whose DB
+  role is `VIEWER` (or anything other than `ADMIN`/`ANALYST`)
+  even if the JWT `role` claim says `ADMIN`. The Phase 5A
+  contract is preserved end-to-end.
+* **`AUTH_ENABLED=false` denies durable WS conversations.**
+  The handshake closes the upgrade with 1008 (policy
+  violation). No anonymous persistent ownership is invented.
+* **Cross-user / nonexistent conversations collapse to the
+  same 4404 close code.** `ConversationService.get` raises
+  `ConversationNotFound` for both cases so a caller cannot
+  enumerate IDs by distinguishing "not found" from "not
+  yours". Even an `ADMIN` cannot read another user's private
+  conversation merely because they are `ADMIN` — the SQL
+  guard is `WHERE id = :cid AND user_id = :uid`.
+* **Fresh Phase 1–3 evidence remains authoritative.** Every
+  `user_message` invokes `AIService.generate_analysis_with_history`
+  which re-runs the Phase 1–3 evidence pipeline. Prior turns
+  are data, not evidence, and are wrapped in
+  `<conversation_history>…</conversation_history>` delimiters.
+* **No `AI_ESTIMATE`, no invented savings.** The Phase 3
+  null-savings protection is preserved end-to-end. The
+  grounding metadata shape is unchanged from Phase 4.
+* **No secret / JWT / AWS / provider-credential logging.**
+  Every `error.message` is sanitized. Tests
+  `test_no_jwt_in_connected_event`,
+  `test_no_aws_credentials_in_any_event`, and
+  `test_no_jwt_or_provider_keys_in_events` assert the
+  absence of `AKIA`, `sk-`, `Bearer `, `secret`, and the
+  caller-supplied JWT from every event payload.
+* **No raw LiteLLM payload leakage.** The wire envelope
+  exposes only `answer`, `model`, `grounding`, `citations`,
+  `warnings`. The `choices` array and any other provider
+  detail are NEVER emitted. Stable codes
+  (`LITELLM_TIMEOUT`, `LITELLM_RATE_LIMIT`, etc.) are used
+  for failure surfacing; raw provider messages are
+  discarded.
+* **One bounded AI operation per connection.** The handler
+  uses an `asyncio.Lock` and an `inflight` flag, set on
+  entry and reset on every exit path including exceptions.
+  Duplicate `request_id` values are deduplicated via a
+  bounded FIFO and answered with a sanitized `error`
+  (`code=Busy`).
+* **Input limits (defense in depth).** Raw WebSocket frames
+  are capped at 64 KiB; questions at 2000 chars; regions at
+  64 chars; `days` must be one of `(7, 30, 60, 90)`;
+  `request_id` must be a UUID; server events are capped at
+  1 MiB. Anything beyond these limits is rejected with a
+  sanitized `error` event so a buggy client can recover.
+* **Normal disconnects handled cleanly.** `WebSocketDisconnect`
+  is caught, the database session is closed in a `finally`
+  block, and a sanitized log line is emitted. The client
+  can reconnect; the prior history is preserved.
+* **nginx remains the only publicly exposed service.** A new
+  `/api/ws/` location was added with the WebSocket upgrade
+  headers and generous AI-friendly timeouts. Verified by
+  `scripts/phase5c_verify.sh` (check #7 — no public port
+  other than nginx; check #10 — nginx WS config present).
+* **No Redis / Kafka / API Gateway WebSockets / SSE /
+  Socket.IO introduced.** Verified by
+  `scripts/phase5c_verify.sh` (check #11).
