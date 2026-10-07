@@ -13,7 +13,9 @@
     "isolatedModules": true,
     "noEmit": true,
     "useDefineForClassFields": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/tests", "node_modules", "dist"]
 }

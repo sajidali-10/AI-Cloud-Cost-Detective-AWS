@@ -1,65 +1,119 @@
-import { useEffect, useState } from 'react'
+// Phase 6A — Application root.
+//
+// Composes providers in the correct order:
+//   ThemeProvider   → sets data-theme + manages persistence
+//     AuthProvider  → reads theme via document attribute (no dep on ThemeProvider)
+//       Router      → routes + role-aware guards
+//         Routes    → role-checked route tree
+//           Pages
+//
+// Theme is intentionally outside Auth so 401-driven redirects keep
+// the user's chosen palette.
 
-type ReadyResponse = {
-  status: 'ready' | 'degraded'
-  components?: Record<string, string>
-} | null
+import { ThemeProvider } from './lib/theme'
+import { AuthProvider, useAuth } from './lib/auth'
+import { Router, Routes, Navigate, type RouteSpec } from './lib/router'
+import { AppShell } from './components/AppShell'
+import { LoginPage } from './pages/LoginPage'
+import { DashboardPage } from './pages/DashboardPage'
+import { CostsPage } from './pages/CostsPage'
+import { ResourcesPage } from './pages/ResourcesPage'
+import { OptimizationPage } from './pages/OptimizationPage'
+import { AIAnalystPage } from './pages/AIAnalystPage'
+import { ConversationsPage } from './pages/ConversationsPage'
+import { UsersPage } from './pages/UsersPage'
+import { SecurityPage } from './pages/SecurityPage'
+import { LoadingSkeleton } from './components/LoadingSkeleton'
 
 export default function App() {
-  const [ready, setReady] = useState<ReadyResponse>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    // Same-origin: Nginx strips /api and forwards to backend.
-    // No hardcoded localhost:8000 / 127.0.0.1:8000 / EC2 IP anywhere.
-    fetch('/api/health/ready')
-      .then(async (r) => {
-        const body = await r.json()
-        setReady(body)
-      })
-      .catch((e: Error) => setError(e.message))
-  }, [])
-
   return (
-    <main className="min-h-full flex flex-col items-center justify-center px-6 text-center">
-      <h1 className="text-4xl md:text-5xl font-bold tracking-tight">
-        AI Cloud Cost Detective
-      </h1>
-      <p className="mt-2 text-lg md:text-xl text-slate-300">AWS Edition</p>
-
-      <section className="mt-10 w-full max-w-xl rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
-        <h2 className="text-xl font-semibold">Platform Foundation Status</h2>
-        <p className="mt-2 text-sm text-slate-400">
-          Phase 0: backend, database, and LiteLLM Gateway reachability.
-        </p>
-
-        <div className="mt-5 grid gap-2 text-left text-sm">
-          <Row k="backend"  v={ready?.components?.backend} />
-          <Row k="database" v={ready?.components?.database} />
-          <Row k="litellm"  v={ready?.components?.litellm} />
-        </div>
-
-        <p className="mt-5 text-xs text-slate-500">
-          status: <code className="text-slate-300">{ready?.status ?? (error ? 'error' : 'loading')}</code>
-        </p>
-      </section>
-
-      <footer className="mt-12 text-xs text-slate-500">
-        Phase 0 does not analyze AWS resources yet. Phase 0 does not invoke any LLM.
-      </footer>
-    </main>
+    <ThemeProvider>
+      <Router>
+        <AuthProvider>
+          <AppRoot />
+        </AuthProvider>
+      </Router>
+    </ThemeProvider>
   )
 }
 
-function Row({ k, v }: { k: string; v?: string }) {
-  const tone =
-    v === 'ok'    ? 'text-emerald-400' :
-    v === 'error' ? 'text-amber-400'   :
-                    'text-slate-400'
+function AppRoot() {
+  const { status, ready, role, user, authEnabled } = useAuth()
+
+  // Bootstrap gate — while we don't yet know whether auth is on,
+  // render a small neutral placeholder inside the theme so the
+  // first paint uses the correct palette.
+  if (!ready) {
+    return <BootScreen />
+  }
+
+  // Auth required but missing — render the login route only.
+  // The login page itself handles "auth disabled" redirects.
+  if (authEnabled && status.phase !== 'authenticated') {
+    return (
+      <Routes
+        routes={[{ path: '/login', element: <LoginPage /> }, { path: '*', element: <LoginPage /> }]}
+        currentRole={role}
+      />
+    )
+  }
+
+  // Authenticated (or auth disabled) — render the full app.
   return (
-    <div className="flex justify-between border-b border-slate-800 py-1">
-      <span className="text-slate-400">{k}</span>
-      <span className={tone}>{v ?? '—'}</span>
+    <AppShell>
+      <Routes
+        currentRole={role}
+        routes={buildRoutes({ role, user, authEnabled })}
+      />
+    </AppShell>
+  )
+}
+
+interface BuildRoutesArgs {
+  role: ReturnType<typeof useAuth>['role']
+  user: ReturnType<typeof useAuth>['user']
+  authEnabled: boolean
+}
+
+function buildRoutes({ role, user, authEnabled }: BuildRoutesArgs): RouteSpec[] {
+  const r: RouteSpec[] = [
+    { path: '/', element: <DashboardPage /> },
+    { path: '/costs', element: <CostsPage /> },
+    { path: '/resources', element: <ResourcesPage /> },
+    { path: '/optimization', element: <OptimizationPage /> },
+  ]
+  if (role === 'ADMIN' || role === 'ANALYST') {
+    r.push({ path: '/analyst', element: <AIAnalystPage /> })
+    r.push({ path: '/conversations', element: <ConversationsPage /> })
+  }
+  if (role === 'ADMIN') {
+    r.push({ path: '/users', element: <UsersPage /> })
+    r.push({ path: '/security', element: <SecurityPage /> })
+  }
+  // Login route — accessible only when auth is enabled and the user
+  // is NOT authenticated.  Once signed in the user is redirected
+  // to the dashboard by the LoginPage effect, but we still resolve
+  // /login → / to avoid the login card flashing when the user is
+  // already authenticated.
+  if (authEnabled && !user) {
+    r.push({ path: '/login', element: <LoginPage /> })
+  } else if (user) {
+    r.push({ path: '/login', element: <Navigate to="/" replace /> })
+  }
+  return r
+}
+
+function BootScreen() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-bg px-6">
+      <div className="flex flex-col items-center gap-3">
+        <div className="h-8 w-32 animate-pulse rounded bg-surface-2" aria-hidden />
+        <p className="text-xs text-fg-muted">Initializing…</p>
+        <span className="sr-only" role="status">
+          <LoadingSkeleton className="sr-only" />
+          Loading application
+        </span>
+      </div>
     </div>
   )
 }

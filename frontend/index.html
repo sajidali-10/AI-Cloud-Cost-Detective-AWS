@@ -3,9 +3,44 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Cloud Cost Detective — Phase 0</title>
+    <meta name="color-scheme" content="dark light" />
+    <title>AI Cloud Cost Detective</title>
+    <!--
+      No-flash theme bootstrap.  Runs synchronously BEFORE React mounts
+      so the user never sees the wrong palette.  Order:
+        1. localStorage('accd.theme') — explicit user choice wins.
+        2. prefers-color-scheme — first-visit system default.
+        3. fall back to 'dark' if neither is available.
+      The chosen value is applied as <html data-theme="...">; the
+      ThemeProvider in React reads the attribute at mount so the two
+      stay in sync.
+    -->
+    <script>
+      (function () {
+        try {
+          var stored = window.localStorage.getItem('accd.theme');
+          var theme;
+          if (stored === 'dark' || stored === 'light') {
+            theme = stored;
+          } else if (
+            window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: light)').matches
+          ) {
+            theme = 'light';
+          } else {
+            theme = 'dark';
+          }
+          document.documentElement.setAttribute('data-theme', theme);
+          document.documentElement.classList.add('theme-' + theme);
+        } catch (e) {
+          /* localStorage blocked — fall back to dark */
+          document.documentElement.setAttribute('data-theme', 'dark');
+          document.documentElement.classList.add('theme-dark');
+        }
+      })();
+    </script>
   </head>
-  <body class="bg-slate-950 text-slate-100">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

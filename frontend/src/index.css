@@ -2,6 +2,169 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root {
+/* -------------------------------------------------------------------------
+ * Phase 6A — Semantic theme tokens.
+ *
+ * Two palettes are defined:
+ *   - :root              → dark (default)
+ *   - .theme-light       → light (set on <html> alongside data-theme="light")
+ *
+ * The :root rules are duplicated under .theme-light to keep parity for
+ * any non-Tailwind selector.  The Tailwind theme in
+ * `tailwind.config.js` reads these via `var(--token)` so every
+ * component consumes semantic classes (bg-surface, text-fg-primary,
+ * border-border, ...).  Do not hardcode hex values in components.
+ * ------------------------------------------------------------------------- */
+
+:root,
+[data-theme='dark'] {
+  /* canvas */
+  --bg: #0b1426;
+  --bg-elevated: #0f1c33;
+  /* surfaces (cards / panels) */
+  --surface: #152339;
+  --surface-2: #1b2b46;
+  --surface-hover: #1f3253;
+  /* borders */
+  --border: #233553;
+  --border-strong: #2f4571;
+  /* text */
+  --fg-primary: #f1f5f9;
+  --fg-secondary: #b8c4d6;
+  --fg-muted: #7d8aa3;
+  --fg-inverse: #0b1426;
+  /* brand / primary — HipLink cyan */
+  --primary: #22d3ee;
+  --primary-hover: #06b6d4;
+  --primary-soft: rgba(34, 211, 238, 0.14);
+  --primary-foreground: #062b35;
+  /* state */
+  --success: #34d399;
+  --success-soft: rgba(52, 211, 153, 0.14);
+  --warning: #f59e0b;
+  --warning-soft: rgba(245, 158, 11, 0.16);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.16);
+  --info: #38bdf8;
+  --info-soft: rgba(56, 189, 248, 0.16);
+  /* AI accent — restrained purple */
+  --ai-accent: #a78bfa;
+  --ai-soft: rgba(167, 139, 250, 0.18);
+  /* shadows */
+  --shadow-card-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-card-md: 0 6px 16px rgba(0, 0, 0, 0.35);
+  --shadow-focus: 0 0 0 2px rgba(34, 211, 238, 0.45);
+  /* focus ring */
+  --ring: 0 0 0 2px rgba(34, 211, 238, 0.55);
+}
+
+.theme-light,
+[data-theme='light'] {
+  /* canvas */
+  --bg: #f1f5f9;
+  --bg-elevated: #ffffff;
+  /* surfaces */
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --surface-hover: #e2e8f0;
+  /* borders */
+  --border: #d8e0ec;
+  --border-strong: #b6c2d3;
+  /* text */
+  --fg-primary: #0f172a;
+  --fg-secondary: #475569;
+  --fg-muted: #64748b;
+  --fg-inverse: #ffffff;
+  /* brand — same cyan, accessible contrast on white */
+  --primary: #0891b2;
+  --primary-hover: #0e7490;
+  --primary-soft: rgba(8, 145, 178, 0.10);
+  --primary-foreground: #ffffff;
+  /* state — accessible on white */
+  --success: #15803d;
+  --success-soft: rgba(21, 128, 61, 0.10);
+  --warning: #b45309;
+  --warning-soft: rgba(180, 83, 9, 0.12);
+  --danger: #b91c1c;
+  --danger-soft: rgba(185, 28, 28, 0.10);
+  --info: #0369a1;
+  --info-soft: rgba(3, 105, 161, 0.10);
+  /* AI accent */
+  --ai-accent: #6d28d9;
+  --ai-soft: rgba(109, 40, 217, 0.10);
+  /* shadows */
+  --shadow-card-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-card-md: 0 6px 16px rgba(15, 23, 42, 0.08);
+  --shadow-focus: 0 0 0 2px rgba(8, 145, 178, 0.45);
+  --ring: 0 0 0 2px rgba(8, 145, 178, 0.55);
+}
+
+/* ----------------------------------------------------------------------- */
+
+html,
+body,
+#root {
   height: 100%;
+}
+
+html {
+  background: var(--bg);
+  color: var(--fg-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg-primary);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+/* Visible keyboard focus — never disabled without a replacement. */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+  border-radius: 6px;
+}
+
+/* Reduce-motion respect */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Compact scrollbars (WebKit + Firefox) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-muted);
+  background-clip: padding-box;
+  border: 2px solid transparent;
 }
