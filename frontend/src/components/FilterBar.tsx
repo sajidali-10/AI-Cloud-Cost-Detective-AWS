@@ -23,6 +23,7 @@ export interface FilterSelectProps {
   options: ReadonlyArray<{ value: string; label: string }>
   onChange: (value: string) => void
   disabled?: boolean
+  testId?: string
 }
 
 export function FilterSelect({
@@ -31,6 +32,7 @@ export function FilterSelect({
   options,
   onChange,
   disabled = false,
+  testId,
 }: FilterSelectProps) {
   return (
     <label className="inline-flex items-center gap-2 text-xs text-fg-muted">
@@ -39,6 +41,7 @@ export function FilterSelect({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}
+        data-testid={testId}
         className="
           rounded-md border border-border bg-surface px-2 py-1 text-xs
           text-fg-primary focus:outline-none focus-visible:shadow-focus

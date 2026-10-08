@@ -35,6 +35,10 @@ export interface DataTableProps<T> {
   caption?: string
   /** When true the table becomes horizontally scrollable on small screens. */
   scrollable?: boolean
+  /** Optional row click handler. */
+  onRowClick?: (row: T) => void
+  /** Predicate — return false to make the row non-interactive. */
+  isRowClickable?: (row: T) => boolean
 }
 
 export function DataTable<T>({
@@ -45,6 +49,8 @@ export function DataTable<T>({
   emptyState,
   caption,
   scrollable = true,
+  onRowClick,
+  isRowClickable,
 }: DataTableProps<T>) {
   const table = (
     <table className="min-w-full text-sm">
@@ -83,28 +89,46 @@ export function DataTable<T>({
             </td>
           </tr>
         ) : (
-          rows.map((row) => (
-            <tr
-              key={rowKey(row)}
-              className="text-fg-primary transition-colors hover:bg-surface-hover"
-            >
-              {columns.map((col) => {
-                const value = col.valueFor ? col.valueFor(row) : (row as Record<string, unknown>)[col.key]
-                return (
-                  <td
-                    key={col.key}
-                    className={[
-                      'px-3 py-2 align-middle',
-                      col.numeric ? 'text-right tabular-nums' : 'text-left',
-                      col.hideOnMobile ? 'hidden sm:table-cell' : '',
-                    ].join(' ')}
-                  >
-                    {col.cell(row, value)}
-                  </td>
-                )
-              })}
-            </tr>
-          ))
+          rows.map((row) => {
+            const clickable = !!(onRowClick && (isRowClickable ? isRowClickable(row) : true))
+            return (
+              <tr
+                key={rowKey(row)}
+                onClick={clickable ? () => onRowClick?.(row) : undefined}
+                tabIndex={clickable ? 0 : -1}
+                onKeyDown={
+                  clickable
+                    ? (e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          onRowClick?.(row)
+                        }
+                      }
+                    : undefined
+                }
+                className={[
+                  'text-fg-primary transition-colors',
+                  clickable ? 'cursor-pointer hover:bg-surface-hover focus-visible:bg-surface-hover' : '',
+                ].join(' ')}
+              >
+                {columns.map((col) => {
+                  const value = col.valueFor ? col.valueFor(row) : (row as Record<string, unknown>)[col.key]
+                  return (
+                    <td
+                      key={col.key}
+                      className={[
+                        'px-3 py-2 align-middle',
+                        col.numeric ? 'text-right tabular-nums' : 'text-left',
+                        col.hideOnMobile ? 'hidden sm:table-cell' : '',
+                      ].join(' ')}
+                    >
+                      {col.cell(row, value)}
+                    </td>
+                  )
+                })}
+              </tr>
+            )
+          })
         )}
       </tbody>
     </table>

@@ -13,6 +13,7 @@
 import { ThemeProvider } from './lib/theme'
 import { AuthProvider, useAuth } from './lib/auth'
 import { Router, Routes, Navigate, type RouteSpec } from './lib/router'
+import { FinopsPeriodProvider } from './lib/finops/period'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -30,7 +31,9 @@ export default function App() {
     <ThemeProvider>
       <Router>
         <AuthProvider>
-          <AppRoot />
+          <FinopsPeriodProvider>
+            <AppRoot />
+          </FinopsPeriodProvider>
         </AuthProvider>
       </Router>
     </ThemeProvider>
