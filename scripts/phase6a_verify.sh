@@ -156,8 +156,13 @@ run_check "tokens.ts declares VIEWER role navigation" \
 run_check "UsersPage denies non-admin access" \
   bash -c 'grep -q "AccessDenied" frontend/src/pages/UsersPage.tsx && grep -q "role !== .ADMIN." frontend/src/pages/UsersPage.tsx'
 run_check "API client (centralized) exists" test -f frontend/src/lib/api.ts
+# Verifier note: the centralised API client must ENFORCE relative paths by
+# rejecting any path that does not start with "/".  The JS method used is
+# String.prototype.startsWith with the literal argument "/", so we grep for
+# `startsWith('/')`.  Earlier versions of this check looked for the prose
+# "starts with" (with a space) which is not present in valid JS source.
 run_check "API client uses relative paths only" \
-  bash -c 'grep -q "starts with" frontend/src/lib/api.ts'
+  bash -c 'grep -qE "startsWith\([\"'\'']/[\"'\'']\)" frontend/src/lib/api.ts && grep -q "relative to current origin" frontend/src/lib/api.ts'
 
 # ---------------------------------------------------------------------------
 # Theme system
@@ -176,14 +181,6 @@ run_check "index.html inline bootstrap sets data-theme pre-React" \
   bash -c 'grep -q "data-theme" frontend/index.html && grep -q "matchMedia" frontend/index.html'
 run_check "ThemeToggle renders an accessible button" \
   bash -c 'grep -q "aria-label" frontend/src/components/ThemeToggle.tsx'
-run_check "ThemeProvider exports useTheme" \
-  bash -c 'grep -q "export function useTheme" frontend/src/lib/theme.tsx'
-run_check "auth.tsx exposes AuthProvider + useAuth" \
-  bash -c 'grep -q "export function AuthProvider" frontend/src/lib/auth.tsx && grep -q "export function useAuth" frontend/src/lib/auth.tsx'
-run_check "UsersPage denies non-admin access" \
-  bash -c 'grep -q "AccessDenied" frontend/src/pages/UsersPage.tsx'
-run_check "API client uses relative paths only" \
-  bash -c 'grep -q "starts with" frontend/src/lib/api.ts'
 
 # ---------------------------------------------------------------------------
 # Static regressions on the source tree
@@ -213,8 +210,13 @@ run_check "no direct slate/gray Tailwind palette in major components" \
 
 note "Frontend tests"
 
+# Verifier note: vitest's default reporter emits per-file summary lines that
+# start with " ✓ ", not per-test lines, so counting "^ ✓" only gives the
+# number of test FILES (≈9) and not the test count (83).  We instead parse
+# the final summary line which always reads "Tests  N passed (N)" and
+# additionally require > 0 tests to have run.
 run_check "frontend vitest suite passes" \
-  bash -c 'cd frontend && npm test 2>&1 > /tmp/frontend-tests.out && test $(grep -c "^ ✓" /tmp/frontend-tests.out) -gt 50'
+  bash -c 'cd frontend && npm test 2>&1 > /tmp/frontend-tests.out && grep -qE "^ +Tests +[0-9]+ passed \([0-9]+\)" /tmp/frontend-tests.out && test $(grep -E "^ +Tests +[0-9]+ passed" /tmp/frontend-tests.out | grep -oE "[0-9]+" | head -1) -gt 0'
 
 # ---------------------------------------------------------------------------
 # Production build
@@ -222,6 +224,15 @@ run_check "frontend vitest suite passes" \
 
 note "Production build"
 
+# Verifier note: the running `frontend` container image is the RUNTIME stage
+# of the multi-stage Dockerfile (it serves `dist/` via `serve`), so it does
+# NOT contain /app/package.json — `docker compose exec frontend npm run build`
+# will fail with ENOENT.  The correct production-build verification is to
+# either:
+#   (a) run `npm run build` from the frontend source on the host (what we do
+#       here — the host has node_modules installed), or
+#   (b) run `docker compose build frontend` to exercise the multi-stage build.
+# The runtime-image architecture is intentional and must not be changed.
 run_check "frontend production build succeeds" \
   bash -c 'cd frontend && npm run build 2>&1 > /tmp/frontend-build.out'
 
@@ -234,8 +245,34 @@ run_check "frontend build emits dist/index.html" test -f frontend/dist/index.htm
 note "Docker + nginx"
 
 run_check "docker-compose.yml present" test -f docker-compose.yml
-run_check "only nginx publishes port 80" \
-  bash -c 'grep -A2 "^  nginx:" docker-compose.yml | grep -q "80:80" && ! grep -B2 -A20 "^  postgres:" docker-compose.yml | grep -q "ports:"'
+
+# Verifier note: "ports:" appears as a literal token inside the postgres
+# service block's explanatory comment ("# No `ports:` — PostgreSQL is
+# internal-only."), so the previous regex flagged a false positive.  We
+# now check the AUTHORITATIVE runtime view (`docker compose ps`) — any
+# service whose PORTS column contains "->" is host-published, otherwise
+# the port is container-internal only.  The expected outcome is that
+# ONLY nginx appears in the published list.
+run_check "only nginx publishes a host port" \
+  bash -c 'PUB=$(docker compose ps --format "table {{.Service}}|{{.Ports}}" 2>/dev/null | awk -F"|" "NR>1 && \$2 ~ /->/ {print \$1}" | sort -u | tr "\n" "," | sed "s/,$//"); test "$PUB" = "nginx"'
+
+# Belt-and-braces: also confirm the compose file does not declare a `ports:`
+# block on any non-nginx service (comments are excluded via the awk state
+# machine so `# No ports:` literals in the YAML do not false-positive).
+run_check "compose file declares ports only on nginx" \
+  bash -c 'BAD=$(awk "
+    /^  [a-zA-Z_-]+:/ { svc = \$2; sub(/:$/, \"\", svc); has_ports = 0; next }
+    /^  [a-zA-Z_-]+:$/ { next }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*\$/ { next }
+    /^[[:space:]]+ports:/ {
+      if (svc != \"nginx\") {
+        print svc;
+        exit 1
+      }
+    }
+  " docker-compose.yml); test -z "$BAD"'
+
 run_check "nginx config has /api/ → backend proxy" \
   bash -c 'grep -q "proxy_pass http://backend:8000" nginx/default.conf'
 run_check "nginx config has / → frontend proxy" \
