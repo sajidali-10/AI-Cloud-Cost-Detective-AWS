@@ -21,6 +21,11 @@ function wrap(node: React.ReactNode) {
   )
 }
 
+// CostsPage uses useFinopsQuery for the cost report; the store
+// notifies React via useSyncExternalStore (React 18) after the
+// mocked fetch resolves.  findBy* / waitFor keep every DOM
+// assertion inside an act() boundary (RTL wraps both automatically).
+
 function makeCosts(totalCost: string, previousCost: string, changePercent: string | null = '0.05') {
   return {
     report: {
@@ -75,7 +80,7 @@ describe('CostsPage', () => {
     await waitFor(() => {
       expect(screen.getByText('$1.50K')).toBeInTheDocument()
     })
-    expect(screen.getByText('+50.0%')).toBeInTheDocument()
+    expect(await screen.findByText('+50.0%')).toBeInTheDocument()
   })
 
   it('renders "—" for missing previous cost (no divide by zero)', async () => {
@@ -101,9 +106,7 @@ describe('CostsPage', () => {
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
     wrap(<CostsPage />)
-    await waitFor(() => {
-      expect(screen.getByTestId('cost-trend-chart')).toBeInTheDocument()
-    })
+    expect(await screen.findByTestId('cost-trend-chart')).toBeInTheDocument()
   })
 
   it('period selector changes lookback and triggers refetch', async () => {
@@ -118,7 +121,8 @@ describe('CostsPage', () => {
     await waitFor(() => {
       expect(calls.some((c) => c.includes('days=30'))).toBe(true)
     })
-    await userEvent.setup().click(screen.getByRole('radio', { name: '7d' }))
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('radio', { name: '7d' }))
     await waitFor(() => {
       expect(calls.some((c) => c.includes('days=7'))).toBe(true)
     })

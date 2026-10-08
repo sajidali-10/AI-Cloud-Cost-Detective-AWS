@@ -249,3 +249,84 @@ All Phase 6B prerequisites for the AI conversation UX are in place:
   already consumes the same `useFinopsPeriod()` context.
 
 Phase 6C can proceed without any backend or frontend-shell changes.
+
+---
+
+## Phase 6B Closure
+
+Two cleanup issues flagged by independent verification were
+addressed in a single closure commit. Phase 6B is otherwise
+unchanged — the production behaviour, the dashboard widgets, the
+typed FinOps surface, and every assertion in every test remain
+identical.
+
+### 1. Verifier shell error
+
+`scripts/phase6b_verify.sh` printed
+`line 97: any: command not found` even though the run reported
+84 PASS / 0 FAIL.
+
+Root cause: line 97 wrapped a label string in double quotes that
+contained two unescaped backticks (`` `any` ``). Bash performs
+command substitution on backticks during double-quoted-string
+parsing, so it tried to execute the literal command `any`,
+producing the spurious error.
+
+Fix (single character, no semantics change):
+
+```
+-run_check "no untyped `any` in frontend/src/types/finops.ts" \
++run_check "no untyped \`any\` in frontend/src/types/finops.ts" \
+```
+
+The escaped backticks render as backticks in the output label, and
+the underlying `grep -E ":\s*any(\b|\[|,|\s|$)"` check is unchanged,
+so the type-safety guard is preserved verbatim.
+
+### 2. React `act(...)` warnings
+
+`npm test -- --run` passed 158 / 158 tests but produced repeated
+`An update to <Component> inside a test was not wrapped in act(...)`
+warnings for OptimizationPage, DashboardPage, ResourcesPage,
+CostsPage, and the FinOps store hooks.
+
+Root cause: the FinOps query store used `useState` + `setTick` to
+notify subscribers when an async fetcher's `finally` block fired.
+When a page fired multiple `useFinopsQuery` calls in parallel
+(Dashboard fires 5, Optimization fires 3, Resources fires 1–2),
+each fetch's microtask ran `setTick` independently and at slightly
+different points in time. Any `setTick` that landed AFTER the last
+RTL assertion fell outside the waitFor/findBy* act boundary and
+React logged the warning.
+
+Fix: switch the store to React 18's documented
+`useSyncExternalStore`. `useSyncExternalStore` integrates natively
+with React's act scheduler, so a store notification that fires from
+inside an async fetcher's microtask is observed inside the test's
+act boundary. Runtime behaviour is identical: every cache miss
+still triggers exactly one fetch, every successful response is
+still cached, every `invalidateCache()` still emits to subscribers,
+and the hook still exposes `{ status, data, error, refreshedAt }`.
+No public-API change, no test weakened, no assertion mocked,
+no warning suppressed.
+
+The affected tests were also rewritten to use the standard RTL
+async patterns (`findBy*`, `waitFor`) instead of synchronous
+`getBy*` after the first waitFor — the existing tests already used
+waitFor for the first assertion but then synchronously checked the
+remaining DOM with `getBy*`, which is exactly the pattern that
+fell outside the act boundary.
+
+### Final validation
+
+| Command | Result |
+| --- | --- |
+| `./scripts/phase6b_verify.sh` | ALL PASS (no `command not found`) |
+| `cd frontend && npm test -- --run` | 158 / 158 PASS, 0 act warnings |
+| `cd frontend && npm run build` | built `dist/index.html` + assets |
+| `./scripts/phase6a_verify.sh` | Phase 6A regression PASS (delegated) |
+| `./scripts/phase5c_verify.sh` | Phase 5C regression PASS (delegated) |
+| `docker compose ps` | 5 / 5 healthy, only `nginx` host-published |
+| `git status` | clean after commit |
+
+Closure commit: see the final commit on this branch.

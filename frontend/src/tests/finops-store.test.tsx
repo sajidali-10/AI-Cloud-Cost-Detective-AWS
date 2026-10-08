@@ -1,8 +1,7 @@
 // Phase 6B — In-memory FinOps query store tests.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, render, waitFor } from '@testing-library/react'
-import { useEffect } from 'react'
+import { render, waitFor } from '@testing-library/react'
 import {
   invalidateCache,
   useFinopsQuery,
@@ -15,9 +14,7 @@ function FetchProbe({ cacheKey, fetcher, onResult }: {
   onResult: (status: string, data: string | null, err: Error | null) => void
 }) {
   const sub = useFinopsQuery<string>(cacheKey, fetcher)
-  useEffect(() => {
-    onResult(sub.entry.status, sub.entry.data, sub.entry.error)
-  })
+  onResult(sub.entry.status, sub.entry.data, sub.entry.error)
   return null
 }
 
@@ -28,6 +25,11 @@ describe('useFinopsQuery', () => {
   afterEach(() => {
     invalidateCache()
   })
+
+  // The store notifies React via useSyncExternalStore (React 18)
+  // whenever the fetcher resolves.  Each test wraps its assertions
+  // in `waitFor` (which keeps every iteration inside an act()
+  // boundary) so React does not log a "not wrapped in act" warning.
 
   it('fetches once per cache key and reuses cached data', async () => {
     let calls = 0
@@ -42,8 +44,8 @@ describe('useFinopsQuery', () => {
 
     await waitFor(() => {
       expect(firstStatus).toBe('success')
+      expect(firstData).toBe('value-1')
     })
-    expect(firstData).toBe('value-1')
     expect(calls).toBe(1)
     expect(_storeSize()).toBe(1)
   })
@@ -104,9 +106,7 @@ describe('useFinopsQuery', () => {
       expect(observedData).toBe('ok')
     })
     const before = calls
-    act(() => {
-      refreshFn()
-    })
+    refreshFn()
     await waitFor(() => {
       expect(calls).toBe(before + 1)
     })

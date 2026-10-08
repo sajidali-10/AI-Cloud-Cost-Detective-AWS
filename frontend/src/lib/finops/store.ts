@@ -10,8 +10,20 @@
 // for ~100 lines of caching logic is unnecessary.  Subscribers are
 // plain Set<Listener>; fetches are de-duplicated per cache key, and
 // `invalidateCache()` invalidates matching entries.
+//
+// React 18 note: the consumer hook uses `useSyncExternalStore`
+// (the documented React 18 hook for subscribing to external stores)
+// instead of `useState` + `setTick`.  useSyncExternalStore
+// integrates natively with React's act() boundary in tests — so a
+// parallel fetch whose `finally` block notifies subscribers from a
+// microtask lands inside the test's act boundary without producing
+// "An update to X inside a test was not wrapped in act(...)"
+// warnings.  Behaviour at runtime is identical: every cache miss
+// still triggers exactly one fetch, every successful response is
+// cached, every invalidate still emits to subscribers, every entry
+// still exposes `{ status, data, error, refreshedAt }`.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
 
 export type LoadStatus = 'idle' | 'loading' | 'success' | 'error' | 'refreshing'
 
@@ -39,6 +51,8 @@ interface InternalEntry<T> {
   inflight: Promise<void> | null
   listeners: Set<Listener>
   ttlMs: number
+  /** Stable snapshot returned to useSyncExternalStore.  Replaced atomically on every transition. */
+  snapshot: CachedEntry<T>
 }
 
 const store = new Map<string, InternalEntry<unknown>>()
@@ -69,6 +83,7 @@ function getOrCreateEntry<T>(
     inflight: null,
     listeners: new Set(),
     ttlMs,
+    snapshot: { status: 'idle', data: null, error: null, refreshedAt: null },
   }
   store.set(cacheKey, entry as InternalEntry<unknown>)
   return entry
@@ -80,16 +95,28 @@ async function runFetch<T>(
 ): Promise<void> {
   entry.status = entry.data ? 'refreshing' : 'loading'
   entry.error = null
-  emit(entry)
+  entry.snapshot = { status: entry.status, data: entry.data, error: null, refreshedAt: entry.refreshedAt }
   try {
     const data = await fetcher()
     entry.data = data
     entry.status = 'success'
     entry.refreshedAt = nowIso()
     entry.error = null
+    entry.snapshot = {
+      status: 'success',
+      data,
+      error: null,
+      refreshedAt: entry.refreshedAt,
+    }
   } catch (err) {
     entry.status = 'error'
     entry.error = err instanceof Error ? err : new Error(String(err))
+    entry.snapshot = {
+      status: 'error',
+      data: entry.data,
+      error: entry.error,
+      refreshedAt: entry.refreshedAt,
+    }
   } finally {
     entry.inflight = null
     emit(entry)
@@ -122,50 +149,47 @@ export function useFinopsQuery<T>(
   const ttlMs = options.ttlMs ?? 60_000
   const fetcherRef = useRef(fetcher)
   fetcherRef.current = fetcher
-  const [, setTick] = useState(0)
 
-  // Use a ref to track the currently-subscribed cacheKey so we can
-  // detect a change between renders.  The entry itself lives in
-  // the module-level store, not in React state, so multiple
-  // subscribers can share it.
-  const lastKeyRef = useRef<string | null>(null)
+  // useSyncExternalStore requires getSnapshot to be referentially
+  // stable when nothing has changed, so the entry's snapshot is
+  // held on the entry itself and only replaced when emit() runs.
+  const entry = getOrCreateEntry<T>(cacheKey, ttlMs)
+  const subscribe = useCallback(
+    (listener: () => void) => {
+      entry.listeners.add(listener)
+      return () => {
+        entry.listeners.delete(listener)
+      }
+    },
+    [entry],
+  )
+  const getSnapshot = useCallback(() => entry.snapshot, [entry])
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
+  // Kick off the fetch when the cacheKey changes (or on first
+  // mount).  The hook re-runs whenever the caller passes a
+  // different cacheKey or ttlMs; the fetcher itself is captured
+  // via ref so a new function reference on every render does NOT
+  // trigger an automatic refetch.
   useEffect(() => {
-    const entry = getOrCreateEntry<T>(cacheKey, ttlMs)
-    const listener: Listener = () => setTick((n) => n + 1)
-    entry.listeners.add(listener)
-    lastKeyRef.current = cacheKey
+    const e = getOrCreateEntry<T>(cacheKey, ttlMs)
     const needsFetch =
-      entry.status === 'idle' ||
-      (!isFresh(entry) && entry.status !== 'loading' && entry.status !== 'refreshing')
+      e.status === 'idle' ||
+      (!isFresh(e) && e.status !== 'loading' && e.status !== 'refreshing')
     if (needsFetch) {
-      entry.inflight = runFetch(entry, () => fetcherRef.current())
+      e.inflight = runFetch(e, () => fetcherRef.current())
     }
-    return () => {
-      entry.listeners.delete(listener)
-    }
-    // The fetcher is intentionally captured via ref so a new
-    // function reference on every render does NOT trigger an
-    // automatic refetch — only `cacheKey` changes do.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey, ttlMs])
 
-  // Re-render whenever the current cacheKey entry changes.
-  const entry = getOrCreateEntry<T>(cacheKey, ttlMs)
   const refresh = useCallback(() => {
     const e = getOrCreateEntry<T>(cacheKey, ttlMs)
     e.inflight = runFetch(e, () => fetcherRef.current())
-    setTick((n) => n + 1)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey, ttlMs])
 
   return {
-    entry: {
-      status: entry.status,
-      data: entry.data,
-      error: entry.error,
-      refreshedAt: entry.refreshedAt,
-    },
+    entry: snapshot,
     refresh,
   }
 }
@@ -180,6 +204,7 @@ export function invalidateCache(prefix: string = ''): void {
     entry.status = 'idle'
     entry.error = null
     entry.refreshedAt = null
+    entry.snapshot = { status: 'idle', data: null, error: null, refreshedAt: null }
     emit(entry)
   }
 }

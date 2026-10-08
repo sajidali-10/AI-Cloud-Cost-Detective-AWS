@@ -94,7 +94,7 @@ run_check "Recommendation + CapabilitiesResponse present" \
   bash -c 'grep -q "interface CapabilitiesResponse" frontend/src/types/finops.ts && grep -q "interface Recommendation " frontend/src/types/finops.ts'
 
 # No `any` lurking in the new types.
-run_check "no untyped `any` in frontend/src/types/finops.ts" \
+run_check "no untyped \`any\` in frontend/src/types/finops.ts" \
   bash -c '! grep -E ":\s*any(\b|\[|,|\s|$)" frontend/src/types/finops.ts'
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,12 @@ function wrap(node: React.ReactNode) {
   )
 }
 
+// The Resources page uses useFinopsQuery for resources plus a
+// (deferred) utilization fetch.  Each fetch notifies React via
+// useSyncExternalStore (React 18) once it resolves.  findBy* /
+// waitFor keep every DOM assertion inside an act() boundary (RTL
+// wraps both automatically).
+
 function makeResources() {
   return {
     region: 'us-east-1',
@@ -56,12 +62,16 @@ describe('ResourcesPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrap(<ResourcesPage />)
+    // Use a single waitFor so all four card counters settle
+    // concurrently — the store emits several transitions (idle
+    // → loading → success) and intermediate renders can briefly
+    // show stale "0" totals.
     await waitFor(() => {
-      expect(screen.getByTestId('resource-card-ec2-count').textContent).toBe('1')
+      expect(screen.getByTestId('resource-card-ec2-count')).toHaveTextContent('1')
+      expect(screen.getByTestId('resource-card-ebs-count')).toHaveTextContent('1')
+      expect(screen.getByTestId('resource-card-eip-count')).toHaveTextContent('1')
+      expect(screen.getByTestId('resource-card-nat')).toHaveTextContent('Access denied')
     })
-    expect(screen.getByTestId('resource-card-ebs-count').textContent).toBe('1')
-    expect(screen.getByTestId('resource-card-eip-count').textContent).toBe('1')
-    expect(screen.getByTestId('resource-card-nat')).toHaveTextContent('Access denied')
   })
 
   it('filters rows by type and search', async () => {
@@ -76,17 +86,24 @@ describe('ResourcesPage', () => {
       expect(screen.getAllByTitle('i-1').length).toBeGreaterThan(0)
     })
 
-    // Filter to EBS only
-    await userEvent.setup().selectOptions(screen.getByTestId('kind-filter'), 'ebs')
-    expect(screen.queryAllByTitle('i-1')).toHaveLength(0)
-    expect(screen.getAllByTitle('vol-1').length).toBeGreaterThan(0)
+    // Filter to EBS only — vol-1 is rendered twice per row (once as
+    // the `name` cell title, once as the `resourceId` cell title),
+    // so use findAllBy* rather than the strict findBy*.
+    const user = userEvent.setup()
+    await user.selectOptions(screen.getByTestId('kind-filter'), 'ebs')
+    await waitFor(() => {
+      expect(screen.queryAllByTitle('i-1')).toHaveLength(0)
+    })
+    expect((await screen.findAllByTitle('vol-1')).length).toBeGreaterThan(0)
 
     // Filter by search
-    await userEvent.setup().selectOptions(screen.getByTestId('kind-filter'), 'all')
+    await user.selectOptions(screen.getByTestId('kind-filter'), 'all')
     const search = screen.getByTestId('resource-search') as HTMLInputElement
-    await userEvent.setup().type(search, 'vol-1')
-    expect(screen.getAllByTitle('vol-1').length).toBeGreaterThan(0)
-    expect(screen.queryAllByTitle('i-1')).toHaveLength(0)
+    await user.type(search, 'vol-1')
+    await waitFor(() => {
+      expect(screen.getAllByTitle('vol-1').length).toBeGreaterThan(0)
+      expect(screen.queryAllByTitle('i-1')).toHaveLength(0)
+    })
   })
 
   it('shows the "Select a resource" placeholder before any row is clicked', async () => {
@@ -98,11 +115,13 @@ describe('ResourcesPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrap(<ResourcesPage />)
+    // i-1 is rendered as both the row's `name` and `resourceId`
+    // title (two spans), so use findAllBy* under waitFor.
     await waitFor(() => {
       expect(screen.getAllByTitle('i-1').length).toBeGreaterThan(0)
     })
     // Before any click, the utilization section prompts the user to select.
-    expect(screen.getByText(/select a resource/i)).toBeInTheDocument()
+    expect(await screen.findByText(/select a resource/i)).toBeInTheDocument()
   })
 
   // NOTE: row-click → utilization flow is verified manually via live

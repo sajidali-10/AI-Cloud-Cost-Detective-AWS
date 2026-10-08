@@ -21,6 +21,14 @@ function wrapRoutes(node: React.ReactNode) {
   )
 }
 
+// OptimizationPage fires THREE useFinopsQuery fetches in parallel
+// (caps / recs / summary).  Each one's `finally` block emits a
+// state transition via useSyncExternalStore from its own microtask.
+// We use `findBy*` / `waitFor` so every DOM assertion is itself
+// wrapped in an act() boundary by RTL — and the store now uses
+// React 18's documented `useSyncExternalStore`, which schedules
+// store notifications inside the same act boundary.
+
 const baseCaps = {
   region: 'us-east-1',
   account_id: '974053642038',
@@ -91,12 +99,13 @@ describe('OptimizationPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    await waitFor(() => {
-      expect(screen.getByTestId('savings-not-available')).toBeInTheDocument()
-    })
-    expect(screen.getByText('vol-001')).toBeInTheDocument()
-    expect(screen.getByText('Unattached EBS volume vol-001')).toBeInTheDocument()
-    expect(screen.getAllByText('Deterministic').length).toBeGreaterThan(0)
+    expect(await screen.findByTestId('savings-not-available')).toBeInTheDocument()
+    expect(await screen.findByText('vol-001')).toBeInTheDocument()
+    expect(await screen.findByText('Unattached EBS volume vol-001')).toBeInTheDocument()
+    // 'Deterministic' appears in multiple places (RecommendationSourceBadge
+    // for UNKNOWN-sourced recs AND the Deterministic KPI tile label),
+    // so use findAllBy* rather than the strict findBy*.
+    expect((await screen.findAllByText('Deterministic')).length).toBeGreaterThan(0)
   })
 
   it('renders an authoritative savings value when present', async () => {
@@ -119,11 +128,8 @@ describe('OptimizationPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    await waitFor(() => {
-      // USD 45.00 / mo in the table cell
-      expect(screen.getByText(/USD\s*45\.00/)).toBeInTheDocument()
-    })
-    expect(screen.getByText('AWS Cost Optimization Hub')).toBeInTheDocument()
+    expect(await screen.findByText(/USD\s*45\.00/)).toBeInTheDocument()
+    expect(await screen.findByText('AWS Cost Optimization Hub')).toBeInTheDocument()
   })
 
   it('renders partial-success state without blanking the page', async () => {
@@ -137,11 +143,9 @@ describe('OptimizationPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    await waitFor(() => {
-      expect(screen.getAllByTestId('partial-warning').length).toBeGreaterThan(0)
-    })
-    expect(screen.getByText('PARTIAL_SUCCESS')).toBeInTheDocument()
-    expect(screen.getByText('vol-001')).toBeInTheDocument()
+    expect(await screen.findByText('PARTIAL_SUCCESS')).toBeInTheDocument()
+    expect((await screen.findAllByTestId('partial-warning')).length).toBeGreaterThan(0)
+    expect(await screen.findByText('vol-001')).toBeInTheDocument()
   })
 
   it('renders the recommendation detail panel when a row is clicked', async () => {
@@ -154,11 +158,10 @@ describe('OptimizationPage', () => {
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    await waitFor(() => {
-      expect(screen.getByText('vol-001')).toBeInTheDocument()
-    })
-    await userEvent.setup().click(screen.getByText('vol-001'))
-    expect(screen.getByTestId('recommendation-detail')).toBeInTheDocument()
-    expect(screen.getByText('Volume has been detached for 30 days.')).toBeInTheDocument()
+    expect(await screen.findByText('vol-001')).toBeInTheDocument()
+    const user = userEvent.setup()
+    await user.click(screen.getByText('vol-001'))
+    expect(await screen.findByTestId('recommendation-detail')).toBeInTheDocument()
+    expect(await screen.findByText('Volume has been detached for 30 days.')).toBeInTheDocument()
   })
 })

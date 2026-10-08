@@ -23,6 +23,13 @@ function wrapRoutes(node: React.ReactNode) {
   )
 }
 
+// The Dashboard fans out 5 useFinopsQuery fetches in parallel;
+// each one's `finally` block emits a state transition via
+// useSyncExternalStore from its own microtask.  Using findBy* /
+// waitFor keeps every DOM assertion inside an act() boundary
+// (RTL wraps both automatically), and useSyncExternalStore
+// integrates natively with React 18's act scheduler.
+
 function makeCostsBody(days = 30) {
   return {
     report: {
@@ -148,16 +155,26 @@ describe('DashboardPage', () => {
     await waitFor(() => {
       expect(screen.getAllByText(/9740…2038/).length).toBeGreaterThan(0)
     })
-    expect(screen.getByText('$2.44K')).toBeInTheDocument()
-    expect(screen.getByText('+6.0%')).toBeInTheDocument()
+    expect(await screen.findByText('$2.44K')).toBeInTheDocument()
+    expect(await screen.findByText('+6.0%')).toBeInTheDocument()
     // Resources KPI: 1 EC2 instance
-    expect(screen.getByTestId('resources-total-kpi')).toHaveTextContent('1')
+    await waitFor(() => {
+      expect(screen.getByTestId('resources-total-kpi')).toHaveTextContent('1')
+    })
     // Optimization KPI: 12 recommendations
-    expect(screen.getByTestId('optimization-count').textContent).toBe('12')
-    expect(screen.getAllByText(/open opportunities/i).length).toBeGreaterThan(0)
-    expect(screen.getByTestId('dashboard-capabilities')).toBeInTheDocument()
-    expect(screen.getAllByText('Inactive').length).toBeGreaterThan(0)
-    expect(screen.getAllByText('Not enrolled').length).toBeGreaterThan(0)
+    await waitFor(() => {
+      expect(screen.getByTestId('optimization-count').textContent).toBe('12')
+    })
+    await waitFor(() => {
+      expect(screen.getAllByText(/open opportunities/i).length).toBeGreaterThan(0)
+    })
+    expect(await screen.findByTestId('dashboard-capabilities')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getAllByText('Inactive').length).toBeGreaterThan(0)
+    })
+    await waitFor(() => {
+      expect(screen.getAllByText('Not enrolled').length).toBeGreaterThan(0)
+    })
   })
 
   it('renders "Savings not available" when authoritative savings is null', async () => {
