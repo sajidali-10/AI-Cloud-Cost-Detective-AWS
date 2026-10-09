@@ -11,6 +11,7 @@ import { PageHeader, ContextItem } from '../components/PageHeader'
 import { MetricCard } from '../components/MetricCard'
 import { SectionCard } from '../components/SectionCard'
 import { StatusBadge } from '../components/StatusBadge'
+import { DashboardHero } from '../components/DashboardHero'
 import { PeriodSelector } from '../components/PeriodSelector'
 import { RefreshButton } from '../components/RefreshButton'
 import { CostTrendChart } from '../components/CostTrendChart'
@@ -176,6 +177,28 @@ export function DashboardPage() {
           title="Some data could not be loaded"
         />
       )}
+
+      {/* Centred HipLink AI Assistant hero — uses real data only. */}
+      <DashboardHero
+        accountLabel={
+          identity.entry.data ? maskAccountId(identity.entry.data.account) : null
+        }
+        regionLabel={identity.entry.data?.region ?? null}
+        refreshedLabel={formatLocalTime(
+          cost.entry.refreshedAt ?? identity.entry.refreshedAt,
+        )}
+        dataStatus={
+          cost.entry.status === 'success'
+            ? 'live'
+            : cost.entry.status === 'loading'
+              ? 'loading'
+              : cost.entry.status === 'refreshing'
+                ? 'refreshing'
+                : cost.entry.status === 'error'
+                  ? 'unavailable'
+                  : 'idle'
+        }
+      />
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">

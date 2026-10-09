@@ -76,6 +76,9 @@ services:
     environment:
       APP_ENV: ${APP_ENV}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
+      # --- Phase 5A: Authentication & RBAC ---
+      AUTH_ENABLED: ${AUTH_ENABLED}
+      JWT_SECRET: ${JWT_SECRET}
       POSTGRES_HOST: ${POSTGRES_HOST}
       POSTGRES_PORT: ${POSTGRES_PORT}
       POSTGRES_ADMIN_USER: ${POSTGRES_ADMIN_USER}

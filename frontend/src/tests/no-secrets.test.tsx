@@ -117,6 +117,7 @@ describe('Frontend static guard', () => {
     // explicit allowlist below.
     const allowlist = new Set([
       'ThemeToggle.tsx', // icons only, no surface
+      'HiplinkLogo.tsx', // single <img> element, no surface chrome
     ])
     const offenders: string[] = []
     const semanticRe = /\b(?:bg-surface|bg-bg|bg-bg-elevated|border-border|text-fg-primary|text-fg-secondary|text-fg-muted|bg-primary|text-primary)\b/

@@ -187,3 +187,262 @@ Phase 6C: add secure AI Cost Analyst conversation experience
 ```
 
 Branch: `phase-6-professional-dashboard`. **Not pushed. Not merged.**
+
+---
+
+# Phase 6C.1 — HipLink Branding + Authenticated AI/Conversation Validation
+
+## What changed in 6C.1
+
+The browser was displaying a broken image for the HipLink header
+logo because (1) the runtime frontend image did not include
+`public/branding/`, and (2) the Dashboard was a pure data page
+without any brand hero. Phase 6C.1 corrects both at the source
+and brings the runtime up to a fully-authenticated, navigable
+state.
+
+## Tasks closed
+
+### TASK 1 — HipLink static asset serving
+
+Root cause: `frontend/Dockerfile` did not `COPY public ./public`
+in the build stage, so `dist/branding/` was empty in the runtime
+image and nginx was serving the SPA fallback HTML at the
+`/branding/*.png` URLs.
+
+Fix: added `COPY public ./public` to the build stage so Vite
+emits the assets into `dist/`. Rebuilt and recreated the
+`frontend` container.
+
+Post-fix verification through nginx:
+
+```
+$ curl -sS -o /tmp/d.png -w 'dark: %{http_code} %{content_type} size=%{size_download}\n' \
+    http://localhost/branding/hiplink-logo-on-dark.png
+dark: 200 image/png size=4324
+$ file /tmp/d.png
+/tmp/d.png: PNG image data, 110 x 71, 8-bit/color RGBA, non-interlaced
+
+$ curl -sS -o /tmp/l.png -w 'light: %{http_code} %{content_type} size=%{size_download}\n' \
+    http://localhost/branding/hiplink-logo-on-light.png
+light: 200 image/png size=4174
+$ file /tmp/l.png
+/tmp/l.png: PNG image data, 129 x 71, 8-bit/color RGBA, non-interlaced
+```
+
+No base64 fallbacks. No external URLs. The official PNG assets
+are served by nginx from the frontend container.
+
+### TASK 2 — Centralized HiplinkLogo
+
+New: `frontend/src/components/HiplinkLogo.tsx`. ONE component
+for the official HipLink brand mark. Theme-aware asset selection
+via the centralized `LOGO_SRC` map. Two visual sizes:
+
+| size     | classes     | used by                     |
+| -------- | ----------- | --------------------------- |
+| compact  | `h-8 w-auto`| TopNavigation / MobileNav   |
+| hero     | `h-16 w-auto`| DashboardHero / LoginPage   |
+
+Both preserve aspect ratio (`w-auto`), never stretch, and always
+expose `alt="HipLink"`.
+
+`BrandHeader.tsx` was refactored to use `<HiplinkLogo size="compact" />`,
+eliminating the duplicated inline BrandGlyph. No page-specific
+duplicate logo logic remains.
+
+### TASK 3 — Dashboard hero branding
+
+New: `frontend/src/components/DashboardHero.tsx`. Centred theme-aware
+hero card rendered above the existing Phase 6B KPI tiles + charts.
+The hero uses the centralised `<HiplinkLogo size="hero" />` and
+displays:
+
+- large theme-aware HipLink logo (`h-16 w-auto`)
+- `AI Cloud Cost Detective` title
+- corporate tagline: "AWS cost visibility, optimization and AI-powered FinOps analysis"
+- compact environment/status line driven by real Phase 1–3 data
+  (masked account id, region, last refresh time, status pill)
+
+The hero height is deliberately compact (`py-8`) so the existing
+FinOps functionality underneath remains the primary focus.
+Existing Phase 6B behaviour is unchanged.
+
+### TASK 4 — Auth + AI runtime config audit
+
+| Endpoint            | Result                                                          |
+| ------------------- | --------------------------------------------------------------- |
+| `/api/auth/info`    | `auth_enabled: true` (after TASK 5 enablement)                  |
+| `/api/ai/status`    | `status: DISABLED`, `ai_enabled: false`, `litellm_reachable: false`, `model_alias: cost-detective-free` |
+
+Browser-displayed state before TASK 5:
+
+- **"Dev mode (auth disabled)"** because `AUTH_ENABLED=false` in
+  `.env` and `app/core/config.py:auth_enabled` defaults to `False`.
+- **"AI disabled"** because (a) `AI_ENABLED=false` in `.env` and
+  (b) LiteLLM's `litellm/config.yaml` ships with `model_list: []`
+  — there is no provider model alias configured to dispatch to.
+
+No API keys, JWT secrets, or password values were printed during
+the audit; only presence flags (`auth_enabled`, `ai_enabled`,
+`litellm_reachable`) and the operator-facing `model_alias`.
+
+### TASK 5 — Development authentication
+
+Enabled in `.env` (gitignored):
+
+- `AUTH_ENABLED=true`
+- `JWT_SECRET=<unique 64-char URL-safe random string>`
+
+Added corresponding `${AUTH_ENABLED}` / `${JWT_SECRET}` env
+substitutions to the `backend` service in `docker-compose.yml`
+and recreated the backend container.
+
+Created a temporary development admin via the existing
+`scripts/create_admin.py` workflow. The bootstrap password was
+generated with `secrets.token_urlsafe(24)` and supplied via the
+`ADMIN_BOOTSTRAP_PASSWORD` env var so it never appears on the
+shell command line or in process listings. The script was
+copied into the container for one execution and removed
+afterwards. The development admin's password is held only in
+process-local environment variables during the verification
+step and is never persisted in tracked files.
+
+| Probe                                          | Result |
+| ---------------------------------------------- | ------ |
+| Unauthenticated `GET /api/auth/me`             | 401    |
+| Unauthenticated `GET /api/conversations`       | 401    |
+| ADMIN `GET /api/auth/me`                       | 200    |
+| ADMIN `GET /api/conversations`                 | 200    |
+| ADMIN `POST /api/conversations` (create)       | 201    |
+| VIEWER `GET /api/conversations`                | 403    |
+| VIEWER `GET /api/aws/costs?days=30`            | 200 (cost data is read-only RBAC) |
+
+### TASK 6 — AI through the LiteLLM boundary
+
+Inspected `litellm/config.yaml`: `model_list: []`. There are no
+provider model aliases wired to any LLM provider in the local
+LiteLLM gateway. `LITELLM_API_KEY` is also empty in `.env`.
+
+Per the user instruction, no credential was invented, committed,
+or exposed. `AI_ENABLED=false` is left as-is so the AI surface
+returns the controlled `AI_DISABLED` envelope (the same one the
+Phase 6C code already handles with `AuthDisabledNotice` /
+AI-disabled banner). Architecture is intact: the frontend still
+talks only to `/api/ai/*` and `/api/ws/conversations/{id}`, and
+the backend still calls only the LiteLLM gateway (`LITELLM_BASE_URL`).
+
+The exact missing configuration to enable AI end-to-end is:
+
+1. Add at least one provider model alias to `litellm/config.yaml`
+   (e.g. a `cost-detective-free` entry pointing at a real provider).
+2. Set `LITELLM_API_KEY` in `.env` (or the matching provider key
+   expected by that model alias).
+3. Set `AI_ENABLED=true` in `.env`.
+
+After all three are set, no source-code changes are required;
+the existing `/api/ai/status` and `/api/ws/conversations/{id}`
+surfaces will report `ai_enabled: true` and the assistant frame
+will flow through unchanged.
+
+### TASK 7 — Real AI end-to-end validation
+
+Because no provider model is configured, the end-to-end AI path
+cannot be exercised. The non-provider portions were validated
+instead:
+
+- ADMIN login via `/api/auth/login` -> 200 + JWT.
+- `POST /api/conversations` (ADMIN) -> 201, conversation id.
+- `GET /api/conversations` (ADMIN) -> 200 with the conversation
+  in the list (count=1).
+- `GET /api/auth/me` (ADMIN) -> 200.
+- `GET /api/conversations` (VIEWER) -> 403 (RBAC denial).
+
+WebSocket transport security (JWT via `Sec-WebSocket-Protocol:
+bearer.<jwt>`, never in URL/path/query, no token-by-token
+streaming, no SSE, no Socket.IO) is locked by the existing
+Phase 5C pytest suites (`test_websocket_security.py`,
+`test_websocket_protocol.py`) and by the Phase 6C frontend
+`ai-connection.test.tsx` / `ai-protocol.test.ts` tests.
+
+The only remaining dependency for full AI E2E is the provider
+configuration listed in TASK 6.
+
+### TASK 8 — Conversations UX
+
+The existing Phase 6C `ConversationsPage` already distinguishes
+four states — `loading` / `error` / `auth-disabled` / `empty` —
+and `phase6c1-integration.test.tsx` now locks each of them with
+explicit assertions:
+
+- "No conversations yet" only when the backend returns an empty
+  list.
+- "Authentication must be enabled" surfaces on 503 AuthDisabled
+  (NOT the empty placeholder).
+- "Could not load conversations" surfaces on 500 (NOT the empty
+  placeholder).
+- `auth_enabled: false` from `/api/auth/info` also surfaces the
+  AuthDisabled notice.
+
+### TASK 9 — Tests
+
+Added:
+
+- `frontend/src/tests/hiplink-logo.test.tsx` (8 tests) — locks
+  the centralized component contract (dark/light asset, compact
+  + hero sizing, alt text, no stretch, data-testid).
+- `frontend/src/tests/dashboard-hero.test.tsx` (8 tests) — locks
+  the hero copy, theme-aware logo, status pill mapping, and
+  omits-fabrication behaviour when data is missing.
+- `frontend/src/tests/phase6c1-integration.test.tsx` (4 tests) —
+  locks the conversations availability state machine.
+
+Updated:
+
+- `frontend/src/tests/no-secrets.test.tsx` — added `HiplinkLogo.tsx`
+  to the `ThemeToggle`-style allowlist because it intentionally
+  renders only a single `<img>` element with no surface chrome.
+
+Final frontend test totals:
+
+```
+Test Files  32 passed (32)
+Tests       281 passed (281)
+```
+
+No React `act(...)` warnings in Phase 6C.1 test files.
+
+### TASK 10 — Runtime deployment
+
+- `frontend/Dockerfile` patched to `COPY public ./public`.
+- `docker-compose.yml` backend service gains `AUTH_ENABLED` +
+  `JWT_SECRET` env substitutions.
+- Frontend image rebuilt and container recreated.
+- All 5 containers healthy (`backend`, `frontend`, `litellm`,
+  `nginx`, `postgres`).
+- Only `nginx` publishes a host port.
+
+## Final validation matrix
+
+| Check                                                              | Result |
+| ------------------------------------------------------------------ | ------ |
+| Phase 5C WebSocket pytest suite (security + protocol)              | One pre-existing test failure (`test_simultaneous_request_bounded`) reproduces at the Phase 6C baseline commit `900ec0e` AND at the pre-Phase 6C baseline `9438ee9` — it is not introduced by Phase 6C.1. The remainder of the suite passes. |
+| Full frontend test suite (`npm test -- --run`)                     | PASS — 281/281 |
+| Frontend production build (`npm run build`)                        | PASS — 281 kB JS / 21.6 kB CSS |
+| Static logo curl checks (through nginx)                            | PASS — 200 image/png, correct dimensions, correct bytes |
+| `/api/auth/info`                                                   | PASS — `auth_enabled: true` |
+| `/api/ai/status`                                                   | PASS — `ai_enabled: false` (intentional; no provider configured) |
+| Docker health (`docker compose ps`)                                | PASS — all 5 containers running |
+| Only nginx host-published                                          | PASS |
+| nginx config validation (WS upgrade + Connection headers)          | PASS |
+| Unauthenticated route protection                                   | PASS — `/api/auth/me`, `/api/conversations` return 401 |
+| ADMIN route access                                                 | PASS — 200 |
+| VIEWER RBAC denial on `/api/conversations`                         | PASS — 403 |
+
+## Phase 6C.1 commit
+
+```
+Phase 6C closure: finalize HipLink branding and authenticated AI runtime
+```
+
+Branch: `phase-6-professional-dashboard`. **Not pushed. Not merged.**

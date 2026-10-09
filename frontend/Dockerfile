@@ -10,6 +10,11 @@ COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 COPY tsconfig.json vite.config.ts tailwind.config.js postcss.config.js index.html ./
 COPY src ./src
+# Vite copies `public/` into `dist/` verbatim during build; the
+# Hiplink brand assets live under `public/branding/` and must
+# be present in the build context so they end up in the runtime
+# image (served by `serve` behind nginx).
+COPY public ./public
 RUN npm run build
 
 FROM node:20.18.1-alpine AS runtime
