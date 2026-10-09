@@ -1,72 +1,62 @@
-// Phase 6A — BrandHeader.
+// Phase 6A / 6C — BrandHeader.
 //
 // The HipLink reference UI shows a compact brand mark at the
-// top-left of the header (logo glyph + "HipLink" wordmark).  No
-// HipLink logo asset exists in this repository, so the BrandHeader
-// renders an inline wordmark in semantic primary color.  Drop a
-// real SVG/PNG into `frontend/public/` and replace this component
-// (or import a static asset) to ship the real logo.
+// top-left of the header (logo glyph + product name).  Two logo
+// assets live under `frontend/public/branding/`:
+//
+//   hiplink-logo-on-dark.png   — light wordmark, intended for dark themes
+//   hiplink-logo-on-light.png  — dark wordmark, intended for light themes
+//
+// The header picks the asset whose wordmark colour matches the
+// active theme's surface, so the logo is legible on either palette.
+// All consumers (TopNavigation, MobileNavigation, LoginPage) render
+// this component — no page-specific duplicate logo logic.
 //
 // Visual hierarchy:
-//   [glyph]  HipLink   AI Cloud Cost Detective
-//              |___________________________|
-//                  subtle separator dot or vertical rule
+//   [HipLink logo]  AI Cloud Cost Detective   (non-compact)
+//   [HipLink logo]  AI Cloud Cost Detective   (compact — same text)
+//
+// The logo is rendered with `h-8 w-auto` so its aspect ratio is
+// preserved at all viewport sizes.  The two PNGs have slightly
+// different intrinsic aspect ratios (110×71 vs 129×71), so each
+// asset renders at its natural width at the chosen height.
 
 import { Link } from '../lib/router'
+import { useTheme } from '../lib/theme'
+
+const LOGO_SRC: Record<'dark' | 'light', string> = {
+  dark: '/branding/hiplink-logo-on-dark.png',
+  light: '/branding/hiplink-logo-on-light.png',
+}
 
 export function BrandHeader({ compact = false }: { compact?: boolean }) {
+  const { theme } = useTheme()
+  const logoSrc = LOGO_SRC[theme]
+
   return (
     <Link
       to="/"
       className="flex items-center gap-3 rounded-md focus:outline-none focus-visible:shadow-focus"
       aria-label="AI Cloud Cost Detective — go to dashboard"
+      data-testid="brand-header"
     >
-      <BrandGlyph />
-      {!compact && (
-        <span className="flex items-baseline gap-2">
-          <span className="text-sm font-semibold tracking-wide text-primary">
-            HIPLINK
-          </span>
-          <span aria-hidden className="text-fg-muted">·</span>
-          <span className="text-sm font-semibold text-fg-primary">
-            AI Cloud Cost Detective
-          </span>
-        </span>
-      )}
-      {compact && (
-        <span className="text-sm font-semibold text-fg-primary">
-          AI Cloud Cost Detective
-        </span>
-      )}
+      <img
+        src={logoSrc}
+        alt="HipLink"
+        width={0}
+        height={32}
+        // `h-8` matches the previous BrandGlyph dimensions.  `w-auto`
+        // preserves each PNG's intrinsic aspect ratio so the logo is
+        // never stretched.  `max-w-none` is implicit because the
+        // parent flex container controls the layout.
+        className="block h-8 w-auto select-none"
+        draggable={false}
+        data-testid="brand-header-logo"
+        data-theme-asset={theme}
+      />
+      <span className="text-sm font-semibold text-fg-primary">
+        {compact ? 'AI Cloud Cost Detective' : 'AI Cloud Cost Detective'}
+      </span>
     </Link>
-  )
-}
-
-function BrandGlyph() {
-  // Geometric mark — a rounded square with the "H" letterform.
-  // Visual placeholder; swap for the real HipLink mark.
-  return (
-    <span
-      aria-hidden
-      className="
-        inline-flex h-8 w-8 items-center justify-center rounded-md
-        bg-primary-soft text-primary ring-1 ring-border
-      "
-    >
-      <svg
-        width="16"
-        height="16"
-        viewBox="0 0 16 16"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      >
-        <path d="M3 2v12" />
-        <path d="M13 2v12" />
-        <path d="M3 8h10" />
-      </svg>
-    </span>
   )
 }

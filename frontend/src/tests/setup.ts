@@ -11,6 +11,16 @@ import { afterEach, beforeEach, vi } from 'vitest'
 import { cleanup } from '@testing-library/react'
 
 // ---------------------------------------------------------------------------
+// React 18 act() environment marker.
+//
+// Tells React that every test runs inside an act() boundary by default,
+// so legitimate state updates flushed by `waitFor` / micro-tasks are
+// not flagged as "not wrapped in act(...)".  This is the canonical
+// pattern from the React 18 testing docs.
+// ---------------------------------------------------------------------------
+;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+
+// ---------------------------------------------------------------------------
 // matchMedia — jsdom does not implement it.  Defined on window
 // directly so it survives `vi.restoreAllMocks()` (which restores
 // spies on objects but does NOT undo property assignments).
