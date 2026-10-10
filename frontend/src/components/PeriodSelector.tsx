@@ -1,12 +1,11 @@
-// Phase 6B — Compact HipLink-style period selector.
+// Phase 7A — Calendar-month billing selector.
 //
-// 7d · 30d · 60d · 90d segmented control.  Reads / writes the
-// FinopsPeriod context so a selection on the Costs page flows to
-// the Dashboard without manual prop-drilling.
+// Replaces the Phase 6B 7d/30d/60d/90d segmented control with a
+// native `<select>` of the last 12 calendar months plus a hidden
+// back-compat hook for tests that drive the rolling-lookback path.
 
 import { useFinopsPeriod } from '../lib/finops/period'
-import { ALLOWED_LOOKBACK_DAYS, type LookbackDays } from '../types/finops'
-import { periodShortLabel } from '../lib/format'
+import { monthLabel } from '../types/finops'
 
 export function PeriodSelector({
   disabled = false,
@@ -15,56 +14,38 @@ export function PeriodSelector({
   disabled?: boolean
   testId?: string
 }) {
-  const { days, setDays } = useFinopsPeriod()
+  const { period, setMonth, monthList } = useFinopsPeriod()
+  if (period.kind !== 'month') {
+    // Back-compat path: when the provider was given a days-based
+    // period (legacy or test fixture), expose no selector — the
+    // caller decides how to render it.
+    return null
+  }
   return (
     <div
-      role="radiogroup"
-      aria-label="Lookback period"
       data-testid={testId}
-      className="inline-flex items-center rounded-md border border-border bg-surface p-0.5"
+      className="inline-flex items-center gap-2 rounded-md border border-border bg-surface px-2 py-1"
     >
-      {ALLOWED_LOOKBACK_DAYS.map((opt) => (
-        <PeriodOption
-          key={opt}
-          value={opt}
-          active={opt === days}
-          disabled={disabled}
-          onSelect={setDays}
-        />
-      ))}
+      <label
+        htmlFor={`${testId}-select`}
+        className="text-xs font-medium text-fg-secondary"
+      >
+        Month
+      </label>
+      <select
+        id={`${testId}-select`}
+        disabled={disabled}
+        value={period.month}
+        onChange={(e) => setMonth(e.target.value)}
+        className="rounded border border-border bg-surface px-2 py-1 text-xs text-fg-primary focus:outline-none focus-visible:shadow-focus"
+        data-testid={`${testId}-input`}
+      >
+        {monthList.map((m) => (
+          <option key={m} value={m}>
+            {monthLabel(m)}
+          </option>
+        ))}
+      </select>
     </div>
-  )
-}
-
-function PeriodOption({
-  value,
-  active,
-  disabled,
-  onSelect,
-}: {
-  value: LookbackDays
-  active: boolean
-  disabled: boolean
-  onSelect: (v: LookbackDays) => void
-}) {
-  return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={active}
-      disabled={disabled}
-      onClick={() => onSelect(value)}
-      className={[
-        'rounded px-2 py-1 text-xs transition-colors',
-        'focus:outline-none focus-visible:shadow-focus',
-        active
-          ? 'bg-primary-soft text-primary ring-1 ring-primary/30'
-          : 'text-fg-secondary hover:bg-surface-hover hover:text-fg-primary',
-        disabled ? 'cursor-not-allowed opacity-60' : '',
-      ].join(' ')}
-      data-active={active ? 'true' : 'false'}
-    >
-      {periodShortLabel(value)}
-    </button>
   )
 }

@@ -1,22 +1,30 @@
-# litellm/config.yaml — Phase 0 minimal configuration.
+# litellm/config.yaml — Phase 7A real-provider-ready configuration.
 #
-# Zero configured provider models on purpose: Phase 0 must NOT call any LLM,
-# must NOT spend any AI API credits, and must NOT contain fake API keys or
-# fake mock responses. The gateway is exercised only by its /health/readiness
-# endpoint against the `litellm` PostgreSQL database.
+# The application talks to LiteLLM exclusively through the stable
+# internal alias `cost-analyst`.  The actual provider model and
+# credentials are resolved by the LiteLLM gateway from environment
+# variables at startup — no secrets appear in this file, and no
+# operator-typed creds are required for the gateway to boot in a
+# safe, AI-disabled-by-default mode.
 #
-# In later phases this file will define model aliases such as:
-#   cost-detective-free
-#   cost-detective-balanced
-#   cost-detective-premium
-# wired to real providers (OpenRouter, Google Gemini, OpenAI, Anthropic,
-# AWS Bedrock, Ollama). None of that is implemented here.
+# Required to enable a real provider:
+#
+#   LITELLM_API_KEY=<your-provider-key>
+#   LITELLM_MODEL=openai/gpt-4o-mini        # or any LiteLLM-supported provider/model
+#
+# The alias `cost-analyst` keeps frontend and backend code stable
+# regardless of which provider the operator wires in.
 
-model_list: []
+model_list:
+  - model_name: cost-analyst
+    litellm_params:
+      model: os.environ/LITELLM_MODEL
+      api_key: os.environ/LITELLM_API_KEY
 
 litellm_settings:
   drop_params: true
   telemetry: false
+  request_timeout: 30
 
 general_settings:
   # Persist LiteLLM metadata + spend tracking in the litellm PostgreSQL DB.

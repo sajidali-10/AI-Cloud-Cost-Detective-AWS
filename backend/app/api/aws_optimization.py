@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -55,6 +56,19 @@ from app.services.optimization_engine import (
 logger = logging.getLogger("cost-detective-backend.aws_optimization")
 
 _settings = get_settings
+
+
+def _route_deadline_seconds() -> float:
+    """Hard deadline for the optimization route handler.
+
+    Phase 7A: the route must return *something* (even a partial
+    response) well before the 25 s frontend budget expires.  We pick
+    22 s so network/protocol overhead still has headroom.
+    """
+    try:
+        return float(os.getenv("OPTIMIZATION_ROUTE_DEADLINE_SECONDS", "22.0"))
+    except (TypeError, ValueError):
+        return 22.0
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +118,20 @@ def _fetch_utilization(
     as "no coverage" and downgrades the deterministic confidence
     accordingly.
 
+    Phase 7A: the CloudWatch batch query is bounded by the
+    ``OPTIMIZATION_TIMEOUT_CLOUDWATCH`` budget (default 10s).  When
+    exceeded the function returns an empty dict and emits a
+    ``TIMED_OUT`` notice via the route layer — deterministic rules
+    remain usable on the partial evidence.
+
     Callers already running inside an event loop (e.g. Phase 4
     ``AIService._gather_async``) MUST use
     :func:`_fetch_utilization_async` instead — calling this sync
     wrapper from an async context would deadlock the loop on
     ``asyncio.run``.
     """
+    from app.services.optimization_engine import _run_with_budget
+
     descriptors = _descriptors_from_phase1(phase1_services, region=region, types_filter=None)
     if not descriptors:
         return {}
@@ -118,24 +140,38 @@ def _fetch_utilization(
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     period = period_seconds_for(days)
-    try:
-        results = _run_batch_query_blocking(
-            cw_client=cw_client,
+
+    def _do() -> Dict[str, list]:
+        try:
+            results = _run_batch_query_blocking(
+                cw_client=cw_client,
+                queries=queries,
+                start=start,
+                end=end,
+                period=period,
+            )
+        except (CloudWatchError, ClientError, BotoCoreError) as exc:
+            logger.warning("aws.optimization cloudwatch error=%s", type(exc).__name__)
+            return {}
+        return _aggregate_batch_results(
+            results=results,
             queries=queries,
-            start=start,
-            end=end,
+            descriptors=descriptors,
+            days=days,
             period=period,
         )
-    except (CloudWatchError, ClientError, BotoCoreError) as exc:
-        logger.warning("aws.optimization cloudwatch error=%s", type(exc).__name__)
+
+    timed_out, result = _run_with_budget("cloudwatch_utilization", _do)
+    if timed_out:
+        logger.warning(
+            "aws.optimization cloudwatch timeout budget=%ss",
+            os.getenv("OPTIMIZATION_TIMEOUT_CLOUDWATCH", "10.0"),
+        )
         return {}
-    return _aggregate_batch_results(
-        results=results,
-        queries=queries,
-        descriptors=descriptors,
-        days=days,
-        period=period,
-    )
+    if isinstance(result, BaseException):
+        logger.warning("aws.optimization cloudwatch error=%s", type(result).__name__)
+        return {}
+    return result  # type: ignore[return-value]
 
 
 async def _fetch_utilization_async(

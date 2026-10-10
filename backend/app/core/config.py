@@ -60,7 +60,12 @@ class Settings(BaseSettings):
     # Base URL for the LiteLLM gateway. When LITELLM_BASE_URL is unset
     # we fall back to http://<litellm_host>:<litellm_port> below.
     litellm_base_url: str = Field(default="")
-    litellm_model: str = Field(default="cost-detective-free")
+    # Phase 7A: the stable internal alias the application uses when
+    # calling the LiteLLM gateway.  The gateway resolves this alias
+    # to a real provider/model via ``litellm/config.yaml``.  We never
+    # ship provider names here so a provider swap (OpenAI → Bedrock
+    # → Gemini) requires no application change.
+    litellm_model: str = Field(default="cost-analyst")
     litellm_api_key: str = Field(default="")
     ai_request_timeout_seconds: int = Field(default=30, ge=1, le=120)
     ai_max_output_tokens: int = Field(default=800, ge=1, le=4000)

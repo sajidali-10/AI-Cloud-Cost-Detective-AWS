@@ -50,6 +50,16 @@ class AIStatusResponse(BaseModel):
 
     Intentionally omits the API key, the full Authorization header,
     and any upstream URL containing credentials.
+
+    Phase 7A — adds:
+
+    * ``provider_configured`` — true when at least one well-known
+      provider credential env var is set.  Never carries the value.
+    * ``provider_model`` — the underlying model the LiteLLM alias
+      resolves to (e.g. ``openai/gpt-4o-mini``).  Driven by
+      ``LITELLM_MODEL``; never contains credentials.
+    * ``required_env_var`` — name of the env var the operator must
+      set to enable a real provider.  Empty / null when configured.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -57,11 +67,14 @@ class AIStatusResponse(BaseModel):
     status: AIStatus
     ai_enabled: bool
     litellm_reachable: bool
+    provider_configured: bool = False
     model_alias: str
+    provider_model: Optional[str] = None
     litellm_base_url: str  # scheme://host:port (no credentials)
     timeout_seconds: int
     max_output_tokens: int
     context_limits: Dict[str, int]
+    required_env_var: Optional[str] = None
     message: Optional[str] = None
 
 

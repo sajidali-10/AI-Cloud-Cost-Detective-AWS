@@ -19,12 +19,23 @@ export interface AIStatusResponse {
   status: AIProviderStatus
   ai_enabled: boolean
   litellm_reachable: boolean
+  /** True when the operator has supplied a provider credential via
+   *  env (e.g. ``LITELLM_API_KEY`` or the provider-specific key the
+   *  LiteLLM config references).  Phase 7A: never expose the key
+   *  itself. */
+  provider_configured: boolean
   model_alias: string
+  /** Phase 7A — The semantic model the alias resolves to (e.g.
+   *  ``openai/gpt-4o-mini``).  Surfaced so operators can confirm
+   *  the env-driven mapping without leaking credentials. */
+  provider_model: string | null
   /** scheme://host:port (no credentials in the wire). */
   litellm_base_url: string
   timeout_seconds: number
   max_output_tokens: number
   context_limits: Record<string, number>
+  /** Required environment variable name when ``provider_configured=false``. */
+  required_env_var: string | null
   message?: string | null
 }
 

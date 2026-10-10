@@ -1,10 +1,16 @@
-// Phase 6B — Dashboard page wired to real Phase 1–3 data.
+// Phase 7A — Dashboard page wired to real Phase 1–3 data with
+// calendar-month billing.
 //
-// The HipLink-style layout is preserved: PageHeader with context
-// row, 4 KPI tiles, two large charts (cost trend + by service),
-// two summary cards (optimization + environment).  Every tile
-// pulls from the typed FinOps services in `lib/finops/*`; no fake
-// numbers are rendered at any layer.
+// Phase 7A invariants:
+//   * The single source of truth for the active period is the
+//     FinopsPeriod context — header and hero always show the same
+//     month.
+//   * Identity / Resources / Capabilities drive the AWS
+//     environment panel; costs come from the selected calendar
+//     month (MTD-clipped when current).
+//   * Auth lifecycle: every FinOps hook now waits for auth
+//     bootstrap via the store's gate; the dashboard cannot fire a
+//     request before the JWT is wired in.
 
 import { useMemo } from 'react'
 import { PageHeader, ContextItem } from '../components/PageHeader'
@@ -41,6 +47,7 @@ import type {
   RegionCost,
   ServiceCost,
 } from '../types/finops'
+import { monthLabel } from '../types/finops'
 import {
   changeTone,
   formatChangePercent,
@@ -50,13 +57,12 @@ import {
   formatSignedChange,
   maskAccountId,
   parseDecimal,
-  periodLabel,
   capabilityTone,
   capabilityLabel,
 } from '../lib/format'
 
 export function DashboardPage() {
-  const { days, region } = useFinopsPeriod()
+  const { period, region, currentMonth } = useFinopsPeriod()
   const effectiveRegion = region === 'all' ? null : region
 
   // Identity — single fetch, drives the page header.
@@ -68,8 +74,8 @@ export function DashboardPage() {
 
   // Cost report — keyed on period + region.
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(days, effectiveRegion),
-    () => fetchCostReport(days, { region: effectiveRegion }),
+    buildCostsCacheKey(period, effectiveRegion),
+    () => fetchCostReport(period, { region: effectiveRegion }),
   )
 
   // Capabilities — drives the Optimization Summary card.
@@ -81,8 +87,8 @@ export function DashboardPage() {
 
   // Optimization summary — keyed on period + region.
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(days, effectiveRegion),
-    () => fetchOptimizationSummary(days, effectiveRegion),
+    buildSummaryCacheKey(period, effectiveRegion),
+    () => fetchOptimizationSummary(period, effectiveRegion),
     { ttlMs: 60_000 },
   )
 
@@ -103,6 +109,9 @@ export function DashboardPage() {
 
   const report = cost.entry.data?.report ?? null
 
+  // Phase 7A — single source of truth for the active month label.
+  const activeMonthLabel = period.kind === 'month' ? monthLabel(period.month) : monthLabel(currentMonth)
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -121,7 +130,17 @@ export function DashboardPage() {
             />
             <ContextItem
               label="Region"
-              value={resources.entry.data?.region ?? effectiveRegion ?? 'default'}
+              value={
+                identity.entry.data?.region
+                  ? identity.entry.data.region
+                  : resources.entry.data?.region
+                    ? resources.entry.data.region
+                    : effectiveRegion ?? 'Account-level'
+              }
+            />
+            <ContextItem
+              label="Month"
+              value={activeMonthLabel}
             />
             <ContextItem
               label="Status"
@@ -202,8 +221,8 @@ export function DashboardPage() {
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} days={days} />
-        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} days={days} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpi
           resources={resources.entry.data}
           loading={resources.entry.status === 'loading'}
@@ -218,7 +237,7 @@ export function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <SectionCard
           title="Cost Trend"
-          description={`Daily spend · ${periodLabel(days)}`}
+          description={`Daily spend · ${activeMonthLabel}`}
           actions={<StatusBadge tone={cost.entry.data?.cache_status === 'HIT' ? 'neutral' : 'info'}>
             Cache: {cost.entry.data?.cache_status ?? '—'}
           </StatusBadge>}
@@ -229,7 +248,7 @@ export function DashboardPage() {
             <CostTrendChart
               points={cost.entry.data.report.daily_trend}
               currency={cost.entry.data.report.currency}
-              ariaLabel={`Daily cost trend over ${periodLabel(days)}`}
+              ariaLabel={`Daily cost trend for ${activeMonthLabel}`}
             />
           )}
         </SectionCard>
@@ -260,7 +279,7 @@ export function DashboardPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <SectionCard
           title="Optimization Summary"
-          description={`Open opportunities · ${periodLabel(days)}`}
+          description={`Open opportunities · ${activeMonthLabel}`}
         >
           <OptimizationSummary
             summary={summary.entry.data}
@@ -289,11 +308,11 @@ export function DashboardPage() {
 function SpendKpi({
   report,
   loading,
-  days,
+  period,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
-  days: number
+  period: import('../types/finops').BillingPeriod
 }) {
   if (loading && !report) {
     return <MetricCard label="AWS Spend" description="Loading…" value={undefined} />
@@ -301,12 +320,13 @@ function SpendKpi({
   if (!report) {
     return <MetricCard label="AWS Spend" description="—" value={undefined} />
   }
+  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
   return (
     <MetricCard
       label="AWS Spend"
       icon={<SpendIcon />}
       value={formatCurrencyCompact(report.total_cost, report.currency)}
-      description={`${periodLabel(days)} · ${report.currency}`}
+      description={`${label} · ${report.currency}`}
     />
   )
 }
@@ -314,11 +334,11 @@ function SpendKpi({
 function ChangeKpi({
   report,
   loading,
-  days,
+  period,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
-  days: number
+  period: import('../types/finops').BillingPeriod
 }) {
   if (loading && !report) {
     return <MetricCard label="Cost Change" description="Loading…" value={undefined} />
@@ -329,7 +349,6 @@ function ChangeKpi({
   const pct = formatChangePercent(report.total_cost, report.previous_period_cost)
   const abs = formatSignedChange(report.change_amount, report.currency)
   const tone = changeTone(report.total_cost, report.previous_period_cost)
-  // Friendly wording: never "Critical".
   const directionWord =
     parseDecimal(report.change_amount) === null
       ? 'No comparison'
@@ -338,13 +357,17 @@ function ChangeKpi({
         : parseDecimal(report.change_amount)! > 0
           ? 'Increase'
           : 'Decrease'
+  const compareLabel =
+    period.kind === 'month'
+      ? 'vs previous month'
+      : `vs previous ${period.days} days`
   return (
     <MetricCard
       label="Cost Change"
       icon={<DeltaIcon />}
       value={pct}
       tone={tone}
-      description={`${directionWord} vs previous ${days} days · ${abs}`}
+      description={`${directionWord} ${compareLabel} · ${abs}`}
     />
   )
 }
@@ -478,14 +501,16 @@ function CapabilityPanel({
   }
   return (
     <div className="mt-3 space-y-1 border-t border-border pt-3" data-testid="dashboard-capabilities">
-      <CapabilityStatusRow label="Compute Optimizer" capability={caps.compute_optimizer} />
+      <CapabilityStatusRow label="Compute Optimizer" capability={caps.compute_optimizer} kind="compute_optimizer" />
       <CapabilityStatusRow
         label="Cost Optimization Hub"
         capability={caps.cost_optimization_hub}
+        kind="cost_optimization_hub"
       />
       <CapabilityStatusRow
         label="Deterministic Engine"
         capability={caps.deterministic_engine}
+        kind="deterministic_engine"
       />
       {caps.warnings.length > 0 && (
         <PartialWarning warnings={caps.warnings} title="Capability warnings" />
@@ -563,9 +588,6 @@ function computeResourceCounts(resources: ResourcesResponse | null): {
   let types = 0
   for (const svc of Object.values(resources.services)) {
     if (!svc) continue
-    // Types discovered = services that returned any data (ok with
-    // items) OR returned a structured status (so a denied/error
-    // service still counts as a "discovered" type).
     if (svc.items.length > 0 || svc.status !== 'ok') {
       types += 1
     }
@@ -601,7 +623,7 @@ function SpendIcon() {
   return (
     <svg aria-hidden width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 2v20" />
-      <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+      <path d="M17 5H9.5a3.3 3.5 0 0 0 0 7h5a3.3 3.5 0 0 1 0 7H6" />
     </svg>
   )
 }

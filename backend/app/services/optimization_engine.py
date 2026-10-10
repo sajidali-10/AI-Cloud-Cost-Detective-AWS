@@ -29,11 +29,23 @@ The orchestrator also computes the summary breakdown (by resource
 type / action / source / confidence) using the same deduplicated
 list, so the savings total in the summary exactly matches the
 recommendations endpoint.
+
+Phase 7A: per-provider timeout budgets.  Each AWS-native source
+(Compute Optimizer, Cost Optimization Hub) and the CloudWatch
+utilization batch run inside a per-call future with a strict
+budget.  When a source exceeds its budget the engine emits a
+``TIMED_OUT`` ``OptimizationNotice`` and continues with whatever
+data the other sources produced.  Deterministic rules are pure
+local code and are NOT budgeted — they always run to completion
+so the dashboard never shows an empty state when the AWS sources
+are slow.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -86,6 +98,36 @@ from app.services.optimization_rules import (
 )
 
 logger = logging.getLogger("cost-detective-backend.optimization_engine")
+
+
+# ---------------------------------------------------------------------------
+# Per-source timeout budgets (Phase 7A).
+#
+# Each AWS-native provider runs in its own thread with a hard
+# deadline.  CloudWatch utilization batching is the heaviest
+# individual step in the route handler, so it gets its own budget.
+# Deterministic rules are pure local code (no I/O) and are NOT
+# budgeted — they always run to completion so a slow AWS source can
+# never blank valid deterministic recommendations.
+#
+# Tuned via environment variables so operators can tighten/loosen
+# without a code change.  Default values match the empirical
+# duration of these AWS APIs against the dev account.
+# ---------------------------------------------------------------------------
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+PROVIDER_TIMEOUT_SECONDS: Dict[str, float] = {
+    "compute_optimizer": _env_float("OPTIMIZATION_TIMEOUT_COMPUTE_OPTIMIZER", 6.0),
+    "cost_optimization_hub": _env_float("OPTIMIZATION_TIMEOUT_COST_OPTIMIZATION_HUB", 6.0),
+    "cloudwatch_utilization": _env_float("OPTIMIZATION_TIMEOUT_CLOUDWATCH", 10.0),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +888,11 @@ def build_recommendations(
     legitimate, non-error capability states.  Only ``ACTIVE`` (or an
     undetected status that happens to come back clean) triggers a
     real fetcher call.
+
+    Phase 7A: each provider call runs on a per-call thread with a
+    hard timeout budget.  A timeout produces a ``TIMED_OUT`` notice
+    and the engine keeps going — deterministic recommendations stay
+    usable even when AWS is unresponsive.
     """
     warnings: List[OptimizationNotice] = []
     candidates: List[RecommendationCandidate] = []
@@ -860,29 +907,47 @@ def build_recommendations(
         # touched and produces no warning.
         co_cap, _co_err = _co_capability(inputs.region, inputs.account_id)
         if _should_fetch_aws_source(co_cap.status.value):
-            try:
-                co_candidates = _fetch_compute_optimizer_candidates(
+            timed_out, result_or_exc = _run_with_budget(
+                "compute_optimizer",
+                lambda: _fetch_compute_optimizer_candidates(
                     region=inputs.region,
                     account_id=inputs.account_id,
-                )
-            except ComputeOptimizerError as exc:
+                ),
+            )
+            if timed_out:
                 warnings.append(
                     OptimizationNotice(
                         source="compute_optimizer",
-                        code=exc.code,
-                        message="Compute Optimizer recommendations were not available.",
+                        code="TIMED_OUT",
+                        message=(
+                            "Compute Optimizer recommendations exceeded the "
+                            f"{PROVIDER_TIMEOUT_SECONDS['compute_optimizer']:.1f}s budget."
+                        ),
                         region=inputs.region,
                     )
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                warnings.append(
-                    OptimizationNotice(
-                        source="compute_optimizer",
-                        code=type(exc).__name__,
-                        message="Compute Optimizer recommendations were not available.",
-                        region=inputs.region,
+            else:
+                exc = result_or_exc
+                if isinstance(exc, ComputeOptimizerError):
+                    warnings.append(
+                        OptimizationNotice(
+                            source="compute_optimizer",
+                            code=exc.code,
+                            message="Compute Optimizer recommendations were not available.",
+                            region=inputs.region,
+                        )
                     )
-                )
+                elif isinstance(exc, BaseException):
+                    warnings.append(
+                        OptimizationNotice(
+                            source="compute_optimizer",
+                            code=type(exc).__name__,
+                            message="Compute Optimizer recommendations were not available.",
+                            region=inputs.region,
+                        )
+                    )
+                else:
+                    co_candidates = result_or_exc  # type: ignore[assignment]
     candidates.extend(co_candidates)
 
     if inputs.include_cost_optimization_hub:
@@ -891,30 +956,47 @@ def build_recommendations(
         # and must not surface as warnings.
         coh_cap, _coh_err = _coh_capability(inputs.region, inputs.account_id)
         if _should_fetch_aws_source(coh_cap.status.value):
-            try:
-                hub_rows = _fetch_cost_optimization_hub_candidates(
+            timed_out, result_or_exc = _run_with_budget(
+                "cost_optimization_hub",
+                lambda: _fetch_cost_optimization_hub_candidates(
                     region=inputs.region,
                     account_id=inputs.account_id,
-                )
-                coh_candidates = [_coh_to_candidate(r) for r in hub_rows]
-            except CostOptimizationHubError as exc:
+                ),
+            )
+            if timed_out:
                 warnings.append(
                     OptimizationNotice(
                         source="cost_optimization_hub",
-                        code=exc.code,
-                        message="Cost Optimization Hub recommendations were not available.",
+                        code="TIMED_OUT",
+                        message=(
+                            "Cost Optimization Hub recommendations exceeded the "
+                            f"{PROVIDER_TIMEOUT_SECONDS['cost_optimization_hub']:.1f}s budget."
+                        ),
                         region=inputs.region,
                     )
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                warnings.append(
-                    OptimizationNotice(
-                        source="cost_optimization_hub",
-                        code=type(exc).__name__,
-                        message="Cost Optimization Hub recommendations were not available.",
-                        region=inputs.region,
+            else:
+                exc = result_or_exc
+                if isinstance(exc, CostOptimizationHubError):
+                    warnings.append(
+                        OptimizationNotice(
+                            source="cost_optimization_hub",
+                            code=exc.code,
+                            message="Cost Optimization Hub recommendations were not available.",
+                            region=inputs.region,
+                        )
                     )
-                )
+                elif isinstance(exc, BaseException):
+                    warnings.append(
+                        OptimizationNotice(
+                            source="cost_optimization_hub",
+                            code=type(exc).__name__,
+                            message="Cost Optimization Hub recommendations were not available.",
+                            region=inputs.region,
+                        )
+                    )
+                else:
+                    coh_candidates = [_coh_to_candidate(r) for r in result_or_exc]  # type: ignore[arg-type, assignment]
     candidates.extend(coh_candidates)
 
     # Deterministic rules.  Always run; pure local code.
@@ -956,6 +1038,36 @@ def build_recommendations(
 
     recommendations = [_candidate_to_recommendation(c, index=i) for i, c in enumerate(deduped)]
     return recommendations, warnings
+
+
+def _run_with_budget(
+    provider_key: str,
+    fn: Any,
+) -> tuple[bool, Any]:
+    """Run ``fn`` in a dedicated thread with a hard timeout.
+
+    Returns ``(timed_out, result)``:
+
+    * ``timed_out=False`` and ``result`` is the callable's return
+      value on success.
+    * ``timed_out=False`` and ``result`` is the raised exception on
+      failure (the caller decides how to map it to a warning).
+    * ``timed_out=True`` and ``result`` is ``None`` when the budget
+      was exceeded.  The worker thread is left to finish on its own;
+      its result is discarded.
+
+    The budget is read from :data:`PROVIDER_TIMEOUT_SECONDS` so tests
+    can override it via env vars.
+    """
+    budget = PROVIDER_TIMEOUT_SECONDS.get(provider_key, 6.0)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn)
+        try:
+            return False, future.result(timeout=budget)
+        except FuturesTimeout:
+            return True, None
+        except Exception as exc:  # propagate the typed exception
+            return False, exc
 
 
 def build_summary(
@@ -1034,7 +1146,9 @@ def _to_summary_list(bucket: Dict[str, dict[str, Any]]) -> List[SummaryByCategor
 
 __all__ = [
     "OptimizationInputs",
+    "PROVIDER_TIMEOUT_SECONDS",
     "SOURCE_PRECEDENCE",
+    "_run_with_budget",
     "build_capabilities",
     "build_recommendations",
     "build_summary",

@@ -129,6 +129,162 @@ def build_period(days: int, *, today: Optional[date] = None) -> CostPeriod:
     return CostPeriod(start=start, end=end, days=days)
 
 
+# ---------------------------------------------------------------------------
+# Calendar-month helpers (Phase 7A).
+# ---------------------------------------------------------------------------
+
+# Months provided to the frontend selector.  12 covers the last full
+# calendar year + the current MTD month.
+CALENDAR_MONTH_SELECTOR_COUNT = 12
+
+
+def parse_month(month: str) -> tuple[int, int]:
+    """Parse a ``YYYY-MM`` string into ``(year, month)``.
+
+    Raises :class:`CostExplorerError` on malformed input.
+    """
+    if not isinstance(month, str) or len(month) != 7 or month[4] != "-":
+        raise CostExplorerError(
+            code="InvalidMonth",
+            message=f"month={month!r} must be in YYYY-MM format",
+        )
+    try:
+        year = int(month[0:4])
+        m = int(month[5:7])
+    except ValueError as exc:
+        raise CostExplorerError(
+            code="InvalidMonth",
+            message=f"month={month!r} is not a valid YYYY-MM",
+        ) from exc
+    if m < 1 or m > 12:
+        raise CostExplorerError(
+            code="InvalidMonth",
+            message=f"month={month!r} must be 01..12",
+        )
+    return year, m
+
+
+def build_month_period(
+    month: str,
+    *,
+    today: Optional[date] = None,
+) -> CostPeriod:
+    """Return the full calendar-month period for ``YYYY-MM``.
+
+    ``September 2026`` → ``(2026-09-01, 2026-10-01)``.  Both bounds
+    are UTC dates; Cost Explorer interprets them as UTC day boundaries.
+
+    When the requested month is the CURRENT month and ``today`` is
+    supplied, the period is clipped to ``[month_start, today+1)`` so
+    the response reflects Month-to-Date instead of a future-anchored
+    full month.  When ``today`` is omitted we always return the
+    FULL calendar month.
+    """
+    year, m = parse_month(month)
+    start = date(year, m, 1)
+    if m == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, m + 1, 1)
+    current = today or _today_utc()
+    if start <= current < end:
+        # Clip to MTD — today exclusive.
+        end = current + timedelta(days=1)
+    days = (end - start).days
+    return CostPeriod(start=start, end=end, days=days)
+
+
+def previous_month_period(month: str) -> CostPeriod:
+    """Return the full calendar month immediately preceding ``YYYY-MM``."""
+    year, m = parse_month(month)
+    if m == 1:
+        prev_year, prev_m = year - 1, 12
+    else:
+        prev_year, prev_m = year, m - 1
+    start = date(prev_year, prev_m, 1)
+    end = date(year, m, 1)
+    return CostPeriod(start=start, end=end, days=(end - start).days)
+
+
+def matched_mtd_previous_period(month: str, *, today: date) -> CostPeriod:
+    """Return the matched-MTD previous-period.
+
+    For a current month request (Oct 1-9), returns Sep 1-9.  Used as
+    the comparison period for Month-to-Date so the delta isn't
+    inflated by missing days from the current month.
+    """
+    year, m = parse_month(month)
+    start = date(year, m, 1)
+    if m == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, m + 1, 1)
+    if not (start <= today < end):
+        return previous_month_period(month)
+    days_into_month = (today - start).days + 1  # inclusive of today
+    if m == 1:
+        prev_year, prev_m = year - 1, 12
+    else:
+        prev_year, prev_m = year, m - 1
+    prev_start = date(prev_year, prev_m, 1)
+    prev_end_exclusive = prev_start + timedelta(days=days_into_month)
+    # The previous month may not have that many days (e.g. Feb 30);
+    # clip to that month's last day.
+    if m - 1 == 2:
+        last_prev = date(prev_year, prev_m, 28)  # safe — only matters if leap year shift
+        # detect leap year
+        if prev_year % 4 == 0 and (prev_year % 100 != 0 or prev_year % 400 == 0):
+            last_prev = date(prev_year, prev_m, 29)
+        if prev_end_exclusive > last_prev + timedelta(days=1):
+            prev_end_exclusive = last_prev + timedelta(days=1)
+    return CostPeriod(
+        start=prev_start,
+        end=prev_end_exclusive,
+        days=(prev_end_exclusive - prev_start).days,
+    )
+
+
+def list_recent_calendar_months(
+    *,
+    today: Optional[date] = None,
+    count: int = CALENDAR_MONTH_SELECTOR_COUNT,
+) -> List[str]:
+    """Return ``count`` recent ``YYYY-MM`` strings ending with the current month."""
+    if count < 1:
+        return []
+    current = today or _today_utc()
+    out: List[str] = []
+    y, m = current.year, current.month
+    for _ in range(count):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return list(reversed(out))
+
+
+def build_explicit_period(start_date: date, end_date: date) -> CostPeriod:
+    """Build a ``CostPeriod`` from explicit dates (Phase 7A)."""
+    if not isinstance(start_date, date) or not isinstance(end_date, date):
+        raise CostExplorerError(
+            code="InvalidDates",
+            message="start_date and end_date must be ISO dates",
+        )
+    if end_date <= start_date:
+        raise CostExplorerError(
+            code="InvalidDates",
+            message="end_date must be strictly after start_date",
+        )
+    days = (end_date - start_date).days
+    if days > 366:
+        raise CostExplorerError(
+            code="InvalidDates",
+            message=f"date range {days} days exceeds the 366-day maximum",
+        )
+    return CostPeriod(start=start_date, end=end_date, days=days)
+
+
 def previous_period(period: CostPeriod) -> CostPeriod:
     """Return the comparable period immediately before ``period``.
 
@@ -429,8 +585,45 @@ def aggregate_cost_report(
     )
 
 
+def aggregate_cost_report_for_period(
+    client: BaseClient,
+    period: CostPeriod,
+    previous: CostPeriod,
+    *,
+    account_id: Optional[str] = None,  # reserved for future enrichment
+) -> CostReport:
+    """Phase 7A — Compose the report for an explicit ``CostPeriod``.
+
+    The previous-period total is fetched from ``previous`` so the
+    caller can supply a matched MTD window or an equal-length
+    preceding range.
+    """
+    current_total, _ = get_total_and_previous(client, period)
+    _, previous_total = get_total_and_previous(client, previous)
+    daily = get_daily_trend(client, period)
+    by_service = get_by_service(client, period)
+    by_region = get_by_region(client, period)
+    unit = "USD"
+    if daily and daily[0][2]:
+        unit = daily[0][2]
+    elif by_service and by_service[0][2]:
+        unit = by_service[0][2]
+    return CostReport(
+        period=period,
+        previous=previous,
+        current_total=current_total,
+        previous_total=previous_total,
+        daily=daily,
+        by_service=by_service,
+        by_region=by_region,
+        estimated=False,
+        unit=unit,
+    )
+
+
 __all__ = [
     "ALLOWED_LOOKBACK_DAYS",
+    "CALENDAR_MONTH_SELECTOR_COUNT",
     "CE_DATE_FORMAT",
     "CE_PAGE_SIZE",
     "COST_METRIC",
@@ -438,11 +631,18 @@ __all__ = [
     "CostPeriod",
     "CostReport",
     "aggregate_cost_report",
+    "aggregate_cost_report_for_period",
+    "build_explicit_period",
+    "build_month_period",
     "build_period",
     "get_by_region",
     "get_by_service",
     "get_cost_explorer_client",
     "get_daily_trend",
     "get_total_and_previous",
+    "list_recent_calendar_months",
+    "matched_mtd_previous_period",
+    "parse_month",
+    "previous_month_period",
     "previous_period",
 ]

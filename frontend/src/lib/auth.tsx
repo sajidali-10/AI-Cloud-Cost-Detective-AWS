@@ -43,6 +43,7 @@ import {
   type ReactNode,
 } from 'react'
 import { ApiError, apiFetch, configureApi } from './api'
+import { invalidateFinopsCache } from './finops/cache'
 import { useNavigate } from './router'
 import type { Role } from './tokens'
 
@@ -200,6 +201,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       kind: 'expired',
       message: 'Your session has expired. Please sign in again.',
     })
+    // Phase 7A: drop any cached FinOps data fetched under the now-
+    // invalidated token so user B never sees user A's numbers.
+    invalidateFinopsCache()
     setStatus({ phase: 'unauthenticated', notice: readStoredNotice() })
   }, [])
 
@@ -291,6 +295,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       writeStoredSession(stored)
       sessionExpiredOnceRef.current = false
       writeStoredNotice(null)
+      // Phase 7A: a different user just logged in; their FinOps
+      // caches must not see another account's pre-login probes.
+      invalidateFinopsCache()
       setStatus({ phase: 'authenticated', user: payload.user })
     },
     [],
@@ -303,6 +310,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       message: 'You have been signed out.',
     })
     sessionExpiredOnceRef.current = false
+    // Phase 7A: clear all FinOps caches so a re-login (or another
+    // user on the same browser) never sees the previous account's
+    // data flash by.
+    invalidateFinopsCache()
     setStatus({ phase: 'unauthenticated', notice: readStoredNotice() })
     navigate('/login', { replace: true })
   }, [navigate])

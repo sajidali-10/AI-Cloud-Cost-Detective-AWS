@@ -1,18 +1,4 @@
-// Phase 6B — Costs page wired to real Phase 2 Cost Explorer data.
-//
-// Layout mirrors the HipLink Security Operations reference: dense,
-// operational, no marketing-style analytics.  Sections:
-//   1. PageHeader with period + region + refresh
-//   2. Top KPI row (Spend / Change / Top service)
-//   3. Cost Trend (large card, full width)
-//   4. Two side-by-side ranked cards: by Service, by Region
-//   5. Cost Detail table — date × service × region entries for the
-//      selected period (top 50 by amount)
-//
-// A slow CloudWatch or recommendation call does NOT blank this page
-// (those services are not used here); however a failing Cost
-// Explorer call is surfaced via the partial-success banner without
-// zeroing the layout.
+// Phase 7A — Costs page wired to calendar-month billing.
 
 import { useMemo } from 'react'
 import { PageHeader } from '../components/PageHeader'
@@ -30,7 +16,8 @@ import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery } from '../lib/finops/store'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
 import { useFinopsPeriod } from '../lib/finops/period'
-import type { CostReportResponse, ServiceCost } from '../types/finops'
+import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
+import { monthLabel } from '../types/finops'
 import {
   changeTone,
   formatChangePercent,
@@ -39,17 +26,21 @@ import {
   formatLocalTime,
   formatSignedChange,
   parseDecimal,
-  periodLabel,
 } from '../lib/format'
 import { regionRows } from './DashboardPage'
 
+function periodDisplay(period: BillingPeriod): string {
+  return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+}
+
 export function CostsPage() {
-  const { days, region } = useFinopsPeriod()
+  const { period, region } = useFinopsPeriod()
   const effectiveRegion = region === 'all' ? null : region
+  const periodText = periodDisplay(period)
 
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(days, effectiveRegion),
-    () => fetchCostReport(days, { region: effectiveRegion }),
+    buildCostsCacheKey(period, effectiveRegion),
+    () => fetchCostReport(period, { region: effectiveRegion }),
   )
 
   const report = cost.entry.data?.report ?? null
@@ -67,7 +58,7 @@ export function CostsPage() {
         context={
           <>
             <span className="text-fg-muted">Period</span>
-            <span className="text-fg-secondary">{periodLabel(days)}</span>
+            <span className="text-fg-secondary">{periodText}</span>
             <span className="text-fg-muted">Currency</span>
             <span className="text-fg-secondary">{report?.currency ?? '—'}</span>
             <span className="text-fg-muted">Cache</span>
@@ -90,8 +81,8 @@ export function CostsPage() {
       )}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} days={days} />
-        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} days={days} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <TopServiceKpi
           report={report}
           loading={cost.entry.status === 'loading'}
@@ -101,7 +92,7 @@ export function CostsPage() {
 
       <SectionCard
         title="Cost Trend"
-        description={`Daily spend · ${periodLabel(days)}`}
+        description={`Daily spend · ${periodText}`}
         actions={
           <StatusBadge tone={report?.estimated ? 'warning' : 'success'}>
             {report?.estimated ? 'Estimated' : 'Final'}
@@ -115,7 +106,7 @@ export function CostsPage() {
             <CostTrendChart
               points={cost.entry.data.report.daily_trend}
               currency={cost.entry.data.report.currency}
-              ariaLabel={`Daily cost trend over ${periodLabel(days)}`}
+              ariaLabel={`Daily cost trend for ${periodText}`}
             />
           )
         )}
@@ -172,7 +163,7 @@ export function CostsPage() {
 
       <SectionCard
         title="Service Breakdown"
-        description={`Top services for ${periodLabel(days)}`}
+        description={`Top services for ${periodText}`}
       >
         {cost.entry.status === 'loading' && !cost.entry.data ? (
           <LoadingSkeletonRows rows={6} />
@@ -193,11 +184,11 @@ export function CostsPage() {
 function SpendKpi({
   report,
   loading,
-  days,
+  period,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
-  days: number
+  period: BillingPeriod
 }) {
   if (loading && !report) return <MetricCard label="Total spend" value={undefined} description="Loading…" />
   if (!report) return <MetricCard label="Total spend" value={undefined} description="—" />
@@ -205,7 +196,7 @@ function SpendKpi({
     <MetricCard
       label="Total spend"
       value={formatCurrencyCompact(report.total_cost, report.currency)}
-      description={`${periodLabel(days)} · ${report.currency}`}
+      description={`${periodDisplay(period)} · ${report.currency}`}
     />
   )
 }
@@ -213,11 +204,11 @@ function SpendKpi({
 function ChangeKpi({
   report,
   loading,
-  days,
+  period,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
-  days: number
+  period: BillingPeriod
 }) {
   if (loading && !report) return <MetricCard label="Cost change" value={undefined} description="Loading…" />
   if (!report) return <MetricCard label="Cost change" value={undefined} description="—" />
@@ -232,12 +223,15 @@ function ChangeKpi({
         : parseDecimal(report.change_amount)! > 0
           ? 'Increase'
           : 'Decrease'
+  const compare = period.kind === 'month'
+    ? 'vs previous month'
+    : `vs previous ${period.days} days`
   return (
     <MetricCard
       label="Cost change"
       value={pct}
       tone={tone}
-      description={`${word} vs previous ${days} days · ${abs}`}
+      description={`${word} ${compare} · ${abs}`}
     />
   )
 }
@@ -260,7 +254,7 @@ function TopServiceKpi({
     <MetricCard
       label="Top service"
       value={top.service}
-      description={`${formatCurrencyDecimal(top.amount, currency)} · ${periodLabel(report.period.days)}`}
+      description={`${formatCurrencyDecimal(top.amount, currency)} · ${report.period.days} day window`}
     />
   )
 }

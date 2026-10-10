@@ -358,6 +358,65 @@ export interface OptimizationSummaryResponse {
 export const ALLOWED_LOOKBACK_DAYS = [7, 30, 60, 90] as const
 export type LookbackDays = (typeof ALLOWED_LOOKBACK_DAYS)[number]
 
+/**
+ * Phase 7A — Billing period.
+ *
+ * The primary UI selector is a calendar month (`YYYY-MM`).  The
+ * legacy rolling-lookback contract is preserved as a deprecated
+ * back-compat path so Phase 6 regression tests still pass.
+ */
+export type BillingPeriod =
+  | { kind: 'month'; month: string }
+  | { kind: 'days'; days: LookbackDays }
+
+/** Number of recent calendar months exposed in the UI selector. */
+export const CALENDAR_MONTH_SELECTOR_COUNT = 12
+
+/**
+ * Build the list of selectable months, ending with the current UTC
+ * month.  Test-only override accepted via `today`.
+ */
+export function buildMonthList(today?: Date, count: number = CALENDAR_MONTH_SELECTOR_COUNT): string[] {
+  const ref = today ?? new Date()
+  const out: string[] = []
+  let y = ref.getUTCFullYear()
+  let m = ref.getUTCMonth() + 1
+  for (let i = 0; i < count; i++) {
+    out.push(`${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}`)
+    m -= 1
+    if (m === 0) {
+      m = 12
+      y -= 1
+    }
+  }
+  return out.reverse()
+}
+
+/**
+ * Return the friendly label for a YYYY-MM string, distinguishing
+ * Month-to-Date (current month) from a full completed month.
+ */
+export function monthLabel(month: string, today?: Date): string {
+  const ref = today ?? new Date()
+  const [yStr, mStr] = month.split('-')
+  const y = Number(yStr)
+  const m = Number(mStr)
+  if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return month
+  const date = new Date(Date.UTC(y, m - 1, 1))
+  const monthName = date.toLocaleString('en-US', { month: 'long', timeZone: 'UTC' })
+  const isCurrent =
+    y === ref.getUTCFullYear() && m === ref.getUTCMonth() + 1
+  return `${monthName} ${y}${isCurrent ? ' · Month-to-Date' : ' · Full month'}`
+}
+
+/** Default billing period for the dashboard — current month, MTD. */
+export function defaultBillingPeriod(today?: Date): BillingPeriod {
+  const ref = today ?? new Date()
+  const y = ref.getUTCFullYear()
+  const m = String(ref.getUTCMonth() + 1).padStart(2, '0')
+  return { kind: 'month', month: `${y}-${m}` }
+}
+
 /** Result envelope shared by every data hook in lib/finops/*. */
 export interface FinopsQuery<T> {
   data: T | null

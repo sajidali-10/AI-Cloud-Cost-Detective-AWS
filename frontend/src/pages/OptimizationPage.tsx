@@ -1,16 +1,10 @@
-// Phase 6B — Optimization page wired to real Phase 3 data.
+// Phase 7A — Optimization page wired to BillingPeriod.
 //
-// Sections:
-//   1. PageHeader with period + refresh.
-//   2. Five KPI tiles (total / high confidence / AWS-native /
-//      deterministic / known savings).
-//   3. Capability panel — Compute Optimizer / Cost Optimization Hub
-//      / Deterministic Engine with explicit enrollment state.
-//   4. Recommendation table — type-specific metadata columns,
-//      null-savings → "Not available", savings source + confidence
-//      badges, finding → title column.
-//   5. Detail drawer — current vs recommended configuration,
-//      evidence, reason codes.  NO AI explanation (Phase 6C).
+// Phase 7A invariants:
+//   * Recommendation fetches honor the calendar-month selector.
+//   * Capability state is rendered with operator-facing guidance.
+//   * Deterministic engine recommendations remain visible even when
+//     AWS-native sources time out or fail.
 
 import { useMemo, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
@@ -37,24 +31,30 @@ import {
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
 import type {
+  BillingPeriod,
   CapabilitiesResponse,
   OptimizationSummaryResponse,
   Recommendation,
   RecommendationsResponse,
   SavingsSource,
 } from '../types/finops'
+import { monthLabel } from '../types/finops'
 import {
   formatCurrencyCompact,
   formatCurrencyDecimal,
   formatLocalTime,
   parseDecimal,
-  periodLabel,
   savingsSourceLabel,
 } from '../lib/format'
 
+function periodDisplay(period: BillingPeriod): string {
+  return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+}
+
 export function OptimizationPage() {
-  const { days, region } = useFinopsPeriod()
+  const { period, region } = useFinopsPeriod()
   const effectiveRegion = region === 'all' ? null : region
+  const periodText = periodDisplay(period)
 
   const caps = useFinopsQuery<CapabilitiesResponse>(
     buildCapabilitiesCacheKey(effectiveRegion),
@@ -62,12 +62,12 @@ export function OptimizationPage() {
     { ttlMs: 60_000 },
   )
   const recs = useFinopsQuery<RecommendationsResponse>(
-    buildRecommendationsCacheKey(days, effectiveRegion),
-    () => fetchRecommendations(days, effectiveRegion),
+    buildRecommendationsCacheKey(period, effectiveRegion),
+    () => fetchRecommendations(period, effectiveRegion),
   )
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(days, effectiveRegion),
-    () => fetchOptimizationSummary(days, effectiveRegion),
+    buildSummaryCacheKey(period, effectiveRegion),
+    () => fetchOptimizationSummary(period, effectiveRegion),
     { ttlMs: 60_000 },
   )
 
@@ -92,7 +92,7 @@ export function OptimizationPage() {
         context={
           <>
             <span className="text-fg-muted">Period</span>
-            <span className="text-fg-secondary">{periodLabel(days)}</span>
+            <span className="text-fg-secondary">{periodText}</span>
             <span className="text-fg-muted">Status</span>
             <StatusBadge
               tone={
@@ -127,7 +127,6 @@ export function OptimizationPage() {
         />
       )}
 
-      {/* KPI tiles */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
         <TotalKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
         <HighConfidenceKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
@@ -144,14 +143,20 @@ export function OptimizationPage() {
           <LoadingSkeletonRows rows={3} />
         ) : caps.entry.data ? (
           <div className="space-y-1" data-testid="capability-rows">
-            <CapabilityStatusRow label="Compute Optimizer" capability={caps.entry.data.compute_optimizer} />
+            <CapabilityStatusRow
+              label="Compute Optimizer"
+              capability={caps.entry.data.compute_optimizer}
+              kind="compute_optimizer"
+            />
             <CapabilityStatusRow
               label="Cost Optimization Hub"
               capability={caps.entry.data.cost_optimization_hub}
+              kind="cost_optimization_hub"
             />
             <CapabilityStatusRow
               label="Deterministic Engine"
               capability={caps.entry.data.deterministic_engine}
+              kind="deterministic_engine"
             />
             {caps.entry.data.warnings.length > 0 && (
               <PartialWarning warnings={caps.entry.data.warnings} title="Capability warnings" />
@@ -164,7 +169,7 @@ export function OptimizationPage() {
 
       <SectionCard
         title="Recommendations"
-        description={`${(recs.entry.data?.count ?? 0).toLocaleString('en-US')} recommendations · ${periodLabel(days)}`}
+        description={`${(recs.entry.data?.count ?? 0).toLocaleString('en-US')} recommendations · ${periodText}`}
       >
         {recs.entry.status === 'loading' && !recs.entry.data ? (
           <LoadingSkeletonRows rows={6} />
@@ -229,7 +234,7 @@ function TotalKpi({ summary, loading }: { summary: OptimizationSummaryResponse |
     <MetricCard
       label="Recommendations"
       value={summary.total_recommendations.toLocaleString('en-US')}
-      description={`${summary.status.toLowerCase()} · ${periodLabel(summary.days)}`}
+      description={`${summary.status.toLowerCase()}`}
     />
   )
 }
@@ -300,10 +305,6 @@ function SavingsKpi({ summary, loading }: { summary: OptimizationSummaryResponse
     />
   )
 }
-
-// ---------------------------------------------------------------------------
-// Recommendation table
-// ---------------------------------------------------------------------------
 
 const columns: DataTableColumn<Recommendation>[] = [
   {
@@ -384,10 +385,6 @@ function savingsCell(r: Recommendation): React.ReactNode {
     </span>
   )
 }
-
-// ---------------------------------------------------------------------------
-// Detail panel
-// ---------------------------------------------------------------------------
 
 function DetailPanel({ recommendation: r }: { recommendation: Recommendation }) {
   return (

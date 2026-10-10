@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -223,20 +224,35 @@ class AIService:
     # ---- status ----------------------------------------------------------
 
     def status(self) -> AIStatusResponse:
-        """Return the public AI status snapshot."""
+        """Return the public AI status snapshot.
+
+        Phase 7A — The response is the public contract surfaced to
+        the frontend.  It NEVER exposes:
+
+        * API keys (``LITELLM_API_KEY``, ``OPENAI_API_KEY`` etc.)
+        * Authorization headers
+        * Raw provider secrets
+        * Full ``LITELLM_BASE_URL`` with credentials embedded
+
+        Only safe operational information is reported:
+        ``provider_configured``, ``model_alias``, ``provider_model``,
+        ``required_env_var``.
+        """
         if self._settings.ai_enabled:
             reachable = self._client_for_status().health_check()
             overall = AIStatus.OK if reachable else AIStatus.DEGRADED
         else:
             reachable = False
             overall = AIStatus.DISABLED
+        provider_configured = self._is_provider_credential_available()
+        provider_model = (os.getenv("LITELLM_MODEL") or "").strip() or None
         return AIStatusResponse(
             status=overall,
             ai_enabled=self._settings.ai_enabled,
             litellm_reachable=reachable,
+            provider_configured=provider_configured,
             model_alias=self._settings.litellm_model,
-            # Defense in depth: strip query / userinfo even though
-            # ``Settings.litellm_base_url`` only carries scheme://host:port.
+            provider_model=provider_model,
             litellm_base_url=self._safe_base_url(self._settings.litellm_base_url),
             timeout_seconds=self._settings.ai_request_timeout_seconds,
             max_output_tokens=self._settings.ai_max_output_tokens,
@@ -246,6 +262,7 @@ class AIService:
                 "regions": self._settings.ai_max_context_regions,
                 "question_length": self._settings.ai_max_question_length,
             },
+            required_env_var=self._required_env_var_name(),
             message=None
             if overall == AIStatus.OK
             else (
@@ -254,6 +271,38 @@ class AIService:
                 else "LiteLLM gateway is unreachable."
             ),
         )
+
+    @staticmethod
+    def _required_env_var_name() -> Optional[str]:
+        """Return the env var the operator must set to enable a provider.
+
+        Phase 7A: the operator runs the LiteLLM gateway with
+        ``LITELLM_API_KEY`` set to the provider key; ``litellm_proxy``
+        then forwards requests to the real provider using that
+        credential.  We never read or echo the value, only its name.
+        """
+        if os.getenv("LITELLM_API_KEY", "").strip():
+            return None
+        return "LITELLM_API_KEY"
+
+    @staticmethod
+    def _is_provider_credential_available() -> bool:
+        """True when at least one provider credential env var is set.
+
+        Phase 7A: we only check the names of well-known provider
+        variables.  The values are NEVER read into Python or echoed
+        anywhere — only the presence of a non-empty string matters.
+        """
+        for var in (
+            "LITELLM_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+        ):
+            if os.getenv(var, "").strip():
+                return True
+        return False
 
     @staticmethod
     def _safe_base_url(url: str) -> str:
