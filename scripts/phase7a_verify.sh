@@ -135,9 +135,10 @@ run_check "auth.tsx invalidates FinOps cache on session-expired" \
   bash -c "grep -c 'invalidateFinopsCache' frontend/src/lib/auth.tsx | grep -qE '^([3-9]|[1-9][0-9]+)$'"
 
 # No JWT in URLs / query strings / logs.
-# Exclude comment lines.
+# Exclude comment lines (lines starting with `//` or `*` after the
+# `path:line:` prefix).
 run_check "no token in URL query string (frontend)" \
-  bash -c "! grep -rE '\\?(token|jwt|access_token)=' frontend/src --include='*.ts' --include='*.tsx' --exclude-dir=tests | grep -vE '://|^[^:]+:[0-9]+:\\s*(//|\\*)'"
+  bash -c "! grep -rnE '\\?(token|jwt|access_token)=' frontend/src --include='*.ts' --include='*.tsx' --exclude-dir=tests | grep -vE ':[[:space:]]*(//|\\*)'"
 # JWT literal: each segment must be 8+ base64url chars and the
 # line must NOT be a property access like `.foo.bar`.  We restrict
 # to lines that contain a JWT-shaped value NOT immediately followed

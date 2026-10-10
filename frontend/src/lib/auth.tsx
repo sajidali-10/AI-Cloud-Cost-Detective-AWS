@@ -1,36 +1,47 @@
-// Phase 6A — Auth provider.
+// Phase 7A closure — Authentication state machine.
+//
+// Three-state bootstrap:
+//   checking        — bootstrap is in flight (calling /api/auth/info
+//                     and optionally /api/auth/me).  No FinOps
+//                     requests fire while we are in this state.
+//   authenticated   — valid token (either freshly issued by /login or
+//                     restored from sessionStorage + /auth/me).
+//   unauthenticated — no token (initial state with nothing stored, or
+//                     the stored token failed validation).
+//   disabled        — backend reports auth_enabled=false; synthetic
+//                     anonymous user.
 //
 // Lifecycle:
 //   1. On mount, call GET /api/auth/info (anonymous) to learn
-//      `auth_enabled` from the backend.  Until this resolves the
-//      app is in a "booting" state.
-//   2. If `auth_enabled=false` → the app is open.  A synthetic
-//      "anonymous" user is exposed so role-aware UI keeps working
-//      but is documented as a development-only mode (matches the
-//      backend Phase 5A contract).
-//   3. If `auth_enabled=true` and no stored session → render the
-//      login route.
-//   4. If `auth_enabled=true` and a stored session exists → verify
-//      it with GET /api/auth/me.  On 401 drop the session and show
-//      login.  On success, expose the user via context.
+//      `auth_enabled` from the backend.
+//   2. If `auth_enabled=false` → the app is open (synthetic anon).
+//   3. If `auth_enabled=true`:
+//      a. If a stored session exists in sessionStorage, validate
+//         it with /api/auth/me.  On success → authenticated.  On
+//         401 / expired → unauthenticated.
+//      b. If no stored session → unauthenticated.
+//   4. The sessionStorage['accd.session'] key is the source of truth
+//      for the bearer token.  Centralized `getToken` reads it
+//      synchronously on every request — no React-state gate — so a
+//      successful login() makes the next apiFetch() carry the new
+//      token even when the configured getToken callback has not yet
+//      been refreshed.
 //
-// Token storage: localStorage under 'accd.session'.  The bearer
-// token is the only credential material; it is short-lived (60 min
-// per Phase 5A) and the backend re-validates against the DB row on
-// every request, so even if the token leaks from localStorage the
-// blast radius is bounded to that single user's permissions until
-// expiry.  A hardened deployment should prefer httpOnly Secure
-// SameSite cookies set by the backend; that is a backend change
-// deferred beyond Phase 6A.
+// Token storage: sessionStorage under 'accd.session'.  Phase 7A
+// moves JWTs out of localStorage so a tab refresh in a different
+// browser session does not silently inherit a stale token.  We also
+// run a one-time cleanup of any pre-existing localStorage entry.
 //
 // Security invariants enforced here:
 //   * The bearer token is NEVER logged or echoed in errors.
 //   * The password is NEVER stored or echoed.
 //   * 401 responses automatically drop the session and surface a
-//     "session expired" notification (not a silent re-login).
+//     "session expired" notification.
 //   * 401 does NOT cause a redirect loop — at most once per session
-//     lifetime, controlled by `sessionExpiredOnce` ref.
-//   * Logout clears local storage and forces a re-bootstrap.
+//     lifetime, controlled by `sessionExpiredOnceRef`.
+//   * Logout clears sessionStorage + FinOps cache + drives the WS
+//     hook to close.
+//   * No JWT in URL query, path, or fragment.
 
 import {
   createContext,
@@ -84,9 +95,15 @@ interface StoredSession {
   user: AuthUser
 }
 
-type AuthStatus =
-  | { phase: 'booting' }
-  | { phase: 'disabled' } // auth_enabled=false → synthetic anon user
+export type AuthPhase =
+  | 'checking'
+  | 'authenticated'
+  | 'unauthenticated'
+  | 'disabled'
+
+export type AuthStatus =
+  | { phase: 'checking' }
+  | { phase: 'disabled' }
   | { phase: 'unauthenticated'; notice: SessionNotice | null }
   | { phase: 'authenticated'; user: AuthUser }
 
@@ -97,10 +114,14 @@ export type SessionNotice =
 interface AuthContextValue {
   status: AuthStatus
   user: AuthUser | null
-  /** Resolved when the user is signed in (or auth is disabled). */
+  /** Resolved when bootstrap is complete (any terminal phase). */
   ready: boolean
+  /** Resolved when the user is signed in (or auth is disabled). */
+  authReady: boolean
   /** Effective role for route guards; null when not signed in. */
   role: Role | null
+  /** Synchronous access to the current bearer token. */
+  accessToken: string | null
   login: (email: string, password: string) => Promise<void>
   logout: () => Promise<void>
   /** Clears any active session notice after the UI has displayed it. */
@@ -113,16 +134,42 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
+// sessionStorage key — Phase 7A closure.  Replaces the prior
+// localStorage key for the bearer token.  We deliberately keep the
+// same KEY NAME so a single cleanup pass at startup can remove any
+// stale localStorage entry without changing the wire contract.
 const SESSION_STORAGE_KEY = 'accd.session'
 const SESSION_NOTICE_KEY = 'accd.session.notice'
+// Storage keys that must never end up holding auth material.
+const FORBIDDEN_LOCALSTORAGE_KEYS = [SESSION_STORAGE_KEY]
 
 // ---------------------------------------------------------------------------
-// Session storage helpers
+// Storage helpers
 // ---------------------------------------------------------------------------
 
-function readStoredSession(): StoredSession | null {
+function safeSessionStorage(): Storage | null {
   try {
-    const raw = window.localStorage.getItem(SESSION_STORAGE_KEY)
+    if (typeof window === 'undefined') return null
+    return window.sessionStorage
+  } catch {
+    return null
+  }
+}
+
+function safeLocalStorage(): Storage | null {
+  try {
+    if (typeof window === 'undefined') return null
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+export function readStoredSession(): StoredSession | null {
+  const storage = safeSessionStorage()
+  if (!storage) return null
+  try {
+    const raw = storage.getItem(SESSION_STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<StoredSession>
     if (
@@ -139,21 +186,25 @@ function readStoredSession(): StoredSession | null {
   }
 }
 
-function writeStoredSession(session: StoredSession | null): void {
+export function writeStoredSession(session: StoredSession | null): void {
+  const storage = safeSessionStorage()
+  if (!storage) return
   try {
     if (session === null) {
-      window.localStorage.removeItem(SESSION_STORAGE_KEY)
+      storage.removeItem(SESSION_STORAGE_KEY)
     } else {
-      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session))
+      storage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session))
     }
   } catch {
-    /* localStorage may be blocked; non-fatal */
+    /* storage may be blocked; non-fatal */
   }
 }
 
-function readStoredNotice(): SessionNotice | null {
+export function readStoredNotice(): SessionNotice | null {
+  const storage = safeSessionStorage()
+  if (!storage) return null
   try {
-    const raw = window.sessionStorage.getItem(SESSION_NOTICE_KEY)
+    const raw = storage.getItem(SESSION_NOTICE_KEY)
     if (!raw) return null
     return JSON.parse(raw) as SessionNotice
   } catch {
@@ -161,15 +212,38 @@ function readStoredNotice(): SessionNotice | null {
   }
 }
 
-function writeStoredNotice(notice: SessionNotice | null): void {
+export function writeStoredNotice(notice: SessionNotice | null): void {
+  const storage = safeSessionStorage()
+  if (!storage) return
   try {
     if (notice === null) {
-      window.sessionStorage.removeItem(SESSION_NOTICE_KEY)
+      storage.removeItem(SESSION_NOTICE_KEY)
     } else {
-      window.sessionStorage.setItem(SESSION_NOTICE_KEY, JSON.stringify(notice))
+      storage.setItem(SESSION_NOTICE_KEY, JSON.stringify(notice))
     }
   } catch {
     /* non-fatal */
+  }
+}
+
+/**
+ * One-time cleanup of any pre-Phase 7A auth material that may have
+ * landed in localStorage before the JWT-storage migration.  Removing
+ * the legacy key prevents a previous deployment from leaving a stale
+ * JWT in the user's browser after we deploy the sessionStorage-only
+ * path.
+ *
+ * Idempotent and safe to run on every bootstrap.
+ */
+export function cleanupLegacyAuthStorage(): void {
+  const ls = safeLocalStorage()
+  if (!ls) return
+  for (const key of FORBIDDEN_LOCALSTORAGE_KEYS) {
+    try {
+      ls.removeItem(key)
+    } catch {
+      /* non-fatal */
+    }
   }
 }
 
@@ -178,20 +252,26 @@ function writeStoredNotice(notice: SessionNotice | null): void {
 // ---------------------------------------------------------------------------
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [status, setStatus] = useState<AuthStatus>({ phase: 'booting' })
+  const [status, setStatus] = useState<AuthStatus>({ phase: 'checking' })
   const sessionExpiredOnceRef = useRef(false)
   const navigate = useNavigate()
 
   // Wire the api client to read the current token + react to 401s.
-  const getToken = useCallback(() => {
-    if (status.phase === 'authenticated') {
-      const stored = readStoredSession()
-      if (!stored) return null
-      if (stored.expires_at <= Date.now()) return null
-      return stored.access_token
-    }
-    return null
-  }, [status.phase])
+  //
+  // CRITICAL: `getToken` reads storage directly (no React-state gate).
+  // Storage is the source of truth for the bearer token.  When login()
+  // calls `writeStoredSession()` followed by `setStatus({...})`, the
+  // very next apiFetch() must return the NEW token — even before the
+  // `useEffect` that re-runs `configureApi` with the new `getToken`
+  // closure has fired.  Gating on `status.phase === 'authenticated'`
+  // re-introduces the race that produced the Phase 7A symptoms
+  // (FinOps queries firing before the new token was wired).
+  const getToken = useCallback((): string | null => {
+    const stored = readStoredSession()
+    if (!stored) return null
+    if (stored.expires_at <= Date.now()) return null
+    return stored.access_token
+  }, [])
 
   const handleSessionExpired = useCallback(() => {
     if (sessionExpiredOnceRef.current) return
@@ -201,8 +281,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       kind: 'expired',
       message: 'Your session has expired. Please sign in again.',
     })
-    // Phase 7A: drop any cached FinOps data fetched under the now-
-    // invalidated token so user B never sees user A's numbers.
     invalidateFinopsCache()
     setStatus({ phase: 'unauthenticated', notice: readStoredNotice() })
   }, [])
@@ -224,6 +302,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // ----- bootstrap -----
   useEffect(() => {
     let cancelled = false
+    // Defensive: strip any stale JWT that may still live in
+    // localStorage from a pre-Phase 7A deployment so a user does
+    // not silently inherit a stored credential from a previous
+    // origin.
+    cleanupLegacyAuthStorage()
     ;(async () => {
       try {
         const info = await apiFetch<AuthInfo>('/api/auth/info', {
@@ -250,7 +333,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           })
           if (cancelled) return
           setStatus({ phase: 'authenticated', user })
-          // If we had a notice, clear it once the user is back.
           if (notice) writeStoredNotice(null)
         } catch (err) {
           if (cancelled) return
@@ -258,17 +340,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             writeStoredSession(null)
             setStatus({ phase: 'unauthenticated', notice: readStoredNotice() })
           } else {
-            // Network / backend down.  Fall back to unauthenticated
-            // but keep the session; the login page will surface the
-            // error.  Do NOT mark `sessionExpiredOnce`.
+            // Network / backend down: drop into unauthenticated but
+            // keep the stored session so the user can retry without
+            // re-entering credentials.
             setStatus({ phase: 'unauthenticated', notice: readStoredNotice() })
           }
         }
       } catch {
         if (cancelled) return
-        // Backend unreachable.  Treat as auth_enabled=true and
-        // unauthenticated; the login page will surface the error
-        // when the user attempts to submit credentials.
         setStatus({ phase: 'unauthenticated', notice: null })
       }
     })()
@@ -292,11 +371,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         expires_at: Date.now() + payload.expires_in * 1000,
         user: payload.user,
       }
+      // Persist FIRST so the very next apiFetch (from the
+      // freshly-mounted Dashboard) returns the new token.  Storage
+      // is the source of truth — see the long comment on
+      // `getToken` above.
       writeStoredSession(stored)
       sessionExpiredOnceRef.current = false
       writeStoredNotice(null)
-      // Phase 7A: a different user just logged in; their FinOps
-      // caches must not see another account's pre-login probes.
+      // Invalidate any pre-login probes (a different user may have
+      // logged in earlier in this tab).
       invalidateFinopsCache()
       setStatus({ phase: 'authenticated', user: payload.user })
     },
@@ -310,7 +393,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       message: 'You have been signed out.',
     })
     sessionExpiredOnceRef.current = false
-    // Phase 7A: clear all FinOps caches so a re-login (or another
+    // Clear user-scoped FinOps cache so a re-login (or another
     // user on the same browser) never sees the previous account's
     // data flash by.
     invalidateFinopsCache()
@@ -329,24 +412,40 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const user = status.phase === 'authenticated' ? status.user : null
   const role: Role | null = user ? user.role : status.phase === 'disabled' ? 'ADMIN' : null
-  const ready = status.phase !== 'booting'
+  const ready = status.phase !== 'checking'
+  const authReady = status.phase === 'authenticated' || status.phase === 'disabled'
   const authEnabled = status.phase !== 'disabled'
   const notice: SessionNotice | null =
     status.phase === 'unauthenticated' ? status.notice : null
+
+  // accessToken is the synchronous mirror of the in-memory storage
+  // entry.  Useful for components (e.g. AIAnalystPage's WebSocket
+  // hook) that need the token without touching storage themselves.
+  const accessToken = useMemo(() => {
+    if (status.phase === 'authenticated' || status.phase === 'checking') {
+      const stored = readStoredSession()
+      if (!stored) return null
+      if (stored.expires_at <= Date.now()) return null
+      return stored.access_token
+    }
+    return null
+  }, [status.phase])
 
   const value = useMemo<AuthContextValue>(
     () => ({
       status,
       user,
       ready,
+      authReady,
       role,
+      accessToken,
       login,
       logout,
       clearNotice,
       authEnabled,
       notice,
     }),
-    [status, user, ready, role, login, logout, clearNotice, authEnabled, notice],
+    [status, user, ready, authReady, role, accessToken, login, logout, clearNotice, authEnabled, notice],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
@@ -362,8 +461,10 @@ export function useAuth(): AuthContextValue {
 export const __authTestInternals = {
   SESSION_STORAGE_KEY,
   SESSION_NOTICE_KEY,
+  FORBIDDEN_LOCALSTORAGE_KEYS,
   readStoredSession,
   writeStoredSession,
   readStoredNotice,
   writeStoredNotice,
+  cleanupLegacyAuthStorage,
 }

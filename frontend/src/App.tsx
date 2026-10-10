@@ -45,7 +45,8 @@ function AppRoot() {
 
   // Bootstrap gate — while we don't yet know whether auth is on,
   // render a small neutral placeholder inside the theme so the
-  // first paint uses the correct palette.
+  // first paint uses the correct palette.  No FinOps hooks mount
+  // here, so no request can fire before auth restoration completes.
   if (!ready) {
     return <BootScreen />
   }

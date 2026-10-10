@@ -63,7 +63,7 @@ function getConversationIdFromLocation(locationSearch: string): number | null {
 }
 
 export function AIAnalystPage() {
-  const { authEnabled } = useAuth()
+  const { authEnabled, accessToken } = useAuth()
   const { days } = useFinopsPeriod()
   const location = useLocation()
   const navigate = useNavigate()
@@ -153,21 +153,12 @@ export function AIAnalystPage() {
   }, [listError, detailError, messagesError, authEnabled, isAuthDisabled])
 
   // ---- WebSocket ----
+  // Phase 7A closure: the bearer token comes from the centralized
+  // auth layer (sessionStorage-backed) via useAuth().accessToken.
+  // No direct browser-storage access from feature pages.
   const socket = useConversationSocket({
     conversationId: activeId,
-    getToken: () => {
-      try {
-        const raw = window.localStorage.getItem('accd.session')
-        if (!raw) return null
-        const parsed = JSON.parse(raw) as { access_token?: string; expires_at?: number }
-        if (typeof parsed.access_token !== 'string') return null
-        if (typeof parsed.expires_at !== 'number') return null
-        if (parsed.expires_at <= Date.now()) return null
-        return parsed.access_token
-      } catch {
-        return null
-      }
-    },
+    getToken: () => accessToken,
     authEnabled,
   })
 

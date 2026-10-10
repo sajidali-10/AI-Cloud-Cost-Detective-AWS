@@ -1,4 +1,4 @@
-// Phase 6A — Auth provider tests.
+// Phase 7A closure — Auth provider tests.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -44,6 +44,8 @@ function Harness() {
       <span data-testid="authEnabled">{String(api.authEnabled)}</span>
       <span data-testid="user-email">{api.user?.email ?? 'null'}</span>
       <span data-testid="ready">{String(api.ready)}</span>
+      <span data-testid="authReady">{String(api.authReady)}</span>
+      <span data-testid="accessToken">{api.accessToken ?? 'null'}</span>
       <button data-testid="login" onClick={() => api.login('a@b.com', 'pw')}>
         login
       </button>
@@ -55,11 +57,6 @@ function Harness() {
   )
 }
 
-// Wraps the harness in a Router + AuthProvider in the correct order
-// (Router outside AuthProvider — AuthProvider uses useNavigate).
-// The Tree always renders the Harness at every known path so that
-// the test can read the auth status regardless of which route the
-// underlying browser history happens to point at.
 function Tree({ extra }: { extra?: React.ReactNode }) {
   const HarnessOrExtra = () => <>{extra ?? <Harness />}</>
   return (
@@ -91,7 +88,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('AuthProvider — bootstrap', () => {
-  it('reports booting until /api/auth/info resolves', async () => {
+  it('reports checking until /api/auth/info resolves', async () => {
     let resolveInfo!: (r: Response) => void
     const transport = vi.fn().mockImplementation(
       () => new Promise<Response>((res) => (resolveInfo = res)),
@@ -103,7 +100,8 @@ describe('AuthProvider — bootstrap', () => {
     })
 
     render(<Tree />)
-    expect(screen.getByTestId('phase').textContent).toBe('booting')
+    expect(screen.getByTestId('phase').textContent).toBe('checking')
+    expect(screen.getByTestId('ready').textContent).toBe('false')
 
     await act(async () => {
       resolveInfo(mockResponse(200, authInfoDisabled))
@@ -137,7 +135,7 @@ describe('AuthProvider — bootstrap', () => {
       onSessionExpired: () => {},
       transport: transport as unknown as typeof fetch,
     })
-    window.localStorage.setItem(
+    window.sessionStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         access_token: 'good',
@@ -149,6 +147,7 @@ describe('AuthProvider — bootstrap', () => {
     await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('authenticated'))
     expect(screen.getByTestId('role').textContent).toBe('ADMIN')
     expect(screen.getByTestId('user-email').textContent).toBe('admin@x.com')
+    expect(screen.getByTestId('accessToken').textContent).toBe('good')
   })
 
   it('drops a stored session that fails /api/auth/me with 401', async () => {
@@ -162,7 +161,7 @@ describe('AuthProvider — bootstrap', () => {
       onSessionExpired: () => {},
       transport: transport as unknown as typeof fetch,
     })
-    window.localStorage.setItem(
+    window.sessionStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         access_token: 'stale',
@@ -172,6 +171,7 @@ describe('AuthProvider — bootstrap', () => {
     )
     render(<Tree />)
     await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('unauthenticated'))
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 })
@@ -181,7 +181,7 @@ describe('AuthProvider — bootstrap', () => {
 // ---------------------------------------------------------------------------
 
 describe('AuthProvider — login', () => {
-  it('persists the session and updates phase on success', async () => {
+  it('persists the session in sessionStorage and updates phase on success', async () => {
     const analystUser: AuthUser = { ...sampleUser, id: 2, email: 'analyst@x.com', display_name: 'Analyst', role: 'ANALYST' }
     const transport = vi.fn().mockImplementation(async (path: string) => {
       if (path === '/api/auth/info') return mockResponse(200, authInfoEnabled)
@@ -207,9 +207,10 @@ describe('AuthProvider — login', () => {
     })
     await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('authenticated'))
     expect(screen.getByTestId('role').textContent).toBe('ANALYST')
-    const stored = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? 'null')
+    const stored = JSON.parse(window.sessionStorage.getItem(STORAGE_KEY) ?? 'null')
     expect(stored.access_token).toBe('fresh')
     expect(stored.user.role).toBe('ANALYST')
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
   it('rejects with ApiError(Unauthorized) on 401', async () => {
@@ -294,7 +295,7 @@ describe('AuthProvider — login', () => {
 })
 
 describe('AuthProvider — logout', () => {
-  it('clears the session and redirects to /login', async () => {
+  it('clears sessionStorage and redirects to /login', async () => {
     const transport = vi.fn().mockImplementation(async (path: string) => {
       if (path === '/api/auth/info') return mockResponse(200, authInfoEnabled)
       if (path === '/api/auth/me') return mockResponse(200, sampleUser)
@@ -305,7 +306,7 @@ describe('AuthProvider — logout', () => {
       onSessionExpired: () => {},
       transport: transport as unknown as typeof fetch,
     })
-    window.localStorage.setItem(
+    window.sessionStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         access_token: 'good',
@@ -319,8 +320,94 @@ describe('AuthProvider — logout', () => {
       screen.getByTestId('logout').click()
     })
     await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('unauthenticated'))
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+    expect(window.sessionStorage.getItem(STORAGE_KEY)).toBeNull()
     expect(window.location.pathname).toBe('/login')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 7A closure — storage migration + cleanup
+// ---------------------------------------------------------------------------
+
+describe('AuthProvider — Phase 7A closure storage', () => {
+  it('does NOT store the JWT in localStorage', async () => {
+    const transport = vi.fn().mockImplementation(async (path: string) => {
+      if (path === '/api/auth/info') return mockResponse(200, authInfoEnabled)
+      if (path === '/api/auth/login') {
+        return mockResponse(200, {
+          access_token: 'jwt-fresh',
+          token_type: 'bearer',
+          expires_in: 3600,
+          user: sampleUser,
+        })
+      }
+      return mockResponse(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+    render(<Tree />)
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('unauthenticated'))
+    await act(async () => {
+      screen.getByTestId('login').click()
+    })
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('authenticated'))
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
+    const ss = window.sessionStorage.getItem(STORAGE_KEY)
+    expect(ss).not.toBeNull()
+    expect(JSON.parse(ss ?? '{}').access_token).toBe('jwt-fresh')
+  })
+
+  it('cleans up the legacy localStorage JWT on bootstrap', async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        access_token: 'LEGACY-LOCALSTORAGE-JWT',
+        expires_at: Date.now() + 60_000,
+        user: sampleUser,
+      }),
+    )
+    const transport = vi.fn().mockImplementation(async (path: string) => {
+      if (path === '/api/auth/info') return mockResponse(200, authInfoEnabled)
+      if (path === '/api/auth/me') return mockResponse(200, sampleUser)
+      return mockResponse(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+    render(<Tree />)
+    // legacy localStorage entry must be removed on bootstrap.
+    await waitFor(() => expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull())
+  })
+
+  it('exposes the access token via useAuth().accessToken without touching storage', async () => {
+    const transport = vi.fn().mockImplementation(async (path: string) => {
+      if (path === '/api/auth/info') return mockResponse(200, authInfoEnabled)
+      if (path === '/api/auth/login') {
+        return mockResponse(200, {
+          access_token: 'jwt-public',
+          token_type: 'bearer',
+          expires_in: 3600,
+          user: sampleUser,
+        })
+      }
+      return mockResponse(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+    render(<Tree />)
+    await waitFor(() => expect(screen.getByTestId('phase').textContent).toBe('unauthenticated'))
+    await act(async () => {
+      screen.getByTestId('login').click()
+    })
+    await waitFor(() => expect(screen.getByTestId('accessToken').textContent).toBe('jwt-public'))
   })
 })
 

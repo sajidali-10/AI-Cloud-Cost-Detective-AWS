@@ -177,7 +177,7 @@ export function LoginPage() {
         </form>
 
         <p className="mt-6 text-center text-[11px] text-fg-muted">
-          {!authEnabled && status.phase === 'booting' ? (
+          {status.phase === 'checking' ? (
             <>Checking sign-in configuration…</>
           ) : (
             <>Protected by HipLink · AI Cloud Cost Detective</>
