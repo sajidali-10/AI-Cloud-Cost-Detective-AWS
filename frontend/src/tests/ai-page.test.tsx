@@ -99,7 +99,11 @@ const sampleUser = {
 }
 
 function writeStoredSession(token = 'header.payload.sig') {
-  window.localStorage.setItem(
+  // Phase 7A: bearer token lives in sessionStorage, not
+  // localStorage.  AuthProvider's bootstrap reads
+  // sessionStorage['accd.session'] and validates the stored token
+  // against /api/auth/me.
+  window.sessionStorage.setItem(
     __authTestInternals.SESSION_STORAGE_KEY,
     JSON.stringify({
       access_token: token,
@@ -239,7 +243,8 @@ function renderAnalyst(handlers: Parameters<typeof buildHarness>[0] = {}) {
   configureApi({
     getToken: () => {
       try {
-        const raw = window.localStorage.getItem(__authTestInternals.SESSION_STORAGE_KEY)
+        // Phase 7A: token lives in sessionStorage.
+        const raw = window.sessionStorage.getItem(__authTestInternals.SESSION_STORAGE_KEY)
         if (!raw) return null
         const parsed = JSON.parse(raw) as { access_token: string; expires_at: number }
         if (parsed.expires_at <= Date.now()) return null

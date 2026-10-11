@@ -3,10 +3,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { ThemeProvider } from '../lib/theme'
+import { AuthProvider } from '../lib/auth'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
 import { DashboardPage } from '../pages/DashboardPage'
+import { MemoryRouter } from '../lib/router'
 
 function mockJson(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -17,9 +19,13 @@ function mockJson(status: number, body: unknown): Response {
 
 function wrapRoutes(node: React.ReactNode) {
   return render(
-    <ThemeProvider>
-      <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -126,6 +132,10 @@ function makeIdentity() {
 
 function installMockRoutes(opts: { costs?: Response; summary?: any } = {}) {
   const transport = vi.fn(async (path: string) => {
+    // Phase 7A: AuthProvider fires /api/auth/info on mount.  Return
+    // the disabled phase so the FinOps gate opens without requiring
+    // a real auth flow.
+    if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
     if (path.startsWith('/api/aws/identity')) return mockJson(200, makeIdentity())
     if (path.startsWith('/api/aws/costs')) return opts.costs ?? mockJson(200, makeCostsBody())
     if (path.startsWith('/api/aws/resources')) return mockJson(200, makeResourcesBody())

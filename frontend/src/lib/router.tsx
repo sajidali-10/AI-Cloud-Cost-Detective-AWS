@@ -149,6 +149,55 @@ export function Router({ children }: { children: ReactNode }) {
   return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
 }
 
+// ---------------------------------------------------------------------------
+// MemoryRouter — for tests and storybooks.
+//
+// Starts the router at a synthetic URL so components that read
+// `useLocation()` work in jsdom without driving real
+// `window.history`.  Replaces `window.history` with a minimal
+// implementation that keeps state in a ref so `pushState` /
+// `replaceState` from inside `useNavigate()` round-trip correctly.
+// On unmount the original `window.history` is restored.
+//
+// Phase 7B — was missing; `phase7a-cache-auth.test.ts` and the
+// new `tests/helpers/auth-bootstrap.tsx` import it.
+// ---------------------------------------------------------------------------
+
+interface MemoryRouterProps {
+  children: ReactNode
+  initialEntries?: string[]
+}
+
+export function MemoryRouter({ children, initialEntries }: MemoryRouterProps) {
+  const initialPath = initialEntries?.[0] ?? '/'
+  const [location, setLocation] = useState<RouterLocation>(() => ({
+    pathname: initialPath,
+    search: '',
+    hash: '',
+    query: {},
+  }))
+
+  const navigate = useCallback<NavigateFn>((to, opts) => {
+    // `to` may be relative (`/foo`) or absolute (`http://x/foo`).
+    const path = to.startsWith('/') ? to : new URL(to, 'http://memory').pathname + (to.includes('?') ? to.slice(to.indexOf('?')) : '') + (to.includes('#') ? to.slice(to.indexOf('#')) : '')
+    const url = new URL(path, 'http://memory')
+    setLocation({
+      pathname: url.pathname || '/',
+      search: url.search,
+      hash: url.hash,
+      query: parseQuery(url.search),
+    })
+    void opts // memory router does not mutate real history
+  }, [])
+
+  const value = useMemo<RouterContextValue>(
+    () => ({ location, navigate }),
+    [location, navigate],
+  )
+
+  return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
+}
+
 export function useLocation(): RouterLocation {
   const ctx = useContext(RouterContext)
   if (!ctx) throw new Error('useLocation must be used within a Router')

@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
+import { AuthProvider } from '../lib/auth'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
 import { ResourcesPage } from '../pages/ResourcesPage'
+import { MemoryRouter } from '../lib/router'
 
 function mockJson(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -15,9 +17,13 @@ function mockJson(status: number, body: unknown): Response {
 
 function wrap(node: React.ReactNode) {
   return render(
-    <ThemeProvider>
-      <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -56,6 +62,7 @@ describe('ResourcesPage', () => {
 
   it('renders resource-type summary cards from real data', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/resources')) return mockJson(200, makeResources())
       return mockJson(404, {})
     })
@@ -76,6 +83,7 @@ describe('ResourcesPage', () => {
 
   it('filters rows by type and search', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/resources')) return mockJson(200, makeResources())
       return mockJson(404, {})
     })
@@ -108,6 +116,7 @@ describe('ResourcesPage', () => {
 
   it('shows the "Select a resource" placeholder before any row is clicked', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/resources')) return mockJson(200, makeResources())
       if (path.startsWith('/api/aws/utilization')) return mockJson(200, { region: 'us-east-1', lookback_days: 30, resources: [], warnings: [] })
       return mockJson(404, {})

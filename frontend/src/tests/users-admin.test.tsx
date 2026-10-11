@@ -42,7 +42,11 @@ function mockResponse(status: number, body: unknown): Response {
 }
 
 function seedSession(user: AuthUser) {
-  window.localStorage.setItem(
+  // Phase 7A: the bearer token lives in sessionStorage, not
+  // localStorage.  AuthProvider's bootstrap reads
+  // sessionStorage['accd.session'] and validates the stored
+  // token against /api/auth/me.
+  window.sessionStorage.setItem(
     'accd.session',
     JSON.stringify({
       access_token: 'good',

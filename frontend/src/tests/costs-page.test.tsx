@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
+import { AuthProvider } from '../lib/auth'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
 import { CostsPage } from '../pages/CostsPage'
+import { MemoryRouter } from '../lib/router'
 
 function mockJson(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -15,9 +17,13 @@ function mockJson(status: number, body: unknown): Response {
 
 function wrap(node: React.ReactNode) {
   return render(
-    <ThemeProvider>
-      <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -71,6 +77,7 @@ describe('CostsPage', () => {
 
   it('renders real period data with KPI tiles', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00', '0.5'))
       return mockJson(404, {})
     })
@@ -85,6 +92,7 @@ describe('CostsPage', () => {
 
   it('renders "—" for missing previous cost (no divide by zero)', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('100', '0', null))
       return mockJson(404, {})
     })
@@ -101,6 +109,7 @@ describe('CostsPage', () => {
 
   it('renders the Cost Trend chart with daily points', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00'))
       return mockJson(404, {})
     })
@@ -109,22 +118,29 @@ describe('CostsPage', () => {
     expect(await screen.findByTestId('cost-trend-chart')).toBeInTheDocument()
   })
 
-  it('period selector changes lookback and triggers refetch', async () => {
+  it('period selector changes month and triggers refetch', async () => {
     const calls: string[] = []
     const transport = vi.fn(async (path: string) => {
       calls.push(path)
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00'))
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
-    wrap(<CostsPage />)
+    const { container } = wrap(<CostsPage />)
     await waitFor(() => {
-      expect(calls.some((c) => c.includes('days=30'))).toBe(true)
+      // Phase 7A: costs endpoint is hit with ?month=YYYY-MM.
+      expect(calls.some((c) => /month=\d{4}-\d{2}/.test(c))).toBe(true)
     })
+    const select = container.querySelector('select[data-testid="period-selector-input"]') as HTMLSelectElement
+    expect(select).not.toBeNull()
+    const options = Array.from(select.querySelectorAll('option')) as HTMLOptionElement[]
+    expect(options.length).toBeGreaterThan(1)
+    const target = options[options.length - 2].value
     const user = userEvent.setup()
-    await user.click(screen.getByRole('radio', { name: '7d' }))
+    await user.selectOptions(select, target)
     await waitFor(() => {
-      expect(calls.some((c) => c.includes('days=7'))).toBe(true)
+      expect(calls.some((c) => c.includes(`month=${target}`))).toBe(true)
     })
   })
 })

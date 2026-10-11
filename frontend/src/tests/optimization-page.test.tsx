@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
+import { AuthProvider } from '../lib/auth'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
 import { OptimizationPage } from '../pages/OptimizationPage'
+import { MemoryRouter } from '../lib/router'
 
 function mockJson(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -15,9 +17,13 @@ function mockJson(status: number, body: unknown): Response {
 
 function wrapRoutes(node: React.ReactNode) {
   return render(
-    <ThemeProvider>
-      <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -91,6 +97,7 @@ describe('OptimizationPage', () => {
 
   it('renders recommendation rows with null savings as "Not available"', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
       if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [rec], warnings: [] })
       if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, makeSummaryNullSavings())
@@ -120,6 +127,7 @@ describe('OptimizationPage', () => {
       recommendations_without_savings: 0, warnings: [],
     }
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
       if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [awsRec], warnings: [] })
       if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, summary)
@@ -135,6 +143,7 @@ describe('OptimizationPage', () => {
   it('renders partial-success state without blanking the page', async () => {
     const warning = { source: 'compute_optimizer', code: 'AccessDenied', message: 'Access denied', region: 'us-east-1' }
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, { ...baseCaps, warnings: [warning] })
       if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'PARTIAL_SUCCESS', count: 1, recommendations: [rec], warnings: [warning] })
       if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, { ...makeSummaryNullSavings(), status: 'PARTIAL_SUCCESS', warnings: [warning] })
@@ -150,6 +159,7 @@ describe('OptimizationPage', () => {
 
   it('renders the recommendation detail panel when a row is clicked', async () => {
     const transport = vi.fn(async (path: string) => {
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
       if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
       if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [rec], warnings: [] })
       if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, makeSummaryNullSavings())

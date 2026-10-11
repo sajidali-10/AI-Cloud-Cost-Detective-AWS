@@ -1,56 +1,97 @@
 // Phase 6B — Period selector and region filter tests.
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
+import { AuthProvider } from '../lib/auth'
 import { FinopsPeriodProvider, useFinopsPeriod } from '../lib/finops/period'
+import { configureApi, __resetApiForTests } from '../lib/api'
 import { PeriodSelector } from '../components/PeriodSelector'
 import { RegionFilter, buildRegionOptions } from '../components/RegionFilter'
+import { MemoryRouter } from '../lib/router'
 
 afterEach(cleanup)
 
-function wrap(node: React.ReactNode) {
+beforeEach(() => {
+  // Phase 7A: AuthProvider fires /api/auth/info on mount; mock the
+  // transport so the bootstrap resolves to auth_enabled=false and
+  // lands on the synthetic-anon 'disabled' phase.
+  __resetApiForTests()
+  configureApi({
+    getToken: () => null,
+    onSessionExpired: () => {},
+    onForbidden: () => {},
+    transport: (async (input: RequestInfo | URL) => {
+      const path = typeof input === 'string' ? input : input.toString()
+      if (path === '/api/auth/info') {
+        return new Response(JSON.stringify({ auth_enabled: false }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({}), { status: 404 })
+    }) as unknown as typeof fetch,
+  })
+})
+
+function wrap(node: React.ReactNode, opts: { initialPeriod?: { kind: 'month'; month: string } } = {}) {
   return render(
-    <ThemeProvider>
-      <FinopsPeriodProvider initialDays={30} initialRegion="all">
-        {node}
-      </FinopsPeriodProvider>
-    </ThemeProvider>,
+    <MemoryRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <FinopsPeriodProvider
+            {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
+            initialRegion="all"
+          >
+            {node}
+          </FinopsPeriodProvider>
+        </AuthProvider>
+      </ThemeProvider>
+    </MemoryRouter>,
   )
 }
 
-function PeriodReader({ onDays }: { onDays: (d: number) => void }) {
-  const { days } = useFinopsPeriod()
-  onDays(days)
+function PeriodReader({ onPeriod }: { onPeriod: (p: { kind: 'month'; month: string } | { kind: 'days'; days: number }) => void }) {
+  const { period } = useFinopsPeriod()
+  onPeriod(period)
   return null
 }
 
 describe('PeriodSelector', () => {
-  it('renders 7d/30d/60d/90d with 30d default active', () => {
-    let days = 0
-    wrap(
+  it('renders the calendar-month select with the current month selected', () => {
+    let observed: { kind: 'month' | 'days'; [k: string]: unknown } | null = null
+    const { container } = wrap(
       <>
         <PeriodSelector />
-        <PeriodReader onDays={(d) => { days = d }} />
+        <PeriodReader onPeriod={(p) => { observed = p as { kind: 'month' | 'days' } }} />
       </>,
     )
-    const radios = screen.getAllByRole('radio')
-    expect(radios).toHaveLength(4)
-    expect(radios.find((r) => r.textContent === '30d')).toHaveAttribute('aria-checked', 'true')
-    expect(days).toBe(30)
+    // The Phase 7A selector renders a native <select>, not a radio
+    // group.  The provider always lands on a calendar month by
+    // default.
+    const select = container.querySelector('select[data-testid="period-selector-input"]')
+    expect(select).not.toBeNull()
+    const options = select!.querySelectorAll('option')
+    expect(options.length).toBeGreaterThanOrEqual(12)
+    expect(observed?.kind).toBe('month')
   })
 
-  it('changes the period on click', async () => {
-    let days = 0
-    wrap(
+  it('changes the month on selection', async () => {
+    let observedMonth = ''
+    const { container } = wrap(
       <>
         <PeriodSelector />
-        <PeriodReader onDays={(d) => { days = d }} />
+        <PeriodReader onPeriod={(p) => { if (p.kind === 'month') observedMonth = p.month }} />
       </>,
     )
-    await userEvent.setup().click(screen.getByRole('radio', { name: '7d' }))
-    expect(days).toBe(7)
+    const select = container.querySelector('select[data-testid="period-selector-input"]') as HTMLSelectElement
+    const options = Array.from(select.querySelectorAll('option')) as HTMLOptionElement[]
+    expect(options.length).toBeGreaterThan(1)
+    const target = options[options.length - 2] // second-to-last month
+    const user = userEvent.setup()
+    await user.selectOptions(select, target.value)
+    expect(observedMonth).toBe(target.value)
   })
 })
 

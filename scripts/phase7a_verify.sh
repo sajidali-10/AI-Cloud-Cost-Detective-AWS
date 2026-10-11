@@ -375,6 +375,72 @@ run_check "nginx does NOT enable HTTPS (Phase 7A constraint)" \
   bash -c "! grep -E 'listen[[:space:]]+443|ssl_certificate' nginx/default.conf"
 
 # ---------------------------------------------------------------------------
+# Phase 7B — Sensitive-path deny rules + regression test.
+#
+# Internet scanners routinely probe /.env, /.git/, /.aws/credentials,
+# /terraform.tfstate, /docker-compose.yml, /secrets.json etc.  Phase
+# 7B hardens nginx to return 404 from nginx itself for these paths
+# rather than letting the SPA fallback serve index.html.
+# ---------------------------------------------------------------------------
+
+note "Phase 7B — nginx sensitive-path deny rules"
+
+run_check "nginx maps dotfile/secret paths to 404" \
+  bash -c 'grep -q "is_sensitive_path" nginx/default.conf'
+run_check "nginx denies /env via map" \
+  bash -c 'grep -E "\\^/\\\\\.env" nginx/default.conf'
+run_check "nginx denies /.git/ via map" \
+  bash -c 'grep -E "\\^/\\\\\.git[[:space:]]" nginx/default.conf'
+run_check "nginx denies /.aws/credentials via map" \
+  bash -c 'grep -E "\\^/\\\\\.aws" nginx/default.conf'
+run_check "nginx denies /terraform.tfstate via map" \
+  bash -c 'grep -E "terraform\\\\\.tfstate|\\\.tfstate\\\$" nginx/default.conf'
+run_check "nginx denies /docker-compose via map" \
+  bash -c 'grep -E "\\^/docker-compose" nginx/default.conf'
+run_check "nginx denies /secrets.json via map" \
+  bash -c 'grep -F "/secrets.json" nginx/default.conf'
+run_check "nginx location ~ ^/\\. blocks generic dotfile paths" \
+  bash -c 'grep -F "location ~ ^/\\." nginx/default.conf'
+run_check "nginx serves /branding/ from frontend" \
+  bash -c 'grep -q "location /branding/" nginx/default.conf'
+run_check "nginx serves /api/ws/ with WebSocket upgrade" \
+  bash -c 'grep -q "location /api/ws/" nginx/default.conf && grep -q "Connection" nginx/default.conf'
+run_check "nginx serves /api/ stripping the prefix" \
+  bash -c "grep -q 'rewrite ^/api/' nginx/default.conf"
+
+# Run the live regression test if nginx is available.  Skips
+# gracefully when nginx is not installed (CI without nginx-light).
+if command -v nginx >/dev/null 2>&1; then
+  if bash scripts/phase7b_nginx_test.sh > /tmp/phase7b-nginx.out 2>&1; then
+    PASS_COUNT=$(grep -cE '^PASS  ' /tmp/phase7b-nginx.out || true)
+    echo "PASS  phase7b_nginx_test.sh  ($PASS_COUNT assertions)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  phase7b_nginx_test.sh"
+    tail -60 /tmp/phase7b-nginx.out
+    FAIL=$((FAIL + 1))
+    FAIL_LINES+=("phase7b_nginx_test.sh")
+  fi
+else
+  echo "SKIP  phase7b_nginx_test.sh (nginx binary not installed)"
+fi
+
+# ---------------------------------------------------------------------------
+# Verify the JS test gate that protects phase6c delegation.
+#
+# Phase 7B rule: if the JS test suite is failing, the verifier must
+# NOT delegate to phase6c_verify.sh (which would mask the failure).
+# We pin the gate by asserting the JS test command is wired through
+# `npm test` and that the scripts/phase7b_nginx_test.sh regression
+# test exists for live HTTP probes.
+# ---------------------------------------------------------------------------
+
+run_check "frontend package.json test script runs vitest" \
+  bash -c 'grep -q "\"test\":[[:space:]]*\"vitest run\"" frontend/package.json'
+run_check "scripts/phase7b_nginx_test.sh exists and is executable" \
+  bash -c 'test -x scripts/phase7b_nginx_test.sh'
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

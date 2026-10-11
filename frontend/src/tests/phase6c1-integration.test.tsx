@@ -43,7 +43,8 @@ const sampleUser = {
 }
 
 function writeStoredSession() {
-  window.localStorage.setItem(
+  // Phase 7A: bearer token lives in sessionStorage.
+  window.sessionStorage.setItem(
     __authTestInternals.SESSION_STORAGE_KEY,
     JSON.stringify({
       access_token: 'header.payload.sig',

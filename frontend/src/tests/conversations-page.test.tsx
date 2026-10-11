@@ -36,7 +36,8 @@ const sampleUser = {
 }
 
 function writeStoredSession() {
-  window.localStorage.setItem(
+  // Phase 7A: bearer token lives in sessionStorage.
+  window.sessionStorage.setItem(
     __authTestInternals.SESSION_STORAGE_KEY,
     JSON.stringify({
       access_token: 'header.payload.sig',
@@ -54,6 +55,10 @@ function buildTransport(handlers: {
   return vi.fn().mockImplementation((url: string) => {
     if (url === '/api/auth/info')
       return Promise.resolve(handlers.authInfo?.() ?? mockJson(200, authInfoEnabled))
+    // Phase 7A: AuthProvider's bootstrap calls /api/auth/me when a
+    // stored session is found in sessionStorage.  Return the
+    // sampleUser so the provider lands on 'authenticated'.
+    if (url === '/api/auth/me') return Promise.resolve(mockJson(200, sampleUser))
     if (url === '/api/ai/status')
       return Promise.resolve(
         handlers.status?.() ??

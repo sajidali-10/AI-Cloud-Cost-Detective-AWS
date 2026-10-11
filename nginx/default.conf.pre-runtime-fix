@@ -1,0 +1,191 @@
+# nginx/default.conf — only public entry point.
+# - /              → frontend (static) with SPA fallback for client routes
+# - /api/          → backend (FastAPI on internal :8000)
+# - /api/ws/       → backend WebSocket (Phase 5C)
+# - /branding/     → frontend static brand assets
+# - sensitive paths (dotfiles, terraform state, secrets, compose, etc.)
+#   → 404 directly from nginx (no SPA fallback, no proxying, no exposure)
+#
+# Phase 7B — Hardening: explicit deny rules for paths that are routinely
+# probed by Internet scanners and that MUST NEVER resolve to the SPA
+# index.  None of these files actually exist in the runtime frontend
+# container today (the build context excludes .env, .git, docker-compose,
+# etc. via .dockerignore), but the SPA fallback returns dist/index.html
+# with HTTP 200 for every non-existent path — making it look as if those
+# resources exist as application HTML.  Returning 404 from nginx itself
+# is both more accurate and materially less noisy in logs.
+
+# `events` block is mandatory in nginx config — keeps a tiny
+# worker pool so this config is valid for `nginx -t` and any
+# sandboxed test that loads it standalone (e.g. `nginx -t -p`).
+events {
+    worker_connections 256;
+}
+
+http {
+    # Map directives must live in `http` context.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # Block access to obviously sensitive paths.
+    #
+    # Scope (case-insensitive prefix/regex match on the normalized URI):
+    #   /.env, /.env.*              — application secrets
+    #   /.aws/credentials           — AWS SDK credential files
+    #   /.git/, /.gitconfig         — VCS metadata
+    #   /terraform.tfstate, *.tfstate, /.terraform/
+    #   /docker-compose*, /Dockerfile
+    #   /secrets.json, /secrets.yaml, /secrets.yml
+    #   dotfile + VCS dotdirs in general
+    #
+    # These rules return 404 from nginx itself, never reaching the
+    # frontend or backend.  The response body is intentionally empty.
+    map $uri $is_sensitive_path {
+        default 0;
+        ~^/\.env                1;
+        ~^/\.aws                1;
+        ~^/\.git                1;
+        ~^/\.gitconfig          1;
+        ~^/\.terraform          1;
+        ~^/\.htaccess           1;
+        ~^/\.htpasswd           1;
+        ~^/\.npmrc              1;
+        ~^/\.yarnrc             1;
+        ~^/\.ssh                1;
+        ~^/\.docker             1;
+        ~^/\.kube               1;
+        ~^/\.bash_history       1;
+        ~^/\.bashrc             1;
+        ~^/\.profile            1;
+        ~^/\.zsh_history        1;
+        ~^/\.well-known/security 1;
+        ~^/terraform\.tfstate   1;
+        ~\.tfstate$             1;
+        ~^/docker-compose       1;
+        ~^/Dockerfile           1;
+        ~^/secrets\.(json|ya?ml)$ 1;
+        ~^/phpinfo\.php         1;
+        ~^/server-status        1;
+        ~^/server-info          1;
+        ~^/wp-admin             1;
+        ~^/wp-login             1;
+        ~^/xmlrpc\.php          1;
+    }
+
+    server {
+        listen 80 default_server;
+        server_name _;
+
+        # Reasonable defaults.
+        client_max_body_size 10m;
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+
+        # Always-on security headers.  nginx adds these to every
+        # response — including 404s — so Internet scanners that probe
+        # /.env see a hardened 404 rather than the SPA HTML.
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options        "DENY"    always;
+        add_header Referrer-Policy        "no-referrer" always;
+        # Reduce MIME sniffing across the board.
+        types { } default_type application/octet-stream;
+
+        # ---------------------------------------------------------------
+        # Block obviously sensitive paths.  Returns 404 immediately,
+        # BEFORE the SPA fallback can return index.html.  The map above
+        # is matched first (in server scope), so this `if` is the
+        # authoritative deny trigger.
+        # ---------------------------------------------------------------
+        if ($is_sensitive_path) {
+            return 404;
+        }
+
+        # ---------------------------------------------------------------
+        # Explicit dotfile block: any URI whose first path segment is a
+        # dotfile (i.e. starts with "/.").  Belt-and-braces — the map
+        # above already covers the known patterns, but a generic
+        # dotfile rule keeps the deny list current as new tooling/config
+        # files appear.  Anchored at "/\\." so legitimate paths like
+        # /assets/foo.js (which contain a dot later) are NOT matched.
+        # ---------------------------------------------------------------
+        location ~ ^/\. {
+            return 404;
+        }
+
+        # ---------------------------------------------------------------
+        # Branding — explicit, so brand assets always work even if the
+        # frontend container's SPA fallback misses them.
+        # ---------------------------------------------------------------
+        location /branding/ {
+            proxy_pass http://frontend:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # ---------------------------------------------------------------
+        # Backend API — strip the /api prefix so the backend sees clean
+        # paths (/health, /auth/info, /aws/identity, ...).
+        # ---------------------------------------------------------------
+        location /api/ {
+            rewrite ^/api/(.*)$ /$1 break;
+            proxy_pass http://backend:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade           $http_upgrade;
+            proxy_set_header Connection        $connection_upgrade;
+        }
+
+        # ---------------------------------------------------------------
+        # Backend WebSocket — Phase 5C realtime conversation channel.
+        # Same /api/ prefix-stripping convention as the REST surface so
+        # the backend sees /ws/conversations/{id}.  Bearer token travels
+        # in the Sec-WebSocket-Protocol header (`bearer.<jwt>`) — NEVER
+        # in the URL — so nginx access_log records the request path
+        # WITHOUT the token.
+        # ---------------------------------------------------------------
+        location /api/ws/ {
+            rewrite ^/api/(.*)$ /$1 break;
+            proxy_pass http://backend:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade           $http_upgrade;
+            proxy_set_header Connection        $connection_upgrade;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_buffering off;
+        }
+
+        # ---------------------------------------------------------------
+        # Frontend static (SPA fallback handled by `serve` in the
+        # frontend container).
+        # ---------------------------------------------------------------
+        location / {
+            proxy_pass http://frontend:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # ---------------------------------------------------------------
+        # Health endpoint for Nginx itself.
+        # ---------------------------------------------------------------
+        location = /nginx-health {
+            access_log off;
+            return 200 "ok\n";
+            add_header Content-Type text/plain;
+        }
+    }
+}

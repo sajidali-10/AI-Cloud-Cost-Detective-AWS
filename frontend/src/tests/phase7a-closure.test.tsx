@@ -21,8 +21,12 @@ import {
   apiFetch,
 } from '../lib/api'
 import { Router, Routes } from '../lib/router'
-import { FinopsPeriodProvider } from '../lib/finops/period'
+import { FinopsPeriodProvider, useFinopsPeriod as _useFinopsPeriod } from '../lib/finops/period'
 import { MemoryRouter } from '../lib/router'
+
+// Aliased re-export so the inner test component (defined below the
+// imports) can resolve the hook statically.
+const MonthProbeModule = { useFinopsPeriod: _useFinopsPeriod }
 
 const SESSION_KEY = 'accd.session'
 
@@ -92,8 +96,15 @@ function Wrap({
   initialToken?: string
   initialUser?: AuthUser
 }) {
-  if (initialToken && initialUser) {
-    window.sessionStorage.setItem(SESSION_KEY, buildUserSession(initialToken, initialUser))
+  if (initialToken) {
+    // Phase 7B: when only `initialToken` is supplied (most callers),
+    // synthesize a default user so the AuthProvider's bootstrap can
+    // restore the session from sessionStorage.  Callers that need a
+    // custom user pass both.
+    window.sessionStorage.setItem(
+      SESSION_KEY,
+      buildUserSession(initialToken, initialUser ?? sampleUser),
+    )
   }
   return (
     <MemoryRouter initialEntries={['/']}>
@@ -418,10 +429,8 @@ describe('Phase 7A closure — billing-month persistence', () => {
     })
 
     const MonthProbe = () => {
-      // Import the hook lazily so the test only depends on the
-      // public API surface.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { useFinopsPeriod } = require('../lib/finops/period') as typeof import('../lib/finops/period')
+      // Import the hook via static import (ESM test setup).
+      const { useFinopsPeriod } = MonthProbeModule
       const { period } = useFinopsPeriod()
       return <span data-testid="month">{period.kind === 'month' ? period.month : 'days'}</span>
     }
@@ -536,7 +545,11 @@ describe('Phase 7A closure — WebSocket JWT transport', () => {
       path.resolve(__dirname, '../lib/ai/protocol.ts'),
       'utf-8',
     )
-    expect(protocolSrc).toMatch(/bearer\.\$\{token\}/)
+    // Phase 7B: the prefix lives in `WS_SUBPROTOCOL_PREFIX` so we
+    // grep for the constant usage in `buildSubprotocols` instead of
+    // an inline string-literal template.
+    expect(protocolSrc).toMatch(/WS_SUBPROTOCOL_PREFIX/)
+    expect(protocolSrc).toMatch(/bearer\./)
     // URL must be built without the token.
     expect(src).not.toMatch(/token.*=.*url|url.*token=/)
   })
