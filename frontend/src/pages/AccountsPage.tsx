@@ -1,7 +1,19 @@
 // Phase 7B — ADMIN-only cloud accounts registry page.
+//
+// Phase 7B runtime closure fix:
+//   * The page used to fire ``apiFetch`` on mount regardless of
+//     auth-bootstrap state.  That made the very first request race
+//     the session-restore step, and if the race lost, the request
+//     reached the backend without an ``Authorization`` header.
+//   * The fix mirrors the FinOps store pattern: gate the initial
+//     fetch (and every subsequent refetch) on ``authReady`` from
+//     ``useAuth()``.  Only authenticated ADMIN sessions issue
+//     network traffic.  Anonymous renders show a "sign in"
+//     placeholder instead of leaking a 401 to the UI.
 
 import { useCallback, useEffect, useState } from 'react'
 import { apiFetch, ApiError } from '../lib/api'
+import { useAuth } from '../lib/auth'
 
 interface CloudAccount {
   id: number
@@ -33,6 +45,7 @@ const EMPTY_FORM: CreateFormState = {
 }
 
 export function AccountsPage() {
+  const { ready: authReady, user } = useAuth()
   const [accounts, setAccounts] = useState<CloudAccount[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -41,7 +54,14 @@ export function AccountsPage() {
   const [statusById, setStatusById] = useState<Record<number, string>>({})
   const [busyId, setBusyId] = useState<number | null>(null)
 
+  // Phase 7B runtime closure: only fetch when we have an
+  // authenticated user.  ``ready`` (authReady) AND ``user`` must be
+  // present — otherwise the backend would receive an anonymous
+  // request and reject it.
+  const canFetch = authReady && user !== null
+
   const refresh = useCallback(async () => {
+    if (!canFetch) return
     setLoading(true)
     setError(null)
     try {
@@ -54,7 +74,7 @@ export function AccountsPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [canFetch])
 
   useEffect(() => {
     void refresh()
@@ -63,6 +83,10 @@ export function AccountsPage() {
   async function submit(ev: React.FormEvent<HTMLFormElement>) {
     ev.preventDefault()
     setFormError(null)
+    if (!canFetch) {
+      setFormError('authentication has not finished initializing')
+      return
+    }
     if (!/^\d{12}$/.test(form.account_id)) {
       setFormError('AWS account id must be exactly 12 digits')
       return
@@ -95,6 +119,7 @@ export function AccountsPage() {
   }
 
   async function validate(id: number) {
+    if (!canFetch) return
     setBusyId(id)
     try {
       const resp = await apiFetch<{ status: string; reason?: string }>(
@@ -116,6 +141,7 @@ export function AccountsPage() {
   }
 
   async function disable(id: number) {
+    if (!canFetch) return
     setBusyId(id)
     try {
       await apiFetch(`/api/aws/cloud-accounts/${id}`, { method: 'DELETE' })
@@ -125,6 +151,44 @@ export function AccountsPage() {
     } finally {
       setBusyId(null)
     }
+  }
+
+  // Auth bootstrap gate — while the AuthProvider is still restoring
+  // the session, render a small placeholder so we never issue a
+  // request without a token.
+  if (!authReady) {
+    return (
+      <div
+        className="mx-auto flex max-w-6xl flex-col gap-2 px-6 py-8"
+        data-testid="accounts-page-loading"
+      >
+        <h1 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
+          AWS Accounts
+        </h1>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Initializing session…
+        </p>
+      </div>
+    )
+  }
+
+  // Anonymous-but-auth-enabled users — they cannot manage accounts.
+  // Backend will reject the call regardless, so we surface a
+  // pre-flight message rather than issue a guaranteed-401.
+  if (!user) {
+    return (
+      <div
+        className="mx-auto flex max-w-6xl flex-col gap-2 px-6 py-8"
+        data-testid="accounts-page-anonymous"
+      >
+        <h1 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
+          AWS Accounts
+        </h1>
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          You must sign in to manage AWS accounts.
+        </p>
+      </div>
+    )
   }
 
   return (
