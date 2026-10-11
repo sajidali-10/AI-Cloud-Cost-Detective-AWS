@@ -10,8 +10,12 @@ Region handling (applies to BOTH endpoints):
     - Caller may pass ``?region=<r>`` per request.
     - If absent, falls back to ``settings.aws_default_region``.
     - If absent again, falls back to Boto3's own region resolution.
-    - Single region only - multi-region discovery is intentionally NOT
-      implemented in this slice (Phase 2 territory).
+
+Phase 7B: callers may pass ``?account_id=<selection>`` to scope the
+request to a registered target account.  When omitted, the
+management account / instance profile is used (preserves Phase 7A
+behaviour).  ``account_id`` accepts either ``"acct:<id>"`` or a
+registry row id.
 """
 from __future__ import annotations
 
@@ -20,13 +24,22 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from app.api.deps import require_role
 from app.core.config import get_settings
 from app.db.models import AppUser
+from app.db.session import get_db
+from app.services.aws.account_provider import (
+    get_management_account,
+    resolve_account_or_404,
+)
 from app.services.aws.enrichment import collect_enrichment
 from app.services.aws.identity import AwsIdentityError, get_caller_identity
 from app.services.aws.resources import enumerate_all_services
+from app.services.aws.session_factory import (
+    get_default_session_factory,
+)
 
 router = APIRouter(prefix="/aws", tags=["aws"])
 logger = logging.getLogger("cost-detective-backend.aws")
@@ -35,26 +48,71 @@ logger = logging.getLogger("cost-detective-backend.aws")
 _settings = get_settings
 
 
+def _resolve_account_or_management(
+    db: Session,
+    selection: Optional[str],
+):
+    """Resolve ``?account_id`` to a registry row, defaulting to management."""
+    if selection is None or selection.strip() == "" or selection == "all":
+        return get_management_account(db)
+    return resolve_account_or_404(db, selection.strip())
+
+
 @router.get("/identity", summary="AWS caller identity (STS GetCallerIdentity)")
 def get_aws_identity(
     region: Optional[str] = Query(
         default=None,
         description=(
             "AWS region override (e.g. us-east-1). When omitted, falls back "
-            "to AWS_DEFAULT_REGION from Settings, then Boto3's own region resolution. "
-            "Single-region only: multi-region discovery is deferred."
+            "to AWS_DEFAULT_REGION from Settings, then Boto3's own region resolution."
+        ),
+    ),
+    account_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Phase 7B: 'all' (default), 'acct:<id>' or a registry row id. "
+            "Omitted is treated as 'all' for backwards-compatibility with Phase 7A."
         ),
     ),
     _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
 ) -> Any:
-    """Return the caller's AWS identity resolved via the default credential chain.
+    """Return the caller's AWS identity.
 
-    On credential or STS errors, returns a sanitized 502 with the Boto3
-    error code in the body — never the exception message or stack trace.
+    With no ``account_id`` (default), this resolves the management
+    instance profile exactly as Phase 1/7A did.  When
+    ``account_id`` points at a registered target account, this
+    issues an ``STS AssumeRole`` against that account's role and
+    returns the assumed-role identity.
     """
-    effective_region = region or _settings().aws_default_region
+    settings = _settings()
+    effective_region = region or settings.aws_default_region
+
+    selection = (account_id or "all").strip()
+    row = _resolve_account_or_management(db, selection)
+    if row is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "status": "error",
+                "error_code": "AccountNotFound",
+                "message": f"no AWS account matches selection={selection!r}",
+            },
+        )
+
+    factory = get_default_session_factory()
     try:
-        identity = get_caller_identity(region=effective_region)
+        if row.is_management:
+            session = factory.management_session()
+        else:
+            session = factory.target_session(
+                role_arn=row.role_arn,
+                external_id=row.external_id,
+                region=effective_region,
+            )
+        identity = get_caller_identity(
+            region=effective_region, session=session
+        )
     except AwsIdentityError as exc:
         # Log the code (not the message) so an operator can debug
         # without leaking credentials into logs.
@@ -65,8 +123,12 @@ def get_aws_identity(
                 "status": "error",
                 "error_code": exc.code,
                 "region": effective_region,
+                "account_id": row.account_id,
             },
         )
+    identity["account_id"] = row.account_id
+    identity["account_display_name"] = row.display_name
+    identity["is_management"] = row.is_management
     return identity
 
 
@@ -79,13 +141,27 @@ def get_aws_resources(
         default=None,
         description=(
             "AWS region override (e.g. us-east-1). When omitted, falls back "
-            "to AWS_DEFAULT_REGION from Settings, then Boto3's own region resolution. "
-            "Single-region only: multi-region discovery is deferred."
+            "to AWS_DEFAULT_REGION from Settings, then Boto3's own region resolution."
+        ),
+    ),
+    account_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Phase 7B: 'all' (default), 'acct:<id>' or a registry row id. "
+            "Omitted is treated as 'all'."
         ),
     ),
     _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
 ) -> Any:
     """Aggregate per-service resource inventory plus optional enrichment.
+
+    Phase 7B: when ``account_id`` is set to a specific account the
+    discovery is scoped to that account's session.  When
+    ``account_id`` is omitted (default ``all``) the response is the
+    management account's inventory, which preserves Phase 7A
+    behaviour exactly.  The dedicated multi-account aggregate lives
+    at ``/api/aws/resources/all``.
 
     Per-service Boto3 errors (AccessDenied, Throttling, etc.) are surfaced
     in the response body as ``status="denied"`` / ``status="error"`` per
@@ -93,12 +169,63 @@ def get_aws_resources(
     layers (Resource Explorer, Tagging API) are likewise presented with
     ``available=False`` flags instead of 500s.
     """
-    effective_region = region or _settings().aws_default_region
-    services = enumerate_all_services(region=effective_region)
-    enrichment = collect_enrichment(region=effective_region)
+    settings = _settings()
+    effective_region = region or settings.aws_default_region
+    selection = (account_id or "all").strip()
 
-    return {
+    if selection == "all":
+        # Preserve Phase 7A behaviour exactly.
+        services = enumerate_all_services(region=effective_region)
+        enrichment = collect_enrichment(region=effective_region)
+        return {
+            "region": effective_region,
+            "services": {name: result.model_dump(mode="json") for name, result in services.items()},
+            "enrichment": enrichment,
+        }
+
+    # Specific account path.
+    row = _resolve_account_or_management(db, selection)
+    if row is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "status": "error",
+                "error_code": "AccountNotFound",
+                "message": f"no AWS account matches selection={selection!r}",
+            },
+        )
+    factory = get_default_session_factory()
+    from app.services.aws import clients as _clients_module
+
+    def _patched(service_name: str, region: Optional[str] = None):
+        if row.is_management:
+            return factory.management_client(service_name, region=region or effective_region)
+        return factory.target_client(
+            service_name,
+            role_arn=row.role_arn,
+            external_id=row.external_id,
+            region=region or effective_region,
+        )
+
+    original = _clients_module.get_aws_client
+    _clients_module.get_aws_client = _patched
+    try:
+        services = enumerate_all_services(region=effective_region)
+        enrichment = collect_enrichment(region=effective_region)
+    finally:
+        _clients_module.get_aws_client = original
+    payload = {
         "region": effective_region,
+        "account_id": row.account_id,
+        "account_display_name": row.display_name,
         "services": {name: result.model_dump(mode="json") for name, result in services.items()},
         "enrichment": enrichment,
     }
+    # Tag every emitted item with account attribution so the
+    # frontend never has to guess which account a resource belongs to.
+    for service_name, result in payload["services"].items():
+        for item in result.get("items", []):
+            item.setdefault("provider", "AWS")
+            item["account_id"] = row.account_id
+            item["account_display_name"] = row.display_name
+    return payload

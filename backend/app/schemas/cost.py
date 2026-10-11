@@ -126,12 +126,93 @@ class CostReportResponse(BaseModel):
     expires_at: Optional[datetime] = None
 
 
+# ---------------------------------------------------------------------------
+# Phase 7B — multi-account aggregate response.
+# ---------------------------------------------------------------------------
+
+
+class AccountCostShare(BaseModel):
+    """A single account's contribution to the rollup."""
+
+    model_config = ConfigDict(frozen=True)
+
+    account_id: str
+    display_name: str
+    amount: Decimal
+
+
+class AccountCostError(BaseModel):
+    """A sanitized per-account failure surfaced in the aggregate."""
+
+    model_config = ConfigDict(frozen=True)
+
+    account_id: str
+    display_name: str
+    code: str
+    message: str
+
+
+class MultiAccountCostReport(BaseModel):
+    """The full multi-account Cost Explorer response.
+
+    Math is always deterministic:
+
+    * ``total_cost = sum(per-account totals)`` (no averaging)
+    * ``by_service`` sums identical service categories across accounts
+    * ``by_region`` sums identical region keys across accounts
+    * ``daily_trend`` aligns by date and fills missing days with zero
+    * ``by_account`` preserves per-account totals for drill-down
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    scope: str = Field(default="all", description="Either 'all' or 'acct:<id>'.")
+    status: str = Field(description="SUCCESS | PARTIAL_SUCCESS | ERROR")
+    account_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Set when scope='acct:<id>'.  When scope='all' the value is "
+            "the management account ID for backwards-compatibility."
+        ),
+    )
+    account_display_name: Optional[str] = Field(default=None)
+    period: CostPeriod
+    previous_period: CostPeriod
+    currency: str = "USD"
+    total_cost: Decimal
+    previous_period_cost: Decimal
+    change_amount: Decimal
+    change_percent: Optional[Decimal]
+    estimated: bool = False
+    daily_trend: List[DailyCostPoint]
+    by_service: List[ServiceCost]
+    by_region: List[RegionCost]
+    by_account: List[AccountCostShare] = Field(default_factory=list)
+    account_errors: List[AccountCostError] = Field(default_factory=list)
+    source: str = "AWS_COST_EXPLORER"
+
+
+class MultiAccountCostReportResponse(BaseModel):
+    """The wire envelope for a multi-account aggregate."""
+
+    model_config = ConfigDict(frozen=True)
+
+    report: MultiAccountCostReport
+    cache_status: CacheStatus
+    cached_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
 __all__ = [
+    "AccountCostError",
+    "AccountCostShare",
     "CacheStatus",
     "CostPeriod",
     "CostReport",
     "CostReportResponse",
     "DailyCostPoint",
+    "MultiAccountCostReport",
+    "MultiAccountCostReportResponse",
     "RegionCost",
     "ServiceCost",
 ]

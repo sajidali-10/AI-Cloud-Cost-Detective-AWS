@@ -103,13 +103,46 @@ def _serialize_payload(report: CostReport) -> dict[str, Any]:
     return json.loads(report.model_dump_json())
 
 
-def _deserialize_payload(row_payload: dict[str, Any]) -> CostReport:
-    """Inverse of ``_serialize_payload`` — re-hydrate a ``CostReport``.
+def _deserialize_payload(row_payload: dict[str, Any], *, model_cls: type = CostReport) -> Any:
+    """Inverse of ``_serialize_payload`` — re-hydrate the cached report.
 
-    String-encoded Decimals are restored via ``Pydantic``'s automatic
-    coercion (``Decimal`` accepts a string).
+    ``model_cls`` defaults to ``CostReport`` for backwards-compatibility
+    with Phase 7A; Phase 7B's multi-account path passes
+    :class:`MultiAccountCostReport` so the cache row is interpreted
+    with the correct schema.
     """
-    return CostReport.model_validate(row_payload)
+    return model_cls.model_validate(row_payload)
+
+
+def _build_response(
+    *,
+    model_cls: type,
+    report: Any,
+    cache_status: CacheStatus,
+    cached_at: datetime,
+    expires_at: datetime,
+) -> Any:
+    """Build the correct response envelope for ``model_cls``.
+
+    Phase 7B routes pass ``MultiAccountCostReport`` here so the
+    response is wrapped in :class:`MultiAccountCostReportResponse`.
+    """
+    if model_cls is CostReport:
+        return CostReportResponse(
+            report=report,
+            cache_status=cache_status,
+            cached_at=cached_at,
+            expires_at=expires_at,
+        )
+    # Lazy import to keep the cache module free of Phase 7B schemas
+    # until they're actually used.
+    from app.schemas.cost import MultiAccountCostReportResponse
+    return MultiAccountCostReportResponse(
+        report=report,
+        cache_status=cache_status,
+        cached_at=cached_at,
+        expires_at=expires_at,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +150,7 @@ def _deserialize_payload(row_payload: dict[str, Any]) -> CostReport:
 # ---------------------------------------------------------------------------
 
 
-LoaderType = Callable[[], Awaitable[CostReport]]
+LoaderType = Callable[[], Awaitable[Any]]
 
 
 async def get_or_refresh(
@@ -127,8 +160,20 @@ async def get_or_refresh(
     loader: LoaderType,
     ttl_seconds: Optional[int] = None,
     db: Optional[Session] = None,
-) -> CostReportResponse:
-    """Return a cached or freshly-loaded ``CostReportResponse``.
+    scope: str = "acct",
+    model_cls: type = CostReport,
+) -> Any:
+    """Return a cached or freshly-loaded report envelope.
+
+    Phase 7B: ``scope`` is the account-selection token (``"acct"``
+    for a specific 12-digit AWS account ID, ``"all"`` for the
+    multi-account aggregate).  It is included in the database row
+    so an "All AWS Accounts" response can never satisfy a request
+    scoped to a specific account, and vice-versa.
+
+    ``model_cls`` is the Pydantic model used to deserialize cached
+    payloads (default ``CostReport`` for backwards-compatibility; the
+    multi-account path passes :class:`MultiAccountCostReport`).
 
     The contract:
 
@@ -139,9 +184,13 @@ async def get_or_refresh(
     * Two concurrent callers with the same key share a single loader
       invocation (in-process dedup).
     * After every successful write, ``maybe_collect_garbage`` runs.
+
+    The function returns either a :class:`CostReportResponse` or a
+    :class:`MultiAccountCostReportResponse` depending on ``model_cls``.
     """
     ttl = ttl_seconds if ttl_seconds is not None else _ttl_seconds()
-    lock = await _lock_for(account_id, cache_key)
+    storage_account_id = f"{scope}:{account_id}"
+    lock = await _lock_for(storage_account_id, cache_key)
     async with lock:
         own_session = db is None
         session = db or SessionLocal()
@@ -149,18 +198,19 @@ async def get_or_refresh(
             now = datetime.now(timezone.utc)
             existing = session.execute(
                 select(CostCache).where(
-                    CostCache.account_id == account_id,
+                    CostCache.account_id == storage_account_id,
                     CostCache.cache_key == cache_key,
                 )
             ).scalar_one_or_none()
             if existing is not None and not existing.is_expired(now):
                 logger.info(
                     "cost cache HIT account=%s key=%s",
-                    account_id,
+                    storage_account_id,
                     cache_key,
                 )
-                return CostReportResponse(
-                    report=_deserialize_payload(existing.payload),
+                return _build_response(
+                    model_cls=model_cls,
+                    report=_deserialize_payload(existing.payload, model_cls=model_cls),
                     cache_status=CacheStatus.HIT,
                     cached_at=existing.created_at,
                     expires_at=existing.expires_at,
@@ -174,7 +224,7 @@ async def get_or_refresh(
 
             if existing is None:
                 row = CostCache(
-                    account_id=account_id,
+                    account_id=storage_account_id,
                     cache_key=cache_key,
                     query_type=report.source,
                     period_start=datetime.combine(
@@ -197,12 +247,13 @@ async def get_or_refresh(
                     session.rollback()
                     existing = session.execute(
                         select(CostCache).where(
-                            CostCache.account_id == account_id,
+                            CostCache.account_id == storage_account_id,
                             CostCache.cache_key == cache_key,
                         )
                     ).scalar_one()
-                    return CostReportResponse(
-                        report=_deserialize_payload(existing.payload),
+                    return _build_response(
+                        model_cls=model_cls,
+                        report=_deserialize_payload(existing.payload, model_cls=model_cls),
                         cache_status=CacheStatus.HIT,
                         cached_at=existing.created_at,
                         expires_at=existing.expires_at,
@@ -221,11 +272,12 @@ async def get_or_refresh(
 
             logger.info(
                 "cost cache REFRESHED account=%s key=%s",
-                account_id,
+                storage_account_id,
                 cache_key,
             )
             maybe_collect_garbage(session)
-            return CostReportResponse(
+            return _build_response(
+                model_cls=model_cls,
                 report=report,
                 cache_status=CacheStatus.REFRESHED,
                 cached_at=now_after_load,

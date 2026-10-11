@@ -31,6 +31,10 @@ from app.api import aws_costs  # noqa: F401  (registers /api/aws/costs)
 from app.api import aws_utilization  # noqa: F401  (registers /api/aws/utilization)
 from app.api import aws_evidence  # noqa: F401  (registers /api/aws/evidence)
 from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimization/*)
+# Phase 7B: cloud-account registry routes.  Mounted on the same
+# aws_router so the public URL is /api/cloud-accounts/* after Nginx
+# strips /api/.
+from app.api import cloud_accounts  # noqa: F401  (registers /api/cloud-accounts/*)
 # Phase 5A: authentication + admin user management routers.  These
 # are mounted with their own prefixes (/auth, /admin/users); nginx
 # strips /api/ as usual.
@@ -89,6 +93,37 @@ app.include_router(conversations_router)
 # policy-violation code when authentication is disabled.  nginx is
 # responsible for the WebSocket upgrade headers.
 app.include_router(ws_conversations_router)
+
+
+# ---------------------------------------------------------------------------
+# Phase 7B: bootstrap the management-account row.
+#
+# We do this at startup (after the FastAPI app is wired up but
+# before it begins serving) so that an existing single-account
+# deployment picks up its management row without any operator
+# action.  The bootstrap is idempotent — see
+# :func:`app.services.aws.account_provider.bootstrap_once`.
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+def _phase7b_bootstrap_management_account() -> None:
+    """Ensure the management AWS account is registered.
+
+    Wrapped in a try/except so a transient STS failure cannot prevent
+    the application from starting — the operator will simply see a
+    warning in the logs and the registry will be empty until the
+    instance profile is granted ``sts:GetCallerIdentity``.
+    """
+    from app.services.aws.account_provider import bootstrap_once
+
+    try:
+        bootstrap_once()
+    except Exception as exc:  # noqa: BLE001 — bootstrap must never block startup
+        logger.warning(
+            "phase7b bootstrap_management_account failed: %s",
+            type(exc).__name__,
+        )
 
 
 # ---------------------------------------------------------------------------

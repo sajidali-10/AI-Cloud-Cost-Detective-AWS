@@ -300,17 +300,43 @@ def previous_period(period: CostPeriod) -> CostPeriod:
 # ---------------------------------------------------------------------------
 
 
-def get_cost_explorer_client(region: Optional[str] = None) -> BaseClient:
+def get_cost_explorer_client(
+    region: Optional[str] = None,
+    *,
+    account_row: Optional[Any] = None,
+    role_arn: Optional[str] = None,
+    external_id: Optional[str] = None,
+) -> BaseClient:
     """Return an account-level Cost Explorer client.
 
     Cost Explorer is a single global endpoint per account, so a region
     is not strictly required — but we accept it for symmetry with the
     other AWS services and to let callers override (e.g. for testing).
 
+    Phase 7B: callers may pass ``account_row`` (a ``CloudAccount`` ORM
+    row) or explicit ``role_arn``/``external_id``.  When supplied, the
+    client is constructed via :func:`app.services.aws.session_factory.
+    get_aws_client_for` so the request is routed through the
+    AssumeRole session cache.  When omitted, the legacy default-chain
+    client is returned (preserves Phase 1/2 behaviour).
+
     Boto3 is configured with conservative retries and timeouts so a
     runaway call does not hang a FastAPI request.  Exponential
     backoff on throttling is Boto3's default.
     """
+    # Lazy import to keep ``cost_explorer`` importable from tests
+    # without booting the session factory.
+    from app.services.aws.session_factory import get_aws_client_for
+
+    if account_row is not None or role_arn:
+        return get_aws_client_for(
+            "ce",
+            account_row=account_row,
+            role_arn=role_arn,
+            external_id=external_id,
+            region=region,
+        )
+
     config = BotoConfig(
         retries={"max_attempts": 5, "mode": "standard"},
         connect_timeout=5,
