@@ -30,6 +30,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { path: '/analyst', label: 'AI Cost Analyst', visibleTo: ['ADMIN', 'ANALYST'] },
   { path: '/conversations', label: 'Conversations', visibleTo: ['ADMIN', 'ANALYST'] },
   { path: '/users', label: 'Users', visibleTo: ['ADMIN'] },
+  { path: '/accounts', label: 'Accounts', visibleTo: ['ADMIN'] },
   { path: '/security', label: 'Security', visibleTo: ['ADMIN'] },
 ] as const
 

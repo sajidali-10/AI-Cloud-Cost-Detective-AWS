@@ -13,6 +13,7 @@ import { useAuth } from '../lib/auth'
 import { BrandHeader } from './BrandHeader'
 import { ThemeToggle } from './ThemeToggle'
 import { UserMenu } from './UserMenu'
+import { AccountSelector } from './AccountSelector'
 
 export function TopNavigation() {
   const { role } = useAuth()
@@ -52,6 +53,9 @@ export function TopNavigation() {
           })}
         </nav>
         <div className="ml-auto flex items-center gap-2">
+          <span className="hidden lg:inline-flex">
+            <AccountSelector />
+          </span>
           <span className="hidden md:inline">
             <ThemeToggle />
           </span>

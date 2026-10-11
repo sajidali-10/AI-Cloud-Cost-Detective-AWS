@@ -47,6 +47,7 @@ from app.services.aws.cloudwatch_metrics import (
     period_seconds_for,
 )
 from app.services.aws.identity import AwsIdentityError, get_caller_identity
+from app.services.aws.session_factory import get_default_session_factory
 from app.services.aws.resources import enumerate_all_services
 from app.services.optimization_engine import (
     OptimizationInputs,
