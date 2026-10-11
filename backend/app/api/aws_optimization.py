@@ -24,10 +24,12 @@ from typing import Any, Dict, Optional
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from app.api.aws import router as aws_router
 from app.api.aws_utilization import _descriptors_from_phase1
 from app.api.deps import require_role
+from app.db.session import get_db
 from app.core.config import get_settings
 from app.db.models import AppUser
 from app.schemas.optimization import (
@@ -303,14 +305,75 @@ def _aggregate_batch_results(
 )
 def get_optimization_capabilities(
     region: Optional[str] = Query(default=None),
+    account_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Phase 7B: 'all' (default), 'acct:<id>' or a registry row id. "
+            "Omitted is treated as 'all'."
+        ),
+    ),
     _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
 ) -> Any:
     settings = _settings()
     effective_region = region or settings.aws_default_region
-    identity = _resolve_identity(effective_region)
-    account_id = identity.get("account") if identity else None
-    caps = build_capabilities(region=effective_region, account_id=account_id)
-    return caps.model_dump(mode="json")
+
+    # Phase 7B: route the identity probe through the registry when
+    # the caller names a specific account.  The default (``all``)
+    # preserves Phase 7A behaviour (management instance profile).
+    selection = (account_id or "all").strip()
+    target_row = None
+    if selection != "all":
+        from app.services.aws.account_provider import resolve_account_or_404
+        target_row = resolve_account_or_404(db, selection)
+        if target_row is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={
+                    "status": "error",
+                    "error_code": "AccountNotFound",
+                    "message": f"no AWS account matches selection={selection!r}",
+                },
+            )
+
+    factory = get_default_session_factory()
+    try:
+        if target_row is None:
+            session = factory.management_session()
+        elif target_row.is_management:
+            session = factory.management_session()
+        else:
+            session = factory.target_session(
+                role_arn=target_row.role_arn,
+                external_id=target_row.external_id,
+                region=effective_region,
+            )
+        from app.services.aws.identity import get_caller_identity
+        identity = get_caller_identity(
+            region=effective_region, session=session
+        )
+    except Exception as exc:  # noqa: BLE001 — sanitized
+        logger.warning(
+            "aws.optimization.identity_failed code=%s",
+            type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "status": "error",
+                "error_code": "IdentityUnavailable",
+                "region": effective_region,
+            },
+        )
+    resolved_account_id = identity.get("account")
+    caps = build_capabilities(
+        region=effective_region, account_id=resolved_account_id
+    )
+    payload = caps.model_dump(mode="json")
+    if target_row is not None:
+        payload["account_id"] = target_row.account_id
+        payload["account_display_name"] = target_row.display_name
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +388,15 @@ def get_optimization_capabilities(
 def get_optimization_recommendations(
     region: Optional[str] = Query(default=None),
     days: int = Query(default=30),
+    account_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Phase 7B: 'all' (default), 'acct:<id>' or a registry row id. "
+            "Omitted is treated as 'all'."
+        ),
+    ),
     _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
 ) -> Any:
     bad_lookback = _validate_lookback(days)
     if bad_lookback is not None:
@@ -334,13 +405,37 @@ def get_optimization_recommendations(
     settings = _settings()
     effective_region = region or settings.aws_default_region
 
-    identity = _resolve_identity(effective_region)
-    account_id = identity.get("account") if identity else None
-    if identity is None:
-        # The capabilities endpoint survives identity failure (the
-        # route returns a 200 with warnings); for recommendations we
-        # still return a sanitized 502 because no resource can be
-        # attributed to an account.
+    selection = (account_id or "all").strip()
+    target_row = None
+    if selection != "all":
+        from app.services.aws.account_provider import resolve_account_or_404
+        target_row = resolve_account_or_404(db, selection)
+        if target_row is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={
+                    "status": "error",
+                    "error_code": "AccountNotFound",
+                    "message": f"no AWS account matches selection={selection!r}",
+                },
+            )
+
+    factory = get_default_session_factory()
+    try:
+        if target_row is None or target_row.is_management:
+            session = factory.management_session()
+        else:
+            session = factory.target_session(
+                role_arn=target_row.role_arn,
+                external_id=target_row.external_id,
+                region=effective_region,
+            )
+        from app.services.aws.identity import get_caller_identity
+        identity = get_caller_identity(
+            region=effective_region, session=session
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("aws.optimization identity error_code=%s", type(exc).__name__)
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
             content={
@@ -349,27 +444,40 @@ def get_optimization_recommendations(
                 "region": effective_region,
             },
         )
+    account_id_resolved = identity.get("account")
 
-    # Phase 1 inventory — never raises.
-    phase1_services = enumerate_all_services(region=effective_region)
+    # Phase 1 inventory scoped through the registry row when supplied.
+    from app.services.aws import clients as _clients_module
+    original = _clients_module.get_aws_client
 
-    # CloudWatch utilization — degrades to empty (no coverage) on failure.
-    utilization_by_resource = _fetch_utilization(
-        region=effective_region, days=days, phase1_services=phase1_services
-    )
+    def _patched(service_name: str, region: Optional[str] = None):
+        if target_row is None or target_row.is_management:
+            return factory.management_client(service_name, region=region or effective_region)
+        return factory.target_client(
+            service_name,
+            role_arn=target_row.role_arn,
+            external_id=target_row.external_id,
+            region=region or effective_region,
+        )
+
+    _clients_module.get_aws_client = _patched
+    try:
+        phase1_services = enumerate_all_services(region=effective_region)
+        utilization_by_resource = _fetch_utilization(
+            region=effective_region, days=days, phase1_services=phase1_services
+        )
+    finally:
+        _clients_module.get_aws_client = original
 
     inputs = OptimizationInputs(
         region=effective_region,
-        account_id=account_id,
+        account_id=account_id_resolved,
         days=days,
         phase1_services=phase1_services,
         utilization_by_resource=utilization_by_resource,
     )
     recommendations, warnings = build_recommendations(inputs)
 
-    # Compute status.  Both AWS-native sources failed AND no deterministic
-    # rules ran -> FAILED.  Otherwise PARTIAL_SUCCESS if there are any
-    # warnings, else SUCCESS.
     if not recommendations:
         status_value = "FAILED" if warnings else "SUCCESS"
     elif warnings:
@@ -379,7 +487,7 @@ def get_optimization_recommendations(
 
     response = RecommendationsResponse(
         region=effective_region,
-        account_id=account_id,
+        account_id=account_id_resolved,
         days=days,
         status=status_value,
         count=len(recommendations),
@@ -401,7 +509,15 @@ def get_optimization_recommendations(
 def get_optimization_summary(
     region: Optional[str] = Query(default=None),
     days: int = Query(default=30),
+    account_id: Optional[str] = Query(
+        default=None,
+        description=(
+            "Phase 7B: 'all' (default), 'acct:<id>' or a registry row id. "
+            "Omitted is treated as 'all'."
+        ),
+    ),
     _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
 ) -> Any:
     bad_lookback = _validate_lookback(days)
     if bad_lookback is not None:
@@ -410,9 +526,37 @@ def get_optimization_summary(
     settings = _settings()
     effective_region = region or settings.aws_default_region
 
-    identity = _resolve_identity(effective_region)
-    account_id = identity.get("account") if identity else None
-    if identity is None:
+    selection = (account_id or "all").strip()
+    target_row = None
+    if selection != "all":
+        from app.services.aws.account_provider import resolve_account_or_404
+        target_row = resolve_account_or_404(db, selection)
+        if target_row is None:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={
+                    "status": "error",
+                    "error_code": "AccountNotFound",
+                    "message": f"no AWS account matches selection={selection!r}",
+                },
+            )
+
+    factory = get_default_session_factory()
+    try:
+        if target_row is None or target_row.is_management:
+            session = factory.management_session()
+        else:
+            session = factory.target_session(
+                role_arn=target_row.role_arn,
+                external_id=target_row.external_id,
+                region=effective_region,
+            )
+        from app.services.aws.identity import get_caller_identity
+        identity = get_caller_identity(
+            region=effective_region, session=session
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("aws.optimization identity error_code=%s", type(exc).__name__)
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
             content={
@@ -421,15 +565,33 @@ def get_optimization_summary(
                 "region": effective_region,
             },
         )
+    account_id_resolved = identity.get("account")
 
-    phase1_services = enumerate_all_services(region=effective_region)
-    utilization_by_resource = _fetch_utilization(
-        region=effective_region, days=days, phase1_services=phase1_services
-    )
+    from app.services.aws import clients as _clients_module
+    original = _clients_module.get_aws_client
+
+    def _patched(service_name: str, region: Optional[str] = None):
+        if target_row is None or target_row.is_management:
+            return factory.management_client(service_name, region=region or effective_region)
+        return factory.target_client(
+            service_name,
+            role_arn=target_row.role_arn,
+            external_id=target_row.external_id,
+            region=region or effective_region,
+        )
+
+    _clients_module.get_aws_client = _patched
+    try:
+        phase1_services = enumerate_all_services(region=effective_region)
+        utilization_by_resource = _fetch_utilization(
+            region=effective_region, days=days, phase1_services=phase1_services
+        )
+    finally:
+        _clients_module.get_aws_client = original
 
     inputs = OptimizationInputs(
         region=effective_region,
-        account_id=account_id,
+        account_id=account_id_resolved,
         days=days,
         phase1_services=phase1_services,
         utilization_by_resource=utilization_by_resource,
@@ -437,12 +599,16 @@ def get_optimization_summary(
     recommendations, warnings = build_recommendations(inputs)
     summary = build_summary(
         region=effective_region,
-        account_id=account_id,
+        account_id=account_id_resolved,
         days=days,
         recommendations=recommendations,
         warnings=warnings,
     )
-    return summary.model_dump(mode="json")
+    payload = summary.model_dump(mode="json")
+    if target_row is not None:
+        payload["account_id"] = target_row.account_id
+        payload["account_display_name"] = target_row.display_name
+    return payload
 
 
 __all__ = [
