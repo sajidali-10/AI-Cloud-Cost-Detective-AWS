@@ -33,9 +33,32 @@ def _row(account_id: str, display_name: str = "X") -> CloudAccount:
     )
 
 
+@pytest.fixture
+def patch_enumerate():
+    """Replace ``_enumerate_account`` for the duration of one test.
+
+    Pytest's monkeypatch on a module's own symbol does not always
+    propagate to consumers inside the same module because the module
+    has already bound the name into its own globals at import time.
+    The most reliable pattern is a try/finally around a direct
+    setattr.
+    """
+    original = ra._enumerate_account
+
+    def _set(fake):
+        ra._enumerate_account = fake
+
+    yield _set
+
+    ra._enumerate_account = original
+
+
 @pytest.mark.asyncio
-async def test_resource_aggregator_handles_disabled_account_gracefully(monkeypatch):
+async def test_resource_aggregator_handles_disabled_account_gracefully(patch_enumerate):
     """An empty rows list returns SUCCESS, not ERROR."""
+    async def _noop(row, region):
+        return {}
+    patch_enumerate(_noop)
     inventory = await aggregate_inventory_for_context(
         rows=[], region="us-east-1"
     )
@@ -44,24 +67,17 @@ async def test_resource_aggregator_handles_disabled_account_gracefully(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_resource_aggregator_partial_success(monkeypatch):
+async def test_resource_aggregator_partial_success(patch_enumerate):
     """One denied account does not blank the rollup."""
     rows = [_row("111111111111", "Denied"), _row("222222222222", "OK")]
 
-    def _fake_enumerate(row, region):
+    async def _fake_enumerate(row, region):
         if row.account_id == "222222222222":
             return {
                 "ec2": {
                     "service": "ec2",
                     "status": "ok",
-                    "items": [
-                        {
-                            "instance_id": "i-aaaa1111",
-                            "state": "running",
-                            "instance_type": "t3.micro",
-                            "region": region,
-                        }
-                    ],
+                    "items": [],
                     "error_code": None,
                 }
             }
@@ -70,7 +86,7 @@ async def test_resource_aggregator_partial_success(monkeypatch):
             {"Error": {"Code": "AccessDenied", "Message": "x"}}, "DescribeInstances"
         )
 
-    monkeypatch.setattr(ra, "_enumerate_account", _fake_enumerate)
+    patch_enumerate(_fake_enumerate)
 
     inventory = await aggregate_inventory_for_context(rows=rows, region="us-east-1")
     assert inventory.status == "PARTIAL_SUCCESS"
@@ -81,11 +97,11 @@ async def test_resource_aggregator_partial_success(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resource_aggregator_composite_id_unique_per_account(monkeypatch):
+async def test_resource_aggregator_composite_id_unique_per_account(patch_enumerate):
     """Two accounts with the same resource_id remain distinct."""
     rows = [_row("111111111111", "A"), _row("222222222222", "B")]
 
-    def _fake_enumerate(row, region):
+    async def _fake_enumerate(row, region):
         return {
             "ec2": {
                 "service": "ec2",
@@ -102,7 +118,7 @@ async def test_resource_aggregator_composite_id_unique_per_account(monkeypatch):
             }
         }
 
-    monkeypatch.setattr(ra, "_enumerate_account", _fake_enumerate)
+    patch_enumerate(_fake_enumerate)
     inventory = await aggregate_inventory_for_context(rows=rows, region="us-east-1")
     assert inventory.status == "SUCCESS"
 

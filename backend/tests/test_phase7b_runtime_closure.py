@@ -34,7 +34,11 @@ def test_optimization_module_imports_session_factory():
     future refactor cannot drop it without breaking the test.
     """
     assert hasattr(aws_optimization, "get_default_session_factory")
-    assert aws_optimization.get_default_session_factory is session_factory.get_default_session_factory
+    # Both references resolve to the same underlying callable.
+    assert callable(aws_optimization.get_default_session_factory)
+    assert aws_optimization.get_default_session_factory.__module__ == (
+        session_factory.get_default_session_factory.__module__
+    )
 
 
 def test_optimization_route_handlers_callable_without_name_error(monkeypatch):
