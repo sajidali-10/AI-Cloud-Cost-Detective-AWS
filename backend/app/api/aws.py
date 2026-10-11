@@ -229,3 +229,39 @@ def get_aws_resources(
             item["account_id"] = row.account_id
             item["account_display_name"] = row.display_name
     return payload
+
+
+@router.get(
+    "/resources/all",
+    summary="Phase 7B — multi-account resource inventory aggregate",
+)
+async def get_aws_resources_all(
+    region: Optional[str] = Query(default=None),
+    _user: AppUser = Depends(require_role("ADMIN", "ANALYST", "VIEWER")),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Fan out resource discovery across every enabled account.
+
+    Every resource carries a composite identity
+    ``(provider, account_id, region, resource_type, resource_id)`` so
+    two accounts with the same ``i-0123`` appear as distinct rows.
+    Per-account failures are captured in ``account_errors`` and do
+    not fail the request.  Bounded concurrency via
+    ``PHASE7B_RESOURCES_MAX_CONCURRENCY``.
+    """
+    from app.services.aws.account_provider import list_accounts
+    from app.services.aws.resource_aggregator import (
+        aggregate_inventory_for_context,
+    )
+
+    settings = _settings()
+    effective_region = region or settings.aws_default_region
+    rows = list_accounts(db, provider="AWS", enabled_only=True)
+    if not rows:
+        mgmt = get_management_account(db)
+        if mgmt is not None:
+            rows = [mgmt]
+    inventory = await aggregate_inventory_for_context(
+        rows=rows, region=effective_region
+    )
+    return inventory.to_summary_dict(scope="all")
