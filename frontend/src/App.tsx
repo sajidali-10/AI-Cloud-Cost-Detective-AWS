@@ -3,9 +3,10 @@
 // Composes providers in the correct order:
 //   ThemeProvider   → sets data-theme + manages persistence
 //     AuthProvider  → reads theme via document attribute (no dep on ThemeProvider)
-//       Router      → routes + role-aware guards
-//         Routes    → role-checked route tree
-//           Pages
+//       AccountProvider (Phase 7B) → registers the AWS account selector
+//         Router      → routes + role-aware guards
+//           Routes    → role-checked route tree
+//             Pages
 //
 // Theme is intentionally outside Auth so 401-driven redirects keep
 // the user's chosen palette.
@@ -14,6 +15,7 @@ import { ThemeProvider } from './lib/theme'
 import { AuthProvider, useAuth } from './lib/auth'
 import { Router, Routes, Navigate, type RouteSpec } from './lib/router'
 import { FinopsPeriodProvider } from './lib/finops/period'
+import { AccountProvider } from './lib/accountContext'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -24,6 +26,7 @@ import { AIAnalystPage } from './pages/AIAnalystPage'
 import { ConversationsPage } from './pages/ConversationsPage'
 import { UsersPage } from './pages/UsersPage'
 import { SecurityPage } from './pages/SecurityPage'
+import { AccountsPage } from './pages/AccountsPage'
 import { LoadingSkeleton } from './components/LoadingSkeleton'
 
 export default function App() {
@@ -31,9 +34,11 @@ export default function App() {
     <ThemeProvider>
       <Router>
         <AuthProvider>
-          <FinopsPeriodProvider>
-            <AppRoot />
-          </FinopsPeriodProvider>
+          <AccountProvider>
+            <FinopsPeriodProvider>
+              <AppRoot />
+            </FinopsPeriodProvider>
+          </AccountProvider>
         </AuthProvider>
       </Router>
     </ThemeProvider>
@@ -93,6 +98,7 @@ function buildRoutes({ role, user, authEnabled }: BuildRoutesArgs): RouteSpec[] 
   if (role === 'ADMIN') {
     r.push({ path: '/users', element: <UsersPage /> })
     r.push({ path: '/security', element: <SecurityPage /> })
+    r.push({ path: '/accounts', element: <AccountsPage /> })
   }
   // Login route — accessible only when auth is enabled and the user
   // is NOT authenticated.  Once signed in the user is redirected
