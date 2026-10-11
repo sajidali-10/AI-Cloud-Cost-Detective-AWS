@@ -38,6 +38,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -382,10 +383,115 @@ class ConversationMessage(Base):
         )
 
 
+# Phase 7B — cloud-account registry.
+#
+# The registry supports AWS today and is designed so Phase 7C can add
+# Azure / Rackspace rows without a schema migration.  We keep the
+# provider-agnostic columns (`provider`, `account_id`, `display_name`,
+# `enabled`, `is_management`) and the AWS-specific bits in dedicated
+# columns (`role_arn`, `external_id`, `preferred_region`).
+#
+# Security invariants:
+#
+# * No temporary STS credentials are ever stored here — only metadata
+#   needed to *request* them.
+# * The ``external_id`` column is write-only at the API surface (see
+#   :mod:`app.schemas.cloud_account`); it is included in the ORM for
+#   parity with the schema but the API layer strips it on every read.
+# * ``is_management`` is unique-per-provider so the platform always
+#   has exactly one row representing the account the EC2 instance
+#   profile lives in.  This row is inserted on first boot via the
+#   ``ensure_management_account_row`` helper.
+
+CLOUD_ACCOUNT_PROVIDERS: tuple[str, ...] = ("AWS",)
+
+
+class CloudAccount(Base):
+    """A registered cloud account the platform can access.
+
+    For AWS accounts the access path is:
+
+    * Management row (``is_management=true``): use the EC2 instance
+      profile directly — no AssumeRole, no external_id.
+    * Target row (``is_management=false``): use
+      ``STS AssumeRole(RoleArn=role_arn, ExternalId=external_id)``
+      to obtain short-lived credentials.
+    """
+
+    __tablename__ = "cloud_accounts"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "account_id", name="uq_cloud_accounts_provider_account"
+        ),
+        # Exactly one management row per provider: a PARTIAL unique
+        # index that only applies when ``is_management = true``.  This
+        # allows many target rows (``is_management=false``) per
+        # provider while still enforcing a single management row.
+        Index(
+            "uq_cloud_accounts_provider_management",
+            "provider",
+            unique=True,
+            postgresql_where=text("is_management = true"),
+            sqlite_where=text("is_management = 1"),
+        ),
+        CheckConstraint(
+            "provider IN ('AWS')",
+            name="ck_cloud_accounts_provider",
+        ),
+        # ``enabled`` and ``is_management`` are BOOLEAN columns; the
+        # type itself enforces the two-state invariant, so no extra
+        # CHECK is needed (Postgres refuses ``bool IN (0, 1)`` because
+        # BOOLEAN does not implicitly compare to INTEGER).
+        Index("ix_cloud_accounts_provider_enabled", "provider", "enabled"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(12), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    role_arn: Mapped[str] = mapped_column(String(2048), nullable=False)
+    # External IDs are optional; the API layer treats them as
+    # write-only secrets.  We never SELECT them into a response.
+    external_id: Mapped[str | None] = mapped_column(
+        String(1224), nullable=True
+    )
+
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    is_management: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    preferred_region: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover — debug helper
+        # Deliberately omits ``external_id`` so a stray ``print(row)``
+        # cannot leak the secret.
+        return (
+            f"CloudAccount(id={self.id!r}, provider={self.provider!r}, "
+            f"account_id={self.account_id!r}, display_name={self.display_name!r}, "
+            f"is_management={self.is_management!r}, enabled={self.enabled!r})"
+        )
+
+
 __all__ = [
     "APP_USER_ROLES",
+    "CLOUD_ACCOUNT_PROVIDERS",
     "CONVERSATION_MESSAGE_ROLES",
     "Base",
+    "CloudAccount",
     "Conversation",
     "ConversationMessage",
     "CostCache",
