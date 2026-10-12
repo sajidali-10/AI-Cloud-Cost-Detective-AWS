@@ -177,7 +177,7 @@ async def _fetch_account_report(
             region=effective_region, account_row=row
         )
         return aggregate_cost_report_for_period(
-            client, period, previous, account_id=row.account_id
+            client, period, previous, account_id=row.account_id, region=region
         )
 
     return await asyncio.to_thread(_build)
@@ -197,7 +197,7 @@ async def _fetch_account_totals(
         client = get_cost_explorer_client(
             region=effective_region, account_row=row
         )
-        return get_total_and_previous(client, period)
+        return get_total_and_previous(client, period, region=region)
 
     return await asyncio.to_thread(_build)
 
@@ -222,9 +222,9 @@ async def _fetch_account_breakdowns(
         client = get_cost_explorer_client(
             region=effective_region, account_row=row
         )
-        daily = get_daily_trend(client, period)
-        by_service = get_by_service(client, period)
-        by_region = get_by_region(client, period)
+        daily = get_daily_trend(client, period, region=region)
+        by_service = get_by_service(client, period, region=region)
+        by_region = get_by_region(client, period, region=region)
         return daily, by_service, by_region
 
     return await asyncio.to_thread(_build)

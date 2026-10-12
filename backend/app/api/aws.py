@@ -19,6 +19,7 @@ registry row id.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -32,7 +33,12 @@ from app.db.models import AppUser
 from app.db.session import get_db
 from app.services.aws.account_provider import (
     get_management_account,
+    iter_enabled_accounts,
     resolve_account_or_404,
+)
+from app.services.aws.clients import (
+    reset_active_account_row,
+    set_active_account_row,
 )
 from app.services.aws.enrichment import collect_enrichment
 from app.services.aws.identity import AwsIdentityError, get_caller_identity
@@ -174,14 +180,37 @@ def get_aws_resources(
     selection = (account_id or "all").strip()
 
     if selection == "all":
-        # Preserve Phase 7A behaviour exactly.
-        services = enumerate_all_services(region=effective_region)
-        enrichment = collect_enrichment(region=effective_region)
-        return {
-            "region": effective_region,
-            "services": {name: result.model_dump(mode="json") for name, result in services.items()},
-            "enrichment": enrichment,
-        }
+        # Phase 7B: query every enabled account and aggregate.  We
+        # route through the resource aggregator (which already
+        # binds each row to the ContextVar internally) and never
+        # invoke ``enumerate_all_services`` against the management
+        # chain — that would silently re-introduce the
+        # "selection=account-A but data=management" leak.
+        mgmt = get_management_account(db)
+        rows = list(iter_enabled_accounts(db))
+        if not rows and mgmt is not None:
+            rows = [mgmt]
+        from app.services.aws.resource_aggregator import (
+            aggregate_inventory_for_context,
+        )
+        inventory = asyncio.run(aggregate_inventory_for_context(
+            rows=rows, region=effective_region
+        ))
+        body = inventory.to_summary_dict(scope="all")
+        body["region"] = effective_region
+        # Enrichment is management-side only; it adds
+        # Resource Explorer / Tagging layers.  Bind management
+        # for the duration of the enrichment call so the
+        # ContextVar-routed client picks the management chain.
+        if mgmt is not None:
+            enrich_token = set_active_account_row(mgmt)
+            try:
+                body["enrichment"] = collect_enrichment(region=effective_region)
+            finally:
+                reset_active_account_row(enrich_token)
+        else:
+            body["enrichment"] = collect_enrichment(region=effective_region)
+        return body
 
     # Specific account path.
     row = _resolve_account_or_management(db, selection)
@@ -194,26 +223,19 @@ def get_aws_resources(
                 "message": f"no AWS account matches selection={selection!r}",
             },
         )
-    factory = get_default_session_factory()
-    from app.services.aws import clients as _clients_module
-
-    def _patched(service_name: str, region: Optional[str] = None):
-        if row.is_management:
-            return factory.management_client(service_name, region=region or effective_region)
-        return factory.target_client(
-            service_name,
-            role_arn=row.role_arn,
-            external_id=row.external_id,
-            region=region or effective_region,
-        )
-
-    original = _clients_module.get_aws_client
-    _clients_module.get_aws_client = _patched
+    # Phase 7B fix: bind the active account row via the ContextVar
+    # so every Boto3 client built through ``clients.get_aws_client``
+    # routes through the STS AssumeRole session factory for
+    # target accounts (and through the management chain for the
+    # management row).  We MUST pair this with a reset in the
+    # ``finally`` so a partial failure cannot leak the row to a
+    # subsequent unrelated request on the same event loop.
+    token = set_active_account_row(row)
     try:
         services = enumerate_all_services(region=effective_region)
         enrichment = collect_enrichment(region=effective_region)
     finally:
-        _clients_module.get_aws_client = original
+        reset_active_account_row(token)
     payload = {
         "region": effective_region,
         "account_id": row.account_id,

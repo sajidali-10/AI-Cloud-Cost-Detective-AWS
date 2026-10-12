@@ -220,6 +220,26 @@ async def _fetch_utilization_async(
     )
 
 
+def _resolve_default_management(db: Optional[Session]):
+    """Return the management row, or ``None`` when no management row exists.
+
+    Used by the optimization routes to bind the active-account
+    ContextVar to the management chain when the caller did not
+    name a specific account (preserves Phase 1/2/7A default =
+    management behaviour).
+
+    When ``db`` is ``None`` (synthetic unit tests that exercise the
+    route function directly without a real DB session) we return
+    ``None`` so the ContextVar bind is a no-op — the clients layer
+    falls through to the Boto3 default chain, which is exactly the
+    Phase 1/2 default.
+    """
+    if db is None:
+        return None
+    from app.services.aws.account_provider import get_management_account
+    return get_management_account(db)
+
+
 def _run_batch_query_blocking(
     *,
     cw_client: Any,
@@ -407,6 +427,16 @@ def get_optimization_recommendations(
     effective_region = region or settings.aws_default_region
 
     selection = (account_id or "all").strip()
+
+    # Phase 7B: ``all`` path — fan out across every enabled
+    # account, dedup-merge, return a single aggregate.  This
+    # closes the same defect class as Issue 1 for the
+    # optimization flow.
+    if selection == "all":
+        return _all_accounts_recommendations_response(
+            db, region=effective_region, days=days,
+        )
+
     target_row = None
     if selection != "all":
         from app.services.aws.account_provider import resolve_account_or_404
@@ -448,27 +478,26 @@ def get_optimization_recommendations(
     account_id_resolved = identity.get("account")
 
     # Phase 1 inventory scoped through the registry row when supplied.
-    from app.services.aws import clients as _clients_module
-    original = _clients_module.get_aws_client
+    from app.services.aws.clients import (
+        reset_active_account_row,
+        set_active_account_row,
+    )
 
-    def _patched(service_name: str, region: Optional[str] = None):
-        if target_row is None or target_row.is_management:
-            return factory.management_client(service_name, region=region or effective_region)
-        return factory.target_client(
-            service_name,
-            role_arn=target_row.role_arn,
-            external_id=target_row.external_id,
-            region=region or effective_region,
-        )
-
-    _clients_module.get_aws_client = _patched
+    # Bind the active row via the ContextVar so every call site that
+    # uses ``from app.services.aws.clients import get_aws_client``
+    # (resources.py, compute_optimizer.py, cost_optimization_hub.py,
+    # enrichment.py) routes through the correct session.  Bind to
+    # the management row when no row was supplied, to preserve the
+    # Phase 1/2/7A "default = management" contract exactly.
+    active_row = target_row if target_row is not None else _resolve_default_management(db)
+    token = set_active_account_row(active_row)
     try:
         phase1_services = enumerate_all_services(region=effective_region)
         utilization_by_resource = _fetch_utilization(
             region=effective_region, days=days, phase1_services=phase1_services
         )
     finally:
-        _clients_module.get_aws_client = original
+        reset_active_account_row(token)
 
     inputs = OptimizationInputs(
         region=effective_region,
@@ -496,6 +525,174 @@ def get_optimization_recommendations(
         warnings=warnings,
     )
     return response.model_dump(mode="json")
+
+
+def _all_accounts_recommendations_response(
+    db: Optional[Session],
+    *,
+    region: Optional[str],
+    days: int,
+) -> Any:
+    """Fan out across every enabled account and dedup-merge.
+
+    When ``db`` is ``None`` (synthetic unit test) we return an
+    empty aggregate so the route handler can still be called
+    without a real DB session.  This preserves the Phase 7B
+    runtime-closure invariant that every route function is
+    callable as a plain Python function (the FastAPI ``def``
+    style lets TestClient exercise the body without a session).
+    """
+    if db is None:
+        return {
+            "region": region,
+            "account_id": None,
+            "scope": "all",
+            "days": days,
+            "status": "ERROR",
+            "count": 0,
+            "recommendations": [],
+            "warnings": [],
+            "by_account": [],
+            "account_errors": [
+                {
+                    "account_id": "000000000000",
+                    "display_name": "synthetic-test",
+                    "code": "NoDatabaseSession",
+                    "message": "synthetic test invocation",
+                }
+            ],
+        }
+    from app.services.aws.account_provider import (
+        get_management_account,
+        iter_enabled_accounts,
+    )
+    from app.services.aws.optimization_aggregator import (
+        aggregate_recommendations_for_context,
+    )
+    rows = list(iter_enabled_accounts(db))
+    if not rows:
+        mgmt = get_management_account(db)
+        if mgmt is None:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={
+                    "status": "error",
+                    "error_code": "NoAccountsRegistered",
+                    "message": "no AWS accounts are registered",
+                },
+            )
+        rows = [mgmt]
+    report = asyncio.run(aggregate_recommendations_for_context(
+        rows=rows, region=region, days=days,
+    ))
+    warn_dicts = [
+        {
+            "code": w.code,
+            "message": w.message,
+            "severity": w.severity.value if hasattr(w.severity, 'value') else str(w.severity),
+            "provider": w.provider,
+        }
+        for w in report.warnings
+    ]
+    return {
+        "region": region,
+        "account_id": None,
+        "scope": "all",
+        "days": days,
+        "status": report.status,
+        "count": len(report.recommendations),
+        "recommendations": [r.model_dump(mode="json") for r in report.recommendations],
+        "warnings": warn_dicts,
+        "by_account": [
+            {"account_id": aid, "display_name": name, "count": count}
+            for aid, name, count in report.by_account
+        ],
+        "account_errors": [
+            {
+                "account_id": e.account_id,
+                "display_name": e.display_name,
+                "code": e.code,
+                "message": e.message,
+            }
+            for e in report.account_errors
+        ],
+    }
+
+
+def _all_accounts_summary_response(
+    db: Optional[Session],
+    *,
+    region: Optional[str],
+    days: int,
+) -> Any:
+    """All-accounts version of the summary endpoint."""
+    if db is None:
+        return {
+            "region": region or "all",
+            "account_id": None,
+            "scope": "all",
+            "days": days,
+            "status": "ERROR",
+            "total_recommendations": 0,
+            "by_account": [],
+            "account_errors": [
+                {
+                    "account_id": "000000000000",
+                    "display_name": "synthetic-test",
+                    "code": "NoDatabaseSession",
+                    "message": "synthetic test invocation",
+                }
+            ],
+        }
+    from app.services.aws.account_provider import (
+        get_management_account,
+        iter_enabled_accounts,
+    )
+    from app.services.aws.optimization_aggregator import (
+        aggregate_recommendations_for_context,
+    )
+    rows = list(iter_enabled_accounts(db))
+    if not rows:
+        mgmt = get_management_account(db)
+        if mgmt is None:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={
+                    "status": "error",
+                    "error_code": "NoAccountsRegistered",
+                    "message": "no AWS accounts are registered",
+                },
+            )
+        rows = [mgmt]
+    report = asyncio.run(aggregate_recommendations_for_context(
+        rows=rows, region=region, days=days,
+    ))
+    # Reuse the build_summary pipeline for the aggregate so the
+    # savings + counts match the single-account endpoint shape.
+    summary = build_summary(
+        region=region or "all",
+        account_id=None,
+        days=days,
+        recommendations=report.recommendations,
+        warnings=[],
+    )
+    payload = summary.model_dump(mode="json")
+    payload["scope"] = "all"
+    payload["account_id"] = None
+    payload["by_account"] = [
+        {"account_id": aid, "display_name": name, "count": count}
+        for aid, name, count in report.by_account
+    ]
+    payload["account_errors"] = [
+        {
+            "account_id": e.account_id,
+            "display_name": e.display_name,
+            "code": e.code,
+            "message": e.message,
+        }
+        for e in report.account_errors
+    ]
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +725,14 @@ def get_optimization_summary(
     effective_region = region or settings.aws_default_region
 
     selection = (account_id or "all").strip()
+
+    # Phase 7B: ``all`` path — fan out across every enabled
+    # account, dedup-merge, return a single aggregate summary.
+    if selection == "all":
+        return _all_accounts_summary_response(
+            db, region=effective_region, days=days,
+        )
+
     target_row = None
     if selection != "all":
         from app.services.aws.account_provider import resolve_account_or_404
@@ -568,27 +773,19 @@ def get_optimization_summary(
         )
     account_id_resolved = identity.get("account")
 
-    from app.services.aws import clients as _clients_module
-    original = _clients_module.get_aws_client
-
-    def _patched(service_name: str, region: Optional[str] = None):
-        if target_row is None or target_row.is_management:
-            return factory.management_client(service_name, region=region or effective_region)
-        return factory.target_client(
-            service_name,
-            role_arn=target_row.role_arn,
-            external_id=target_row.external_id,
-            region=region or effective_region,
-        )
-
-    _clients_module.get_aws_client = _patched
+    from app.services.aws.clients import (
+        reset_active_account_row,
+        set_active_account_row,
+    )
+    active_row = target_row if target_row is not None else _resolve_default_management(db)
+    token = set_active_account_row(active_row)
     try:
         phase1_services = enumerate_all_services(region=effective_region)
         utilization_by_resource = _fetch_utilization(
             region=effective_region, days=days, phase1_services=phase1_services
         )
     finally:
-        _clients_module.get_aws_client = original
+        reset_active_account_row(token)
 
     inputs = OptimizationInputs(
         region=effective_region,

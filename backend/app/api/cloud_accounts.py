@@ -11,7 +11,20 @@ Endpoints (ADMIN-only unless noted):
 * ``POST   /api/cloud-accounts``                  register (ADMIN)
 * ``PATCH  /api/cloud-accounts/{id}``             update metadata (ADMIN)
 * ``POST   /api/cloud-accounts/{id}/validate``    connectivity test (ADMIN)
-* ``DELETE /api/cloud-accounts/{id}``             soft-disable (ADMIN)
+* ``DELETE /api/cloud-accounts/{id}``             PERMANENT DELETE (ADMIN)
+                                                 — refuses management
+                                                 row and refuses
+                                                 enabled target rows
+                                                 (operator must first
+                                                 disable).
+
+Lifecycle (UI + backend, kept in lock-step):
+
+* Management row — ``Edit`` metadata only.  No ``Disable`` / no
+  ``Delete`` ever.
+* Enabled target row — ``Edit``, ``Validate``, ``Disable``.
+* Disabled target row — ``Edit``, ``Validate``, ``Enable``,
+  ``Delete permanently``.
 
 Security:
 
@@ -21,7 +34,7 @@ Security:
   ``ACCESS_DENIED``, ``ROLE_NOT_FOUND``, ``DISABLED``, ``ERROR``)
   with a sanitized reason.
 * RBAC is enforced via ``require_role``; frontend visibility is
-  irrelevant.
+  irrelevant.  Permanent delete is ADMIN-only.
 """
 from __future__ import annotations
 
@@ -45,8 +58,10 @@ from app.schemas.cloud_account import (
 )
 from app.services.aws.account_provider import (
     AccountAlreadyExists,
+    AccountNotDeletable,
     ManagementAccountImmutable,
     create_account,
+    delete_account,
     disable_account,
     get_account_by_id,
     list_accounts,
@@ -255,24 +270,43 @@ def validate_cloud_account(
 
 # ---------------------------------------------------------------------------
 # DELETE /api/cloud-accounts/{id}  (ADMIN)
-# Soft-disable only — the management row is immutable.
+# PERMANENT delete — only available for DISABLED target accounts.
+# Removes ONLY the registry row; never touches AWS.
 # ---------------------------------------------------------------------------
 
 
 @aws_router.delete(
     "/cloud-accounts/{account_id}",
-    summary="Soft-disable a registered cloud account (ADMIN only).",
+    summary="Permanently remove a registered cloud account (ADMIN only).",
 )
 def delete_cloud_account(
     account_id: int,
     _admin: AppUser = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Any:
+    """Permanently delete a registered account row.
+
+    Safety rules (refused with sanitized errors):
+
+    * The management account is immutable — returns ``409``
+      ``ManagementAccountImmutable``.  No IAM, no registry change.
+    * The target account must already be DISABLED.  An enabled
+      target row is refused with ``409`` ``AccountNotDeletable``
+      so an operator must explicitly click Disable first.
+    * Non-ADMIN roles are rejected by ``require_admin`` (403).
+    * Only the local ``cloud_accounts`` row is removed.  No IAM
+      change, no STS revocation, no AWS resource deletion.
+
+    Returns ``204 No Content`` on success.
+    """
     row = get_account_by_id(db, account_id)
     if row is None:
         return _row_not_found_response(account_id)
     try:
-        row = disable_account(db, row)
+        # Capture identity BEFORE deletion so we can purge cached
+        # cost rows that reference this account's id.
+        aws_account_id = row.account_id
+        delete_account(db, row)
     except ManagementAccountImmutable as exc:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
@@ -282,17 +316,35 @@ def delete_cloud_account(
                 "message": str(exc),
             },
         )
-    return CloudAccountResponse(
-        id=row.id,
-        provider=row.provider,
-        account_id=row.account_id,
-        display_name=row.display_name,
-        role_arn=row.role_arn,
-        enabled=row.enabled,
-        is_management=row.is_management,
-        preferred_region=row.preferred_region,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
+    except AccountNotDeletable as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": "error",
+                "error_code": "AccountNotDeletable",
+                "message": str(exc),
+            },
+        )
+
+    # Lifecycle hygiene: drop any cached cost rows that referenced
+    # this account so a stale response can never surface after the
+    # registry row is gone.  Purge failure is non-fatal — the
+    # entries will expire on TTL anyway, but we log a warning.
+    try:
+        from app.services.cost_cache import purge_account, purge_all
+        purge_account(aws_account_id, db=db)
+        # Drop the multi-account aggregate too — its totals are now
+        # stale (one of the contributing accounts is gone).
+        purge_all(db=db)
+    except Exception as exc:  # noqa: BLE001 - sanitized
+        logger.warning(
+            "cloud_accounts.delete.purge_failed account=%s code=%s",
+            aws_account_id, type(exc).__name__,
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_204_NO_CONTENT,
+        content=None,
     )
 
 

@@ -471,7 +471,7 @@ def get_aws_costs(
     async def _loader() -> CostReport:
         def _build():
             return aggregate_cost_report_for_period(
-                ce_client, period, prev, account_id=row.account_id
+                ce_client, period, prev, account_id=row.account_id, region=region
             )
         raw = await asyncio.to_thread(_build)
         return _pydantic_from_single(

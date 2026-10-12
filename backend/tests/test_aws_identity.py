@@ -19,8 +19,17 @@ def client():
 
 @pytest.fixture
 def fake_sts_factory(monkeypatch):
-    """Replace ``app.services.aws.identity.get_aws_client`` with a factory
+    """Replace ``app.services.aws.clients.get_aws_client`` with a factory
     that returns a MagicMock STS client capturing the region argument.
+
+    Phase 7B fix: the legacy approach monkeypatched
+    ``app.services.aws.identity.get_aws_client``, but the
+    ``identity.py`` module does ``from app.services.aws.clients
+    import get_aws_client`` which copies the reference at import
+    time, so the per-module monkeypatch never reached it.  We
+    monkeypatch the source module (``clients.py``) instead — that
+    is the module the import resolved at — so the substitution
+    sticks regardless of who is calling.
     """
     captured = {"region": None}
     client_mock = MagicMock(name="fake_sts_client")
@@ -36,7 +45,7 @@ def fake_sts_factory(monkeypatch):
         captured["service_name"] = service_name
         return client_mock
 
-    monkeypatch.setattr("app.services.aws.identity.get_aws_client", _factory)
+    monkeypatch.setattr("app.services.aws.clients.get_aws_client", _factory)
     return {"captured": captured, "set_response": _set_response, "set_error": _set_error}
 
 

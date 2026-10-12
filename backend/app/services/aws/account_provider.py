@@ -332,6 +332,50 @@ def disable_account(db: Session, row: CloudAccount) -> CloudAccount:
     return row
 
 
+class AccountNotDeletable(Exception):
+    """Raised when a caller tries to delete an account that is not deletable.
+
+    Used when an enabled target account is requested for deletion —
+    the operator must first disable it.
+    """
+
+
+def delete_account(db: Session, row: CloudAccount) -> None:
+    """Permanently remove a registered account row.
+
+    Rules (enforced here AND mirrored in the API layer):
+
+    1. The management row is immutable — refuses with
+       :class:`ManagementAccountImmutable`.
+    2. The target row must already be disabled.  We refuse an
+       enabled target row with :class:`AccountNotDeletable` to make
+       the safety boundary explicit (an operator can disable, then
+       delete in two clicks).
+    3. The row is removed from the registry.  We NEVER touch AWS:
+       no IAM change, no AssumeRole revocation, no resource
+       deletion.  Only the local ``cloud_accounts`` row goes away.
+    4. The deletion is committed before this function returns so a
+       caller observing the registry immediately afterwards sees the
+       absence.
+
+    Returns ``None``.  Raises on rejection.
+    """
+    if row.is_management:
+        raise ManagementAccountImmutable(
+            "the management account cannot be deleted"
+        )
+    if row.enabled:
+        raise AccountNotDeletable(
+            "the account must be disabled before it can be permanently deleted"
+        )
+    db.delete(row)
+    db.commit()
+    logger.info(
+        "cloud_accounts.deleted provider=%s account_id=%s id=%s",
+        row.provider, row.account_id, row.id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Identity / connectivity status
 # ---------------------------------------------------------------------------
@@ -577,6 +621,7 @@ def iter_enabled_accounts(
 __all__ = [
     "AccountAlreadyExists",
     "AccountContext",
+    "AccountNotDeletable",
     "ManagementAccountImmutable",
     "STATUS_ACCESS_DENIED",
     "STATUS_CONNECTED",
@@ -585,6 +630,7 @@ __all__ = [
     "STATUS_ROLE_NOT_FOUND",
     "bootstrap_once",
     "create_account",
+    "delete_account",
     "disable_account",
     "ensure_management_account_row",
     "get_account_by_aws_id",

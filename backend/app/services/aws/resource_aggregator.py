@@ -103,59 +103,33 @@ async def _enumerate_account(
 ) -> Dict[str, Any]:
     """Run ``enumerate_all_services`` for one account in a thread.
 
-    The ``enumerate_all_services`` helper is a synchronous function —
-    Boto3 client construction inside it is lazy, so we can hand it
-    a thread without breaking credential refresh.  Phase 7B: each
-    ``get_aws_client`` call inside ``resources.py`` now uses the
-    account-aware factory.
-    """
-    from app.services.aws.session_factory import set_default_session_factory, get_default_session_factory
-    # The default factory already wraps the management session via
-    # the Boto3 default chain.  For a target account we override the
-    # factory's target path implicitly by passing ``account_row``
-    # through a small shim: the per-service enumerators call
-    # ``get_aws_client(service, region=...)`` which delegates to the
-    # default chain.  For Phase 7B we pre-build a session-bound
-    # client and inject it via env-var override is too invasive —
-    # instead we wrap the call to pass ``account_row`` via a
-    # thread-local context.
+    Phase 7B — we bind the active account row to the
+    ``clients`` ContextVar for the duration of this call so every
+    Boto3 client built through ``clients.get_aws_client`` (including
+    the import-time-bound references in ``resources.py``,
+    ``enrichment.py``, etc.) routes through the centralised STS
+    AssumeRole session factory.  This replaces the legacy
+    monkey-patch approach which only worked for call sites that
+    re-resolved ``get_aws_client`` from the module attribute.
 
-    # For Phase 7B, the simplest correct path is: build the
-    # enumerate call by constructing clients per-service via the
-    # session factory.  Because the per-service enumerators are
-    # already importing ``get_aws_client`` from
-    # ``app.services.aws.clients``, we need to monkey-patch the
-    # factory used during this call.
-    from app.services.aws.session_factory import (
-        get_default_session_factory,
+    The ContextVar is async-loop safe (``contextvars`` are designed
+    for this — they propagate through ``await`` and
+    ``asyncio.to_thread`` without thread-pool surprise).
+    """
+    from app.services.aws.clients import (
+        reset_active_account_row,
+        set_active_account_row,
     )
     from app.services.aws.resources import enumerate_all_services
 
-    factory = get_default_session_factory()
-    # Build a closure that injects ``account_row`` into the per-call
-    # client factory.  We do this by swapping the active factory for
-    # the duration of the call, with a thread-local guard.
-    from app.services.aws import clients as _clients_module
-    original_get_aws_client = _clients_module.get_aws_client
-
-    def _patched_get_aws_client(service_name, region=None):
-        if row.is_management:
-            return factory.management_client(service_name, region=region)
-        return factory.target_client(
-            service_name,
-            role_arn=row.role_arn,
-            external_id=row.external_id,
-            region=region or row.preferred_region,
-        )
-
-    _clients_module.get_aws_client = _patched_get_aws_client
+    token = set_active_account_row(row)
     try:
         return {
             name: result.model_dump(mode="json")
             for name, result in enumerate_all_services(region=region or row.preferred_region).items()
         }
     finally:
-        _clients_module.get_aws_client = original_get_aws_client
+        reset_active_account_row(token)
 
 
 async def aggregate_inventory_for_context(

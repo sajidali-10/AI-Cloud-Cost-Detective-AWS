@@ -431,9 +431,32 @@ def _sum_unblended_cost(results_by_time: List[dict[str, Any]]) -> Decimal:
 # ---------------------------------------------------------------------------
 
 
+def _region_filter(region: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return a Cost Explorer ``Filter`` dict scoped to ``region``.
+
+    ``None`` means "no region filter" (account-level totals).  A
+    concrete region string (e.g. ``"us-east-1"``) produces a
+    ``Filter.Dimensions`` element on ``REGION`` so Cost Explorer
+    scopes the entire response to that region — Total, daily
+    trend, by-service, and by-region all reflect ONLY that region.
+
+    This is the Phase 7B fix for the "Cost page region selector
+    changes UI but not data" defect: prior to this, the
+    ``region`` parameter only changed the Boto3 client's signing
+    endpoint, but Cost Explorer is global and ignores the
+    client-region dimension — every request returned account-wide
+    totals regardless of the selected region.
+    """
+    if not region:
+        return None
+    return {"Dimensions": {"Key": "REGION", "Values": [region]}}
+
+
 def get_total_and_previous(
     client: BaseClient,
     period: CostPeriod,
+    *,
+    region: Optional[str] = None,
 ) -> Tuple[Decimal, Decimal]:
     """Return ``(current_total, previous_total)`` as ``Decimal``.
 
@@ -441,16 +464,23 @@ def get_total_and_previous(
     and no group-by; the response's ``Total`` field gives us the
     current period's spend, and a second call with the previous
     period gives the comparison.
+
+    When ``region`` is supplied, a ``Filter`` on ``REGION`` is
+    applied so the totals reflect ONLY that region.  Omitting
+    ``region`` preserves Phase 2 account-level behaviour.
     """
     cur_str = period.to_ce_strings()
     prev = previous_period(period)
     prev_str = prev.to_ce_strings()
 
+    region_filter = _region_filter(region)
     base = {
         "TimePeriod": {"Start": cur_str[0], "End": cur_str[1]},
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
     }
+    if region_filter is not None:
+        base["Filter"] = region_filter
     pages = list(_paginate(client=client, method_name="get_cost_and_usage", base_kwargs=base))
     current_total = _sum_unblended_cost(pages[0].get("ResultsByTime", []) if pages else [])
 
@@ -459,6 +489,8 @@ def get_total_and_previous(
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
     }
+    if region_filter is not None:
+        base_prev["Filter"] = region_filter
     pages_prev = list(
         _paginate(client=client, method_name="get_cost_and_usage", base_kwargs=base_prev)
     )
@@ -471,14 +503,23 @@ def get_total_and_previous(
 def get_daily_trend(
     client: BaseClient,
     period: CostPeriod,
+    *,
+    region: Optional[str] = None,
 ) -> List[Tuple[date, Decimal, str]]:
-    """Return ``[(date, amount, unit), ...]`` at DAILY granularity."""
+    """Return ``[(date, amount, unit), ...]`` at DAILY granularity.
+
+    When ``region`` is supplied, a REGION ``Filter`` is applied so
+    every daily point reflects only that region.
+    """
     cur_str = period.to_ce_strings()
     base = {
         "TimePeriod": {"Start": cur_str[0], "End": cur_str[1]},
         "Granularity": "DAILY",
         "Metrics": [COST_METRIC],
     }
+    region_filter = _region_filter(region)
+    if region_filter is not None:
+        base["Filter"] = region_filter
     out: List[Tuple[date, Decimal, str]] = []
     unit: str = "USD"
     for response in _paginate(client=client, method_name="get_cost_and_usage", base_kwargs=base):
@@ -499,8 +540,15 @@ def get_daily_trend(
 def get_by_service(
     client: BaseClient,
     period: CostPeriod,
+    *,
+    region: Optional[str] = None,
 ) -> List[Tuple[str, Decimal, str]]:
-    """Return ``[(service_name, amount, unit), ...]`` grouped by SERVICE."""
+    """Return ``[(service_name, amount, unit), ...]`` grouped by SERVICE.
+
+    When ``region`` is supplied, the entire response is scoped to
+    that region via a REGION ``Filter`` so by-service totals
+    reflect only that region.
+    """
     cur_str = period.to_ce_strings()
     base = {
         "TimePeriod": {"Start": cur_str[0], "End": cur_str[1]},
@@ -508,18 +556,28 @@ def get_by_service(
         "GroupBy": [{"Type": "DIMENSION", "Key": "SERVICE"}],
         "Metrics": [COST_METRIC],
     }
+    region_filter = _region_filter(region)
+    if region_filter is not None:
+        base["Filter"] = region_filter
     return _aggregate_grouped(client, base)
 
 
 def get_by_region(
     client: BaseClient,
     period: CostPeriod,
+    *,
+    region: Optional[str] = None,
 ) -> List[Tuple[str, Decimal, str]]:
     """Return ``[(region_name, amount, unit), ...]`` grouped by REGION.
 
     Some services (e.g. global ones) report ``no_region``.  We keep
     that key verbatim so callers can decide whether to surface it or
     drop it from the report.
+
+    When ``region`` is supplied, the response is pre-scoped to that
+    single region so the only Group returned will match (or, when
+    the region had zero spend, the response will be empty and the
+    caller renders explicit zero / no-data).
     """
     cur_str = period.to_ce_strings()
     base = {
@@ -528,6 +586,9 @@ def get_by_region(
         "GroupBy": [{"Type": "DIMENSION", "Key": "REGION"}],
         "Metrics": [COST_METRIC],
     }
+    region_filter = _region_filter(region)
+    if region_filter is not None:
+        base["Filter"] = region_filter
     return _aggregate_grouped(client, base)
 
 
@@ -617,18 +678,24 @@ def aggregate_cost_report_for_period(
     previous: CostPeriod,
     *,
     account_id: Optional[str] = None,  # reserved for future enrichment
+    region: Optional[str] = None,
 ) -> CostReport:
     """Phase 7A — Compose the report for an explicit ``CostPeriod``.
 
     The previous-period total is fetched from ``previous`` so the
     caller can supply a matched MTD window or an equal-length
     preceding range.
+
+    Phase 7B: when ``region`` is supplied, the REGION ``Filter`` is
+    applied to every Cost Explorer call so total, daily, by-service,
+    and by-region all reflect only that region.  Omitting ``region``
+    preserves the Phase 2 account-level behaviour.
     """
-    current_total, _ = get_total_and_previous(client, period)
-    _, previous_total = get_total_and_previous(client, previous)
-    daily = get_daily_trend(client, period)
-    by_service = get_by_service(client, period)
-    by_region = get_by_region(client, period)
+    current_total, _ = get_total_and_previous(client, period, region=region)
+    _, previous_total = get_total_and_previous(client, previous, region=region)
+    daily = get_daily_trend(client, period, region=region)
+    by_service = get_by_service(client, period, region=region)
+    by_region = get_by_region(client, period, region=region)
     unit = "USD"
     if daily and daily[0][2]:
         unit = daily[0][2]

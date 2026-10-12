@@ -334,10 +334,68 @@ def maybe_collect_garbage(
     return deleted
 
 
+def purge_account(aws_account_id: str, *, db: Optional[Session] = None) -> int:
+    """Drop every cached cost row that names ``aws_account_id``.
+
+    Called when a target account is disabled or permanently deleted
+    so a stale cost response from a no-longer-registered account can
+    never surface to the UI.  Only ``scope="acct:<id>"`` rows are
+    matched — the storage_account_id is the natural primary key, so
+    an exact equality match is both safe and unambiguous.
+
+    Returns the number of rows deleted.  Safe to call from a request
+    handler that does not own a session.
+    """
+    own = db is None
+    session = db or SessionLocal()
+    try:
+        # Phase 7B storage shape: storage_account_id is
+        # ``"<scope>:<aws-account-id>"``.  Match the trailing segment
+        # exactly so we don't accidentally hit sibling account IDs
+        # by accident (a LIKE suffix would be too greedy).
+        target = f"acct:{aws_account_id}"
+        result = session.execute(
+            delete(CostCache).where(CostCache.account_id == target)
+        )
+        session.commit()
+        deleted = int(result.rowcount or 0)
+        if deleted:
+            logger.info(
+                "cost cache PURGE account=%s deleted=%d rows",
+                aws_account_id, deleted,
+            )
+        return deleted
+    finally:
+        if own:
+            session.close()
+
+
+def purge_all(*, db: Optional[Session] = None) -> int:
+    """Drop every cost cache row.
+
+    Used as a paranoia hammer for destructive lifecycle events
+    (permanent delete) where we want a clean slate.
+    """
+    own = db is None
+    session = db or SessionLocal()
+    try:
+        result = session.execute(delete(CostCache))
+        session.commit()
+        deleted = int(result.rowcount or 0)
+        if deleted:
+            logger.info("cost cache PURGE_ALL deleted=%d rows", deleted)
+        return deleted
+    finally:
+        if own:
+            session.close()
+
+
 __all__ = [
     "DEFAULT_GC_BATCH",
     "DEFAULT_GC_PROBABILITY",
     "DEFAULT_TTL_SECONDS",
     "get_or_refresh",
     "maybe_collect_garbage",
+    "purge_account",
+    "purge_all",
 ]

@@ -102,7 +102,7 @@ function statusTone(status: string | undefined): StatusTone {
 
 export function AccountsPage() {
   const { ready: authReady, user } = useAuth()
-  const { selection, refreshAccounts } = useAccountContext()
+  const { selection, refreshAccounts, setSelection } = useAccountContext()
   const [accounts, setAccounts] = useState<CloudAccount[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -114,7 +114,8 @@ export function AccountsPage() {
   const [statusById, setStatusById] = useState<Record<number, ValidateStatus>>({})
   const [busyId, setBusyId] = useState<number | null>(null)
   const [pendingDisable, setPendingDisable] = useState<CloudAccount | null>(null)
-  const [feedback, setFeedback] = useState<{ kind: 'enable' | 'disable' | 'create' | 'update'; text: string } | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<CloudAccount | null>(null)
+  const [feedback, setFeedback] = useState<{ kind: 'enable' | 'disable' | 'create' | 'update' | 'delete'; text: string } | null>(null)
   const feedbackTimerRef = useRef<number | null>(null)
 
   const canFetch = authReady && user !== null
@@ -151,7 +152,7 @@ export function AccountsPage() {
     }
   }, [])
 
-  function flashFeedback(kind: 'enable' | 'disable' | 'create' | 'update', text: string) {
+  function flashFeedback(kind: 'enable' | 'disable' | 'create' | 'update' | 'delete', text: string) {
     setFeedback({ kind, text })
     if (feedbackTimerRef.current !== null) {
       window.clearTimeout(feedbackTimerRef.current)
@@ -240,6 +241,37 @@ export function AccountsPage() {
         enabled ? 'enable' : 'disable',
         `${row.display_name} ${enabled ? 'enabled' : 'disabled'}`,
       )
+      await refresh()
+      void refreshAccounts()
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  async function permanentlyDelete(row: CloudAccount) {
+    if (!canFetch) return
+    if (row.is_management) return  // defence in depth — backend also refuses
+    if (row.enabled) return  // defence in depth — backend also refuses
+    setBusyId(row.id)
+    try {
+      await apiFetch(`/api/aws/cloud-accounts/${row.id}`, {
+        method: 'DELETE',
+      })
+      flashFeedback(
+        'delete',
+        `${row.display_name} permanently deleted`,
+      )
+      // If the deleted account was the active selection, fall
+      // back to a safe default so the rest of the UI doesn't
+      // ask for data on a non-existent account.
+      if (selection === `acct:${row.id}`) {
+        // The selector only ever exposes enabled rows, so deleting
+        // an enabled row was already blocked above.  We still
+        // switch back to "all" defensively.
+        setSelection('all')
+      }
       await refresh()
       void refreshAccounts()
     } catch (err) {
@@ -583,15 +615,26 @@ export function AccountsPage() {
                             Disable
                           </button>
                         ) : (
-                          <button
-                            type="button"
-                            onClick={() => void setEnabled(row, true)}
-                            disabled={busyId === row.id}
-                            data-testid={`enable-${row.id}`}
-                            className="rounded border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
-                          >
-                            Enable
-                          </button>
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void setEnabled(row, true)}
+                              disabled={busyId === row.id}
+                              data-testid={`enable-${row.id}`}
+                              className="rounded border border-emerald-300 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-50 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-900/40"
+                            >
+                              Enable
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPendingDelete(row)}
+                              disabled={busyId === row.id}
+                              data-testid={`delete-${row.id}`}
+                              className="rounded border border-rose-400 px-2 py-1 text-xs font-semibold text-rose-700 hover:bg-rose-50 disabled:opacity-50 dark:border-rose-600 dark:text-rose-300 dark:hover:bg-rose-900/40"
+                            >
+                              Delete
+                            </button>
+                          </>
                         ))}
                     </div>
                   </td>
@@ -772,6 +815,68 @@ export function AccountsPage() {
                 data-testid="disable-confirm-confirm"
               >
                 Disable account
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingDelete && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-confirm-title"
+          data-testid="delete-confirm-modal"
+          className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 px-4 py-8 dark:bg-slate-900/60"
+        >
+          <div className="w-full max-w-md rounded-lg border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800">
+            <h3
+              id="delete-confirm-title"
+              data-testid="delete-confirm-title"
+              className="text-lg font-semibold text-rose-700 dark:text-rose-300"
+            >
+              Permanently delete {pendingDelete.display_name}?
+            </h3>
+            <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">
+              Account <span className="font-mono">{pendingDelete.account_id}</span> will be{' '}
+              <strong className="text-rose-700 dark:text-rose-300">
+                permanently removed
+              </strong>{' '}
+              from the registry. This action cannot be undone.
+            </p>
+            <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-900/40 dark:text-amber-100">
+              <p className="font-semibold">Important</p>
+              <p className="mt-1">
+                Only the registry metadata (display name, role ARN,
+                external ID) is removed. Nothing is changed in AWS — no
+                IAM policy, no role, no resource is deleted. To revoke
+                access, you must do so in AWS separately.
+              </p>
+            </div>
+            <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+              The account must already be disabled. The management
+              account cannot be deleted.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingDelete(null)}
+                className="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 dark:border-slate-600 dark:hover:bg-slate-700"
+                data-testid="delete-confirm-cancel"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  const row = pendingDelete
+                  setPendingDelete(null)
+                  await permanentlyDelete(row)
+                }}
+                className="rounded-md bg-rose-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-rose-700"
+                data-testid="delete-confirm-confirm"
+              >
+                Permanently delete
               </button>
             </div>
           </div>
