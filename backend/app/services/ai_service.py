@@ -121,7 +121,6 @@ async def _gather_async(
     # Lazy imports keep the module importable in environments where
     # the AWS-side service modules raise at import time (e.g. tests
     # that stub out boto3).
-    from app.api.aws_costs import _build_cache_key, _to_pydantic_report
     from app.api.aws_optimization import (
         _fetch_utilization_async,
         _resolve_identity,
@@ -132,6 +131,7 @@ async def _gather_async(
     )
     from app.services.aws.resources import enumerate_all_services
     from app.services.cost_cache import get_or_refresh
+    from app.services.cost_report_converter import to_pydantic_cost_report
     from app.services.optimization_engine import (
         OptimizationInputs,
         build_capabilities,
@@ -146,11 +146,13 @@ async def _gather_async(
     if identity is not None:
         try:
             ce_client = get_cost_explorer_client(region=region)
-            cache_key = _build_cache_key(days=days)
+            # Local cache-key derivation — keeps the AI service
+            # independent of the API route's private helpers.
+            cache_key = f"ai_cost|v1|region={region}|days={days}"
 
             async def _loader() -> CostReport:
                 raw = await asyncio.to_thread(aggregate_cost_report, ce_client, days)
-                return _to_pydantic_report(raw, account_id=account_id)
+                return to_pydantic_cost_report(raw, account_id=account_id or "")
 
             cached = await get_or_refresh(
                 account_id=account_id, cache_key=cache_key, loader=_loader

@@ -23,11 +23,17 @@ os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 # non-placeholder JWT secret.  We default ``AUTH_ENABLED`` to False
 # so existing Phase 0-4 tests are untouched; tests that opt in set
 # ``AUTH_ENABLED=true`` and rely on this secret.
+#
+# We deliberately OVERWRITE (not ``setdefault``) the operator's
+# container env (``AUTH_ENABLED=true`` in production) so Phase 0-4
+# tests that pre-date Phase 5A continue to run with anonymous
+# access.  Phase 5A opt-in tests use ``monkeypatch.setenv`` which
+# scopes the override to a single test.
 _TEST_JWT_SECRET = (
     "test-jwt-secret-do-not-use-in-production-"
     "0123456789abcdef0123456789abcdef"
 )
-os.environ.setdefault("AUTH_ENABLED", "false")
+os.environ["AUTH_ENABLED"] = "false"
 os.environ.setdefault("JWT_SECRET", _TEST_JWT_SECRET)
 
 

@@ -51,7 +51,17 @@ def test_required_env_var_reported_when_missing() -> None:
     assert payload["provider_configured"] is False
 
 
-def test_alias_is_cost_analyst() -> None:
+def test_alias_is_cost_analyst(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The documented project alias is ``cost-analyst``.
+
+    This pins the *code default* of :class:`Settings.litellm_model`.
+    Operators MAY override the alias via ``LITELLM_MODEL`` to point at
+    a different alias resolved by ``litellm/config.yaml`` — the
+    override is intentional and is not asserted here.  The
+    ``cost-analyst`` alias is what the application code resolves
+    out-of-the-box when no override is supplied.
+    """
+    monkeypatch.delenv("LITELLM_MODEL", raising=False)
     from app.core.config import get_settings
 
     assert get_settings().litellm_model == "cost-analyst"

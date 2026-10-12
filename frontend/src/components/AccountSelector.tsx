@@ -52,12 +52,12 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-800 shadow-sm hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+        className="inline-flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary shadow-sm hover:bg-surface-hover"
         aria-haspopup="listbox"
         aria-expanded={open}
         data-testid="account-selector-button"
       >
-        <span className="text-slate-500 dark:text-slate-400">AWS Account:</span>
+        <span className="text-fg-muted">AWS Account:</span>
         <span className="font-semibold">{label}</span>
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -76,7 +76,7 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
       {open && (
         <ul
           role="listbox"
-          className="absolute right-0 z-30 mt-1 max-h-72 w-72 overflow-auto rounded-md border border-slate-200 bg-white py-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-800"
+          className="absolute right-0 z-30 mt-1 max-h-72 w-72 overflow-auto rounded-md border border-border bg-surface py-1 text-sm shadow-lg"
           data-testid="account-selector-menu"
         >
           <li>
@@ -87,19 +87,19 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
               onClick={() => pick('all')}
               className={`flex w-full items-center justify-between px-3 py-2 text-left ${
                 selection === 'all'
-                  ? 'bg-sky-50 text-sky-800 dark:bg-sky-900/40 dark:text-sky-100'
-                  : 'text-slate-800 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-700'
+                  ? 'bg-info-soft text-info'
+                  : 'text-fg-primary hover:bg-surface-hover'
               }`}
               data-testid="account-option-all"
             >
               <span className="font-semibold">All AWS Accounts</span>
-              <span className="text-xs text-slate-500 dark:text-slate-400">
+              <span className="text-xs text-fg-muted">
                 {accounts.length} registered
               </span>
             </button>
           </li>
           {accounts.length > 0 && (
-            <li className="my-1 border-t border-slate-200 dark:border-slate-700" />
+            <li className="my-1 border-t border-border" />
           )}
           {accounts.map((acc) => {
             const value = `acct:${acc.id}` as AccountSelection
@@ -112,14 +112,14 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
                   onClick={() => pick(value)}
                   className={`flex w-full items-center justify-between px-3 py-2 text-left ${
                     selection === value
-                      ? 'bg-sky-50 text-sky-800 dark:bg-sky-900/40 dark:text-sky-100'
-                      : 'text-slate-800 hover:bg-slate-50 dark:text-slate-100 dark:hover:bg-slate-700'
+                      ? 'bg-info-soft text-info'
+                      : 'text-fg-primary hover:bg-surface-hover'
                   }`}
                   data-testid={`account-option-${acc.id}`}
                 >
                   <span className="flex flex-col">
                     <span className="font-semibold">{acc.display_name}</span>
-                    <span className="text-xs text-slate-500 dark:text-slate-400">
+                    <span className="text-xs text-fg-muted">
                       {acc.account_id}
                       {acc.is_management ? ' · management' : ''}
                     </span>
@@ -129,17 +129,17 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
             )
           })}
           {!loading && accounts.length === 0 && (
-            <li className="px-3 py-2 text-xs text-slate-500 dark:text-slate-400">
+            <li className="px-3 py-2 text-xs text-fg-muted">
               No accounts registered yet. Ask an ADMIN to add one.
             </li>
           )}
           {loading && (
-            <li className="px-3 py-2 text-xs text-slate-500 dark:text-slate-400">
+            <li className="px-3 py-2 text-xs text-fg-muted">
               Loading accounts…
             </li>
           )}
           {error && (
-            <li className="px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
+            <li className="px-3 py-2 text-xs text-danger">
               {error}
             </li>
           )}

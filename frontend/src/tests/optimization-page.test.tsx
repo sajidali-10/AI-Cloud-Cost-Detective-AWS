@@ -5,6 +5,7 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
 import { AuthProvider } from '../lib/auth'
+import { AccountProvider } from '../lib/accountContext'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
@@ -20,7 +21,9 @@ function wrapRoutes(node: React.ReactNode) {
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+          <AccountProvider>
+            <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+          </AccountProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>,

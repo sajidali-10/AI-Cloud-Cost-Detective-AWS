@@ -14,24 +14,79 @@ from app.main import app
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    """Return a ``TestClient`` with a management account seeded.
+
+    Phase 7B: the identity route looks up the management row via
+    :func:`get_management_account`.  Without one, the route
+    returns 404 and every test fails.  We seed an in-memory SQLite
+    via the same dependency override other Phase 7B tests use.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app.core.config import get_settings
+    from app.db.models import Base, CloudAccount
+    from app.db.session import get_db
+
+    get_settings.cache_clear()
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        future=True,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False, expire_on_commit=False
+    )
+    db = SessionLocal()
+    try:
+        db.add(CloudAccount(
+            account_id="000000000000",
+            display_name="Management",
+            provider="AWS",
+            role_arn="arn:aws:iam::000000000000:role/Management",
+            external_id=None,
+            preferred_region="us-east-1",
+            enabled=True,
+            is_management=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    def _override_get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture
 def fake_sts_factory(monkeypatch):
-    """Replace ``app.services.aws.clients.get_aws_client`` with a factory
-    that returns a MagicMock STS client capturing the region argument.
+    """Replace the AWS session factory with a stub for the duration
+    of one test.
 
-    Phase 7B fix: the legacy approach monkeypatched
-    ``app.services.aws.identity.get_aws_client``, but the
-    ``identity.py`` module does ``from app.services.aws.clients
-    import get_aws_client`` which copies the reference at import
-    time, so the per-module monkeypatch never reached it.  We
-    monkeypatch the source module (``clients.py``) instead — that
-    is the module the import resolved at — so the substitution
-    sticks regardless of who is calling.
+    Phase 7B: the identity route resolves a :class:`boto3.Session`
+    via :func:`get_default_session_factory().management_session()`
+    (or :func:`target_session`) and then calls ``.client('sts',
+    region_name=...)``.  We replace the *factory accessor* with a
+    stub whose management session returns a session whose
+    ``.client(...)`` returns a :class:`MagicMock` STS client that
+    captures the region argument.  This is the only correct Phase
+    7B seam: the route code does NOT call :func:`get_aws_client`
+    directly anymore — it goes through the factory.
     """
-    captured = {"region": None}
+    captured = {"region": None, "service_name": None}
     client_mock = MagicMock(name="fake_sts_client")
 
     def _set_response(payload):
@@ -40,12 +95,31 @@ def fake_sts_factory(monkeypatch):
     def _set_error(exc):
         client_mock.get_caller_identity.side_effect = exc
 
-    def _factory(service_name, region=None):
-        captured["region"] = region
+    fake_session = MagicMock(name="fake_boto3_session")
+
+    def _client(service_name, *args, **kwargs):
+        captured["region"] = kwargs.get("region_name")
         captured["service_name"] = service_name
         return client_mock
 
-    monkeypatch.setattr("app.services.aws.clients.get_aws_client", _factory)
+    fake_session.client.side_effect = _client
+
+    fake_factory = MagicMock(name="fake_session_factory")
+    fake_factory.management_session.return_value = fake_session
+    fake_factory.target_session.return_value = fake_session
+
+    # Patch the binding used by ``app.api.aws``.  We also patch the
+    # ``app.services.aws.session_factory`` module attribute so any
+    # other call site picks up the same stub.
+    monkeypatch.setattr(
+        "app.api.aws.get_default_session_factory",
+        lambda: fake_factory,
+    )
+    monkeypatch.setattr(
+        "app.services.aws.session_factory.get_default_session_factory",
+        lambda: fake_factory,
+    )
+
     return {"captured": captured, "set_response": _set_response, "set_error": _set_error}
 
 

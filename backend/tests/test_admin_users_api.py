@@ -315,6 +315,28 @@ def test_role_change_does_not_affect_existing_tokens(
     _enable_auth(monkeypatch)
     _seed(client, sqlite_engine, email="admin@x.com", password="password-1234", role="ADMIN")
     _seed(client, sqlite_engine, email="analyst@x.com", password="password-1234", role="ANALYST")
+    # Seed a management account so the ``/aws/identity`` route does
+    # not short-circuit with 404 in the SQLite test environment.
+    SessionLocal = sessionmaker(
+        bind=sqlite_engine,
+        autoflush=False, autocommit=False, expire_on_commit=False,
+    )
+    db = SessionLocal()
+    try:
+        from app.db.models import CloudAccount
+        db.add(CloudAccount(
+            account_id="000000000000",
+            display_name="Management",
+            provider="AWS",
+            role_arn="arn:aws:iam::000000000000:role/Management",
+            external_id=None,
+            preferred_region="us-east-1",
+            enabled=True,
+            is_management=True,
+        ))
+        db.commit()
+    finally:
+        db.close()
 
     analyst_token = _login(client, email="analyst@x.com", password="password-1234")
     # AI allowed for ANALYST
@@ -334,8 +356,13 @@ def test_role_change_does_not_affect_existing_tokens(
         json={"role": "VIEWER"},
     )
 
-    # Analyst re-uses their old token to hit an AI endpoint.
-    # Authorization re-loads role from DB -> VIEWER -> 403.
+    # Analyst re-uses their old token to hit a Phase 7B read endpoint.
+    # The token still authenticates (Phase 5A does not revoke),
+    # and the route accepts VIEWER; what matters here is that
+    # authorization is re-evaluated against the *DB* role on every
+    # request — so a future route restricted to ANALYST would now
+    # return 403 with the demoted user.
+    #
     # We don't call AI generation (it would also need to be reachable),
     # but the role check happens at the dependency layer.
     # Use a dependency-protected AWS read endpoint to check role.
@@ -344,4 +371,12 @@ def test_role_change_does_not_affect_existing_tokens(
         headers=_bearer(analyst_token),
     )
     # AWS read endpoints accept VIEWER so this should still work.
-    assert r.status_code in (200, 502)  # 502 = AWS call failed in test env
+    # 200 = identity probe succeeded (no AWS creds -> management row,
+    # which the test environment seeds with no role_arn so the probe
+    # falls through to the Boto3 default chain; the live call may
+    # either succeed against test fixtures or surface a 502 from the
+    # sanitized AWS error handler). 401 would mean the token was
+    # rejected — which would break the documented Phase 5A contract.
+    assert r.status_code in (200, 502), (
+        f"old analyst token must still authenticate; got {r.status_code}: {r.text}"
+    )

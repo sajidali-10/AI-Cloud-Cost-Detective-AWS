@@ -191,7 +191,6 @@ account.  Do **not** add mutation actions.
       "Sid": "Phase7BCostOptimizationHub",
       "Effect": "Allow",
       "Action": [
-        "cost-optimization-hub:GetEnrollmentStatus",
         "cost-optimization-hub:ListEnrollmentStatuses",
         "cost-optimization-hub:GetRecommendation",
         "cost-optimization-hub:ListRecommendations",
