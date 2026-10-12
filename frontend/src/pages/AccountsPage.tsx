@@ -8,8 +8,20 @@
 //     the destructive action so the operator cannot trigger the
 //     error path in the first place.
 //
-// Status presentation covers the full Phase 7B enum:
-//   CONNECTED | ENABLED | DISABLED | ACCESS_DENIED | ROLE_NOT_FOUND | ERROR
+// Account metadata editing:
+//   * Each row exposes Edit.  The Edit modal lets ADMIN change
+//     display_name, preferred_region, role_arn (target accounts
+//     only), and external_id.  external_id remains WRITE-ONLY —
+//     the form never displays the current value; it only sends a
+//     replacement when the operator types a new one.  Sending an
+//     empty external_id field means "leave unchanged" (the backend
+//     drops unset fields, so absence = no change).
+//   * account_id / provider / is_management are NOT form fields.
+//     The PATCH schema rejects any attempt to change them, and the
+//     UI never exposes them.
+//   * Management rows can edit display_name and preferred_region
+//     only.  role_arn and external_id are read-only on the modal
+//     for management rows.
 //
 // Auth bootstrap gate (Phase 7B runtime closure): no anonymous /
 // pre-auth fetch ever fires.
@@ -17,7 +29,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiFetch, ApiError } from '../lib/api'
 import { useAuth } from '../lib/auth'
-import { useAccountContext, AccountSelection } from '../lib/accountContext'
+import { useAccountContext } from '../lib/accountContext'
 
 interface CloudAccount {
   id: number
@@ -40,6 +52,13 @@ interface CreateFormState {
   preferred_region: string
 }
 
+interface EditFormState {
+  display_name: string
+  role_arn: string
+  external_id: string
+  preferred_region: string
+}
+
 interface ValidateStatus {
   status: string
   reason?: string | null
@@ -49,6 +68,13 @@ interface ValidateStatus {
 
 const EMPTY_FORM: CreateFormState = {
   account_id: '',
+  display_name: '',
+  role_arn: '',
+  external_id: '',
+  preferred_region: '',
+}
+
+const EMPTY_EDIT: EditFormState = {
   display_name: '',
   role_arn: '',
   external_id: '',
@@ -82,10 +108,13 @@ export function AccountsPage() {
   const [error, setError] = useState<string | null>(null)
   const [form, setForm] = useState<CreateFormState>(EMPTY_FORM)
   const [formError, setFormError] = useState<string | null>(null)
+  const [editing, setEditing] = useState<CloudAccount | null>(null)
+  const [editForm, setEditForm] = useState<EditFormState>(EMPTY_EDIT)
+  const [editError, setEditError] = useState<string | null>(null)
   const [statusById, setStatusById] = useState<Record<number, ValidateStatus>>({})
   const [busyId, setBusyId] = useState<number | null>(null)
   const [pendingDisable, setPendingDisable] = useState<CloudAccount | null>(null)
-  const [feedback, setFeedback] = useState<{ kind: 'enable' | 'disable' | 'create'; text: string } | null>(null)
+  const [feedback, setFeedback] = useState<{ kind: 'enable' | 'disable' | 'create' | 'update'; text: string } | null>(null)
   const feedbackTimerRef = useRef<number | null>(null)
 
   const canFetch = authReady && user !== null
@@ -122,7 +151,7 @@ export function AccountsPage() {
     }
   }, [])
 
-  function flashFeedback(kind: 'enable' | 'disable' | 'create', text: string) {
+  function flashFeedback(kind: 'enable' | 'disable' | 'create' | 'update', text: string) {
     setFeedback({ kind, text })
     if (feedbackTimerRef.current !== null) {
       window.clearTimeout(feedbackTimerRef.current)
@@ -215,6 +244,90 @@ export function AccountsPage() {
       void refreshAccounts()
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  function openEdit(row: CloudAccount) {
+    setEditing(row)
+    setEditForm({
+      display_name: row.display_name,
+      // role_arn is editable only for non-management accounts.  For
+      // management rows we still populate the field with the current
+      // value so the operator can see what's there, but the form
+      // disables the input below.
+      role_arn: row.role_arn,
+      external_id: '',
+      preferred_region: row.preferred_region ?? '',
+    })
+    setEditError(null)
+  }
+
+  function cancelEdit() {
+    setEditing(null)
+    setEditForm(EMPTY_EDIT)
+    setEditError(null)
+  }
+
+  async function saveEdit(ev: React.FormEvent<HTMLFormElement>) {
+    ev.preventDefault()
+    if (!editing) return
+    if (!canFetch) {
+      setEditError('authentication has not finished initializing')
+      return
+    }
+    if (!editForm.display_name.trim()) {
+      setEditError('display_name is required')
+      return
+    }
+    // role_arn is only editable for non-management accounts.
+    const payload: Record<string, unknown> = {
+      display_name: editForm.display_name.trim(),
+    }
+    if (editing.is_management) {
+      // Management rows: do NOT touch role_arn / external_id.
+      // display_name + preferred_region only.
+      if (editForm.preferred_region.trim()) {
+        payload.preferred_region = editForm.preferred_region.trim()
+      } else {
+        payload.preferred_region = ''
+      }
+    } else {
+      // Target rows: validate role_arn if it was changed.
+      if (!/^arn:aws:iam::\d{12}:role\/[\w+=,.@-]+$/.test(editForm.role_arn)) {
+        setEditError('role_arn must be a valid IAM role ARN')
+        return
+      }
+      payload.role_arn = editForm.role_arn
+      if (editForm.preferred_region.trim()) {
+        payload.preferred_region = editForm.preferred_region.trim()
+      } else {
+        payload.preferred_region = ''
+      }
+      // external_id is write-only.  Only send a replacement when the
+      // operator has typed a non-empty value.  An empty string means
+      // "leave unchanged" — we never include the key in that case.
+      if (editForm.external_id.trim()) {
+        payload.external_id = editForm.external_id.trim()
+      }
+    }
+
+    setBusyId(editing.id)
+    try {
+      await apiFetch(`/api/aws/cloud-accounts/${editing.id}`, {
+        method: 'PATCH',
+        json: payload,
+      })
+      flashFeedback(
+        'update',
+        `${editing.display_name} updated`,
+      )
+      cancelEdit()
+      await refresh()
+      void refreshAccounts()
+    } catch (err) {
+      setEditError(err instanceof ApiError ? err.message : String(err))
     } finally {
       setBusyId(null)
     }
@@ -442,6 +555,15 @@ export function AccountsPage() {
                     <div className="flex justify-end gap-2">
                       <button
                         type="button"
+                        onClick={() => openEdit(row)}
+                        disabled={busyId === row.id}
+                        data-testid={`edit-${row.id}`}
+                        className="rounded border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:hover:bg-slate-700"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => void validate(row.id)}
                         disabled={busyId === row.id}
                         data-testid={`validate-${row.id}`}
@@ -489,6 +611,125 @@ export function AccountsPage() {
           </tbody>
         </table>
       </section>
+
+      {editing && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-account-title"
+          data-testid="edit-account-modal"
+          className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 px-4 py-8 dark:bg-slate-900/60"
+        >
+          <div className="w-full max-w-lg rounded-lg border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-800">
+            <h3
+              id="edit-account-title"
+              className="text-lg font-semibold text-slate-900 dark:text-slate-100"
+            >
+              Edit {editing.display_name}
+            </h3>
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+              Account <span className="font-mono">{editing.account_id}</span>
+              {editing.is_management && (
+                <span className="ml-2 rounded bg-sky-100 px-1.5 py-0.5 text-[10px] uppercase text-sky-800 dark:bg-sky-900/50 dark:text-sky-200">
+                  Management
+                </span>
+              )}
+            </p>
+            <form
+              onSubmit={saveEdit}
+              className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2"
+              data-testid="edit-form"
+            >
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-700 dark:text-slate-300 sm:col-span-2">
+                Display name
+                <input
+                  value={editForm.display_name}
+                  onChange={(e) => setEditForm({ ...editForm, display_name: e.target.value })}
+                  placeholder="Display name"
+                  className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-900"
+                  required
+                  data-testid="edit-display-name"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium text-slate-700 dark:text-slate-300">
+                Preferred region
+                <input
+                  value={editForm.preferred_region}
+                  onChange={(e) =>
+                    setEditForm({ ...editForm, preferred_region: e.target.value })
+                  }
+                  placeholder="us-east-1"
+                  className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-900"
+                  data-testid="edit-preferred-region"
+                />
+              </label>
+              {!editing.is_management && (
+                <label className="flex flex-col gap-1 text-xs font-medium text-slate-700 dark:text-slate-300 sm:col-span-2">
+                  Role ARN
+                  <input
+                    value={editForm.role_arn}
+                    onChange={(e) =>
+                      setEditForm({ ...editForm, role_arn: e.target.value })
+                    }
+                    placeholder="arn:aws:iam::111122223333:role/CostDetectiveReadOnly"
+                    className="rounded-md border border-slate-300 px-3 py-2 text-sm font-mono dark:border-slate-600 dark:bg-slate-900"
+                    required
+                    data-testid="edit-role-arn"
+                  />
+                </label>
+              )}
+              {!editing.is_management && (
+                <label className="flex flex-col gap-1 text-xs font-medium text-slate-700 dark:text-slate-300 sm:col-span-2">
+                  External ID (write-only — leave blank to keep current)
+                  <input
+                    type="password"
+                    value={editForm.external_id}
+                    onChange={(e) =>
+                      setEditForm({ ...editForm, external_id: e.target.value })
+                    }
+                    placeholder="(unchanged)"
+                    className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-600 dark:bg-slate-900"
+                    autoComplete="off"
+                    data-testid="edit-external-id"
+                  />
+                </label>
+              )}
+              {editing.is_management && (
+                <p className="sm:col-span-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  Management account: role ARN and external ID are managed
+                  by the platform and cannot be edited from this UI.
+                </p>
+              )}
+              {editError && (
+                <div
+                  className="sm:col-span-2 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 dark:bg-rose-900/40 dark:text-rose-100"
+                  data-testid="edit-error"
+                >
+                  {editError}
+                </div>
+              )}
+              <div className="sm:col-span-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={cancelEdit}
+                  className="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 dark:border-slate-600 dark:hover:bg-slate-700"
+                  data-testid="edit-cancel"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={busyId === editing.id}
+                  className="rounded-md bg-sky-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-50"
+                  data-testid="edit-save"
+                >
+                  Save changes
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {pendingDisable && (
         <div
