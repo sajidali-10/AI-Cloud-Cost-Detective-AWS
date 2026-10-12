@@ -210,6 +210,7 @@ export interface UtilizationRequestBody {
   region: string
   lookback_days: number
   resource_types?: string[]
+  account_id?: string | null
 }
 
 // ---------------------------------------------------------------------------

@@ -7,9 +7,7 @@
 //   * month mode → ``30`` (closest to MTD)
 //   * days mode → pass-through
 //
-// Deterministic recommendations and the cache invalidation
-// contract are unaffected by this mapping.  The capability row
-// surfaces operator-facing guidance regardless of the period.
+// Phase 7B: optional `accountId` selects a specific registry row.
 
 import { apiFetch } from '../api'
 import type {
@@ -20,33 +18,55 @@ import type {
 } from '../../types/finops'
 import { ALLOWED_LOOKBACK_DAYS, type LookbackDays } from '../../types/finops'
 
-export function buildCapabilitiesCacheKey(region: string | null): string {
-  return `optimization:caps:${region ?? 'default'}`
+export function buildCapabilitiesCacheKey(
+  region: string | null,
+  accountId: string | null,
+): string {
+  return `optimization:caps:${region ?? 'default'}:${accountId ?? 'all'}`
 }
 
-export function buildRecommendationsCacheKey(period: BillingPeriod, region: string | null): string {
+export function buildRecommendationsCacheKey(
+  period: BillingPeriod,
+  region: string | null,
+  accountId: string | null,
+): string {
+  const acct = accountId ?? 'all'
   if (period.kind === 'month') {
-    return `optimization:recs:month:${period.month}:${region ?? 'all'}`
+    return `optimization:recs:month:${period.month}:${region ?? 'all'}:${acct}`
   }
-  return `optimization:recs:${period.days}:${region ?? 'all'}`
+  return `optimization:recs:${period.days}:${region ?? 'all'}:${acct}`
 }
 
-export function buildSummaryCacheKey(period: BillingPeriod, region: string | null): string {
+export function buildSummaryCacheKey(
+  period: BillingPeriod,
+  region: string | null,
+  accountId: string | null,
+): string {
+  const acct = accountId ?? 'all'
   if (period.kind === 'month') {
-    return `optimization:summary:month:${period.month}:${region ?? 'all'}`
+    return `optimization:summary:month:${period.month}:${region ?? 'all'}:${acct}`
   }
-  return `optimization:summary:${period.days}:${region ?? 'all'}`
+  return `optimization:summary:${period.days}:${region ?? 'all'}:${acct}`
 }
 
 function toBackendDays(period: BillingPeriod): LookbackDays {
   if (period.kind === 'days') return period.days
-  // Calendar-month requests don't change the optimization lookback
-  // window; map to 30 (closest to MTD for any month).
   return 30
 }
 
-export async function fetchCapabilities(region: string | null): Promise<CapabilitiesResponse> {
-  const params = new URLSearchParams()
+function _appendAccount(
+  params: URLSearchParams,
+  accountId: string | null,
+): URLSearchParams {
+  if (accountId) params.set('account_id', accountId)
+  return params
+}
+
+export async function fetchCapabilities(
+  region: string | null,
+  options: { accountId?: string | null } = {},
+): Promise<CapabilitiesResponse> {
+  const params = _appendAccount(new URLSearchParams(), options.accountId ?? null)
   if (region) params.set('region', region)
   const path = params.toString()
     ? `/api/aws/optimization/capabilities?${params.toString()}`
@@ -57,12 +77,13 @@ export async function fetchCapabilities(region: string | null): Promise<Capabili
 export async function fetchRecommendations(
   period: BillingPeriod,
   region: string | null,
+  options: { accountId?: string | null } = {},
 ): Promise<RecommendationsResponse> {
   const days = toBackendDays(period)
   if (!ALLOWED_LOOKBACK_DAYS.includes(days)) {
     throw new Error(`fetchRecommendations: days=${days} is not allowed`)
   }
-  const params = new URLSearchParams()
+  const params = _appendAccount(new URLSearchParams(), options.accountId ?? null)
   params.set('days', String(days))
   if (region) params.set('region', region)
   return apiFetch<RecommendationsResponse>(
@@ -74,12 +95,13 @@ export async function fetchRecommendations(
 export async function fetchOptimizationSummary(
   period: BillingPeriod,
   region: string | null,
+  options: { accountId?: string | null } = {},
 ): Promise<OptimizationSummaryResponse> {
   const days = toBackendDays(period)
   if (!ALLOWED_LOOKBACK_DAYS.includes(days)) {
     throw new Error(`fetchOptimizationSummary: days=${days} is not allowed`)
   }
-  const params = new URLSearchParams()
+  const params = _appendAccount(new URLSearchParams(), options.accountId ?? null)
   params.set('days', String(days))
   if (region) params.set('region', region)
   return apiFetch<OptimizationSummaryResponse>(

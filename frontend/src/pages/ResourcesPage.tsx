@@ -8,7 +8,7 @@
 //   4. Utilization sub-panel for the selected resource type —
 //      CloudWatch metrics when available, "No data" otherwise.
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { SectionCard } from '../components/SectionCard'
 import { DataTable, type DataTableColumn } from '../components/DataTable'
@@ -27,6 +27,8 @@ import {
   buildUtilizationCacheKey,
 } from '../lib/finops/utilization'
 import { useFinopsPeriod } from '../lib/finops/period'
+import { useAccountContext } from '../lib/accountContext'
+import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   ResourcesResponse,
   ServiceResult,
@@ -76,11 +78,21 @@ const KIND_LABELS: Record<ResourceKind, string> = {
 
 export function ResourcesPage() {
   const { region } = useFinopsPeriod()
+  const { selection } = useAccountContext()
   const effectiveRegion = region === 'all' ? null : region
 
+  // Phase 7B: invalidate stale data on account switch.
+  const prevSelectionRef = useRef(selection)
+  useEffect(() => {
+    if (prevSelectionRef.current !== selection) {
+      invalidateFinopsCache()
+      prevSelectionRef.current = selection
+    }
+  }, [selection])
+
   const resources = useFinopsQuery<ResourcesResponse>(
-    buildResourcesCacheKey(effectiveRegion),
-    () => fetchResources(effectiveRegion),
+    buildResourcesCacheKey(effectiveRegion, selection),
+    () => fetchResources(effectiveRegion, { accountId: selection }),
   )
 
   const kindOptions = useMemo<{ value: string; label: string }[]>(() => {
@@ -139,6 +151,7 @@ export function ResourcesPage() {
           region: effectiveRegion ?? resources.entry.data?.region ?? 'us-east-1',
           lookback_days: 30,
           resource_types: utilizationKindsFor(selectedResource.kind),
+          account_id: selection,
         })
       : `utilization:none`,
     async () => {
@@ -147,6 +160,7 @@ export function ResourcesPage() {
         region: effectiveRegion ?? resources.entry.data?.region ?? 'us-east-1',
         lookback_days: 30,
         resource_types: utilizationKindsFor(selectedResource.kind),
+        account_id: selection,
       })
     },
     { ttlMs: 60_000 },

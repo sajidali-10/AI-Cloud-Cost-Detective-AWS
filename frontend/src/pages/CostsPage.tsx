@@ -1,6 +1,6 @@
 // Phase 7A — Costs page wired to calendar-month billing.
 
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { SectionCard } from '../components/SectionCard'
 import { MetricCard } from '../components/MetricCard'
@@ -16,6 +16,8 @@ import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery } from '../lib/finops/store'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
 import { useFinopsPeriod } from '../lib/finops/period'
+import { useAccountContext } from '../lib/accountContext'
+import { invalidateFinopsCache } from '../lib/finops/store'
 import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
 import { monthLabel } from '../types/finops'
 import {
@@ -35,12 +37,22 @@ function periodDisplay(period: BillingPeriod): string {
 
 export function CostsPage() {
   const { period, region } = useFinopsPeriod()
+  const { selection } = useAccountContext()
   const effectiveRegion = region === 'all' ? null : region
   const periodText = periodDisplay(period)
 
+  // Phase 7B: invalidate stale data when the account switches.
+  const prevSelectionRef = useRef(selection)
+  useEffect(() => {
+    if (prevSelectionRef.current !== selection) {
+      invalidateFinopsCache()
+      prevSelectionRef.current = selection
+    }
+  }, [selection])
+
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion),
-    () => fetchCostReport(period, { region: effectiveRegion }),
+    buildCostsCacheKey(period, effectiveRegion, selection),
+    () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
   )
 
   const report = cost.entry.data?.report ?? null

@@ -12,7 +12,7 @@
 //     bootstrap via the store's gate; the dashboard cannot fire a
 //     request before the JWT is wired in.
 
-import { useMemo } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { PageHeader, ContextItem } from '../components/PageHeader'
 import { MetricCard } from '../components/MetricCard'
 import { SectionCard } from '../components/SectionCard'
@@ -37,6 +37,8 @@ import {
   buildSummaryCacheKey,
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
+import { useAccountContext } from '../lib/accountContext'
+import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
   CostReportResponse,
@@ -63,39 +65,52 @@ import {
 
 export function DashboardPage() {
   const { period, region, currentMonth } = useFinopsPeriod()
+  const { selection } = useAccountContext()
   const effectiveRegion = region === 'all' ? null : region
+
+  // Phase 7B: invalidate stale data when the user switches accounts.
+  // The store's cache is keyed on (period, region, account) so this
+  // is belt-and-braces — it ensures no stale entry from a previous
+  // account survives while the new fetch is in flight.
+  const prevSelectionRef = useRef(selection)
+  useEffect(() => {
+    if (prevSelectionRef.current !== selection) {
+      invalidateFinopsCache()
+      prevSelectionRef.current = selection
+    }
+  }, [selection])
 
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
-    'identity',
-    () => fetchIdentity(),
+    `identity:${selection}`,
+    () => fetchIdentity({ accountId: selection }),
     { ttlMs: 5 * 60_000 },
   )
 
-  // Cost report — keyed on period + region.
+  // Cost report — keyed on period + region + account.
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion),
-    () => fetchCostReport(period, { region: effectiveRegion }),
+    buildCostsCacheKey(period, effectiveRegion, selection),
+    () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
   )
 
   // Capabilities — drives the Optimization Summary card.
   const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion),
-    () => fetchCapabilities(effectiveRegion),
+    buildCapabilitiesCacheKey(effectiveRegion, selection),
+    () => fetchCapabilities(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
-  // Optimization summary — keyed on period + region.
+  // Optimization summary — keyed on period + region + account.
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion),
-    () => fetchOptimizationSummary(period, effectiveRegion),
+    buildSummaryCacheKey(period, effectiveRegion, selection),
+    () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
   // Resources — drives the resource KPI + environment panel.
   const resources = useFinopsQuery<ResourcesResponse>(
-    buildResourcesCacheKey(effectiveRegion),
-    () => fetchResources(effectiveRegion),
+    buildResourcesCacheKey(effectiveRegion, selection),
+    () => fetchResources(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 

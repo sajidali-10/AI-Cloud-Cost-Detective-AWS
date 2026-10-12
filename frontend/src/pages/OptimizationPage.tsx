@@ -6,7 +6,7 @@
 //   * Deterministic engine recommendations remain visible even when
 //     AWS-native sources time out or fail.
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { SectionCard } from '../components/SectionCard'
 import { MetricCard } from '../components/MetricCard'
@@ -30,6 +30,8 @@ import {
   buildSummaryCacheKey,
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
+import { useAccountContext } from '../lib/accountContext'
+import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   BillingPeriod,
   CapabilitiesResponse,
@@ -53,21 +55,31 @@ function periodDisplay(period: BillingPeriod): string {
 
 export function OptimizationPage() {
   const { period, region } = useFinopsPeriod()
+  const { selection } = useAccountContext()
   const effectiveRegion = region === 'all' ? null : region
   const periodText = periodDisplay(period)
 
+  // Phase 7B: invalidate stale data on account switch.
+  const prevSelectionRef = useRef(selection)
+  useEffect(() => {
+    if (prevSelectionRef.current !== selection) {
+      invalidateFinopsCache()
+      prevSelectionRef.current = selection
+    }
+  }, [selection])
+
   const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion),
-    () => fetchCapabilities(effectiveRegion),
+    buildCapabilitiesCacheKey(effectiveRegion, selection),
+    () => fetchCapabilities(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
   const recs = useFinopsQuery<RecommendationsResponse>(
-    buildRecommendationsCacheKey(period, effectiveRegion),
-    () => fetchRecommendations(period, effectiveRegion),
+    buildRecommendationsCacheKey(period, effectiveRegion, selection),
+    () => fetchRecommendations(period, effectiveRegion, { accountId: selection }),
   )
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion),
-    () => fetchOptimizationSummary(period, effectiveRegion),
+    buildSummaryCacheKey(period, effectiveRegion, selection),
+    () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
