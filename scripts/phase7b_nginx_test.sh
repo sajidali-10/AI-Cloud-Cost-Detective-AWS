@@ -27,6 +27,22 @@
 # request — matching the symptom reported by operators (protected
 # endpoints returning 401 is the correct behaviour, not a bug).
 #
+# Implementation notes:
+#   * Production `nginx/default.conf` is a `conf.d/`-style fragment
+#     (intended to be included inside the parent's `http {}` block).
+#     When loaded as a stand-alone main config it must be wrapped in
+#     an explicit `events { ... } http { ... }` pair so the `map`
+#     directives resolve inside `http` context.  This wrapping is a
+#     TEST-ONLY artifact — production nginx is unaffected.
+#   * The stand-alone test nginx MUST bind a non-production port
+#     (default 18080) so it never collides with the Docker-managed
+#     public nginx that owns host port 80.
+#   * Mock upstream servers are tracked by PID in a file so cleanup
+#     is reliable; relying on `/proc/<pid>/comm` rewrites is not
+#     portable (it requires CAP_SYS_ADMIN on modern kernels).
+#   * A `trap` on EXIT / INT / TERM removes every process this
+#     script started so no orphan nginx/python processes survive.
+#
 # Exit status:
 #   0 — all assertions pass
 #   non-zero — at least one assertion failed
@@ -50,27 +66,81 @@ PIDFILE="$TEST_DIR/nginx.pid"
 MOCK_FE_PORT=18081
 MOCK_BE_PORT=18082
 LOG="$TEST_DIR/test.log"
+PID_DIR="$TEST_DIR/pids"
 
 PASS=0
 FAIL=0
 declare -a FAIL_LINES
 
-mkdir -p "$TEST_DIR/logs" "$TEST_DIR/body"
+mkdir -p "$TEST_DIR/logs" "$TEST_DIR/body" "$PID_DIR"
 : > "$LOG"
 
 log() { echo "$@" | tee -a "$LOG"; }
 pass() { PASS=$((PASS + 1)); log "PASS  $1"; }
 fail() { FAIL=$((FAIL + 1)); FAIL_LINES+=("$1"); log "FAIL  $1"; }
 
+# ---------------------------------------------------------------------------
+# Cleanup — must be registered BEFORE we start any background process so a
+# SIGINT during startup still releases the test directory cleanly.
+# ---------------------------------------------------------------------------
+
 cleanup() {
+  local sig="${1:-EXIT}"
+  log "---- cleanup ($sig)"
+
+  # Kill mock servers by recorded PID.  Walk the pid file so we kill
+  # exactly the processes this script started, never anything else.
+  if [ -d "$PID_DIR" ]; then
+    for pid_file in "$PID_DIR"/*.pid; do
+      [ -e "$pid_file" ] || continue
+      local pid
+      pid=$(cat "$pid_file" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+      rm -f "$pid_file"
+    done
+  fi
+
+  # Belt-and-braces: also catch any mock server bound to the test
+  # ports but somehow missing from the pid file (e.g. a previous
+  # crashed run).  fuser is on every modern distro.
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k -TERM "${MOCK_FE_PORT}/tcp" >/dev/null 2>&1 || true
+    fuser -k -TERM "${MOCK_BE_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
+
+  # Stop the test nginx instance.  Prefer the saved pidfile; if
+  # absent (e.g. nginx -t failed before launch) fall through silently.
   if [ -f "$PIDFILE" ]; then
-    "$NGINX_BIN" -s stop -p "$TEST_DIR" -c "$TEST_DIR/default.conf" 2>/dev/null || true
+    local nginxp
+    nginxp=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "$nginxp" ] && kill -0 "$nginxp" 2>/dev/null; then
+      "$NGINX_BIN" -s stop -p "$TEST_DIR" -c "$TEST_DIR/default.conf" 2>/dev/null || true
+      # Stop can take a moment; wait but do not block forever.
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$nginxp" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -KILL "$nginxp" 2>/dev/null || true
+    fi
     rm -f "$PIDFILE"
   fi
-  pkill -f "accd-phase7b-mock-fe" 2>/dev/null || true
-  pkill -f "accd-phase7b-mock-be" 2>/dev/null || true
+
+  # Last-resort fallback: anything still bound to the test port is
+  # almost certainly our orphan nginx master.  fuser + TERM/KILL so
+  # we never leave a process holding the port between runs.  This
+  # protects against the case where nginx -s stop fails (config
+  # already-replaced, pidfile lost, kernel killed it under us, ...).
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k -TERM "${NGINX_PORT}/tcp" >/dev/null 2>&1 || true
+    sleep 0.2
+    fuser -k -KILL "${NGINX_PORT}/tcp" >/dev/null 2>&1 || true
+  fi
 }
-trap cleanup EXIT
+trap 'cleanup EXIT' EXIT
+trap 'cleanup INT;  exit 130' INT
+trap 'cleanup TERM; exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # 1. Pre-flight: nginx binary present, source config present.
@@ -87,18 +157,36 @@ if [ ! -f "$CONF_SRC" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Build a stand-alone test config with upstream overrides pointing at
-#    local mock servers.  The mock frontend returns a recognisable
-#    HTML body ("<html>...SPA-MOCK-MARKER...</html>") so the assertions
-#    can confirm sensitive paths do NOT return SPA HTML.
+# 2. Build a stand-alone test config.
+#
+#    Production `nginx/default.conf` is a conf.d fragment — it lives
+#    inside the parent nginx.conf's `http {}` block.  When the test
+#    harness runs nginx with `-c $TEST_DIR/default.conf` the file is
+#    loaded as the MAIN config, so we wrap its body in a synthetic
+#    `events { ... } http { ... }` pair.  This wrapping is test-only;
+#    the production container still includes the file via conf.d/ and
+#    sees no extra structure.
+#
+#    We also rewrite the upstream hostnames to point at local mocks
+#    and the listen port to a non-production port (18080 by default)
+#    so the test nginx NEVER owns host port 80 — that port remains
+#    the exclusive domain of the Docker-managed nginx container.
 # ---------------------------------------------------------------------------
 
-cp "$CONF_SRC" "$TEST_DIR/default.conf"
-sed -i \
-  -e "s|http://frontend:8080|http://127.0.0.1:$MOCK_FE_PORT|g" \
-  -e "s|http://backend:8000|http://127.0.0.1:$MOCK_BE_PORT|g" \
-  -e "s|listen 80 default_server|listen $NGINX_PORT default_server|g" \
-  "$TEST_DIR/default.conf"
+{
+  echo "# Auto-generated by scripts/phase7b_nginx_test.sh — DO NOT EDIT."
+  echo "# Wraps production conf.d/default.conf in a stand-alone http{}."
+  echo "events { worker_connections 1024; }"
+  echo "http {"
+  # Body of default.conf verbatim — but with the listen port and
+  # upstream hostnames rewritten for the test environment.
+  sed \
+    -e "s|http://frontend:8080|http://127.0.0.1:$MOCK_FE_PORT|g" \
+    -e "s|http://backend:8000|http://127.0.0.1:$MOCK_BE_PORT|g" \
+    -e "s|listen 80 default_server|listen $NGINX_PORT default_server|g" \
+    "$CONF_SRC"
+  echo "}"
+} > "$TEST_DIR/default.conf"
 
 if ! "$NGINX_BIN" -t -p "$TEST_DIR" -c "$TEST_DIR/default.conf" >>"$LOG" 2>&1; then
   log "FAIL  nginx -t rejected the test config"
@@ -116,6 +204,9 @@ fi
 # 3. Start mock backend (always returns 401) and mock frontend (always
 #    returns the SPA mock marker).  These mimic the production stack
 #    enough to exercise every nginx location block.
+#
+#    Each mock is tracked in $PID_DIR/<port>.pid so cleanup can kill
+#    exactly the processes this script started.
 # ---------------------------------------------------------------------------
 
 python3 - >/dev/null 2>&1 <<PY &
@@ -133,9 +224,8 @@ socketserver.TCPServer.allow_reuse_address = True
 socketserver.TCPServer(("127.0.0.1", $MOCK_FE_PORT), FE).serve_forever()
 PY
 MOCK_FE_PID=$!
-disown
-# Tag the process so cleanup can find it.
-echo "accd-phase7b-mock-fe" > /proc/$MOCK_FE_PID/comm 2>/dev/null || true
+echo "$MOCK_FE_PID" > "$PID_DIR/fe.pid"
+disown "$MOCK_FE_PID" 2>/dev/null || true
 
 python3 - >/dev/null 2>&1 <<PY &
 import http.server, socketserver, sys
@@ -152,13 +242,28 @@ socketserver.TCPServer.allow_reuse_address = True
 socketserver.TCPServer(("127.0.0.1", $MOCK_BE_PORT), BE).serve_forever()
 PY
 MOCK_BE_PID=$!
-disown
-echo "accd-phase7b-mock-be" > /proc/$MOCK_BE_PID/comm 2>/dev/null || true
+echo "$MOCK_BE_PID" > "$PID_DIR/be.pid"
+disown "$MOCK_BE_PID" 2>/dev/null || true
 
-sleep 0.4
+# Wait for both mocks to bind their ports.  Poll with /dev/tcp so we
+# do not depend on `nc`, `lsof`, or any other optional tool.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if (echo >/dev/tcp/127.0.0.1/$MOCK_FE_PORT) >/dev/null 2>&1 \
+     && (echo >/dev/tcp/127.0.0.1/$MOCK_BE_PORT) >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
 
 "$NGINX_BIN" -p "$TEST_DIR" -c "$TEST_DIR/default.conf" >>"$LOG" 2>&1
-sleep 0.3
+
+# Wait for nginx to begin accepting connections on the test port.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if (echo >/dev/tcp/127.0.0.1/$NGINX_PORT) >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
 
 # ---------------------------------------------------------------------------
 # 4. Assertions.
