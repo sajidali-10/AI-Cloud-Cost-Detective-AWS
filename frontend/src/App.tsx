@@ -3,10 +3,12 @@
 // Composes providers in the correct order:
 //   ThemeProvider   → sets data-theme + manages persistence
 //     AuthProvider  → reads theme via document attribute (no dep on ThemeProvider)
-//       AccountProvider (Phase 7B) → registers the AWS account selector
-//         Router      → routes + role-aware guards
-//           Routes    → role-checked route tree
-//             Pages
+//       ProviderProvider (Phase 7C.1) → registers the cloud-provider selector
+//         AccountProvider (Phase 7B) → registers the AWS account selector
+//           FinopsPeriodProvider → region + period context
+//             Router      → routes + role-aware guards
+//               Routes    → role-checked route tree
+//                 Pages
 //
 // Theme is intentionally outside Auth so 401-driven redirects keep
 // the user's chosen palette.
@@ -16,6 +18,7 @@ import { AuthProvider, useAuth } from './lib/auth'
 import { Router, Routes, Navigate, type RouteSpec } from './lib/router'
 import { FinopsPeriodProvider } from './lib/finops/period'
 import { AccountProvider } from './lib/accountContext'
+import { ProviderProvider } from './lib/providerContext'
 import { AppShell } from './components/AppShell'
 import { LoginPage } from './pages/LoginPage'
 import { DashboardPage } from './pages/DashboardPage'
@@ -34,11 +37,13 @@ export default function App() {
     <ThemeProvider>
       <Router>
         <AuthProvider>
-          <AccountProvider>
-            <FinopsPeriodProvider>
-              <AppRoot />
-            </FinopsPeriodProvider>
-          </AccountProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider>
+                <AppRoot />
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </Router>
     </ThemeProvider>

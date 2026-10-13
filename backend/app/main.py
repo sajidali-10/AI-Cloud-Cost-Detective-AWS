@@ -35,6 +35,12 @@ from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimiza
 # aws_router so the public URL is /api/cloud-accounts/* after Nginx
 # strips /api/.
 from app.api import cloud_accounts  # noqa: F401  (registers /api/cloud-accounts/*)
+# Phase 7C.1: provider-neutral routes.  Mounted with the
+# ``/cloud`` prefix so the public URL is /api/cloud/* after
+# Nginx strips /api/.  These are the canonical provider-neutral
+# surface; the AWS-specific routes below remain for backwards
+# compatibility.
+from app.api.cloud_providers import router as cloud_providers_router
 # Phase 5A: authentication + admin user management routers.  These
 # are mounted with their own prefixes (/auth, /admin/users); nginx
 # strips /api/ as usual.
@@ -93,6 +99,9 @@ app.include_router(conversations_router)
 # policy-violation code when authentication is disabled.  nginx is
 # responsible for the WebSocket upgrade headers.
 app.include_router(ws_conversations_router)
+
+# Phase 7C.1: provider-neutral cloud routes mounted under /api/cloud/*.
+app.include_router(cloud_providers_router)
 
 
 # ---------------------------------------------------------------------------

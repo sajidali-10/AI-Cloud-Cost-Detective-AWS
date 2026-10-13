@@ -1,0 +1,73 @@
+// Phase 7C.1 — page-level provider-scoping regression.
+//
+// Pins the contract that every page that uses FinOps cache keys
+// reads the active provider from ProviderContext and includes it
+// in the cache key + invalidates the cache when the provider
+// changes.
+
+import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+const SRC_ROOT = resolve(__dirname, '..')
+
+function src(relative: string): string {
+  return readFileSync(resolve(SRC_ROOT, relative), 'utf-8')
+}
+
+describe('Phase 7C.1 — pages wire provider into cache keys', () => {
+  it('Dashboard consumes provider from ProviderContext', () => {
+    const p = src('pages/DashboardPage.tsx')
+    expect(p).toMatch(/useProviderContext/)
+    expect(p).toMatch(/cacheProvider/)
+    // Every FinOps cache key call passes cacheProvider.
+    expect(p).toMatch(/buildCostsCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildCapabilitiesCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildSummaryCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildResourcesCacheKey\([^)]*cacheProvider/)
+  })
+
+  it('Costs consumes provider from ProviderContext', () => {
+    const p = src('pages/CostsPage.tsx')
+    expect(p).toMatch(/useProviderContext/)
+    expect(p).toMatch(/cacheProvider/)
+    expect(p).toMatch(/buildCostsCacheKey\([^)]*cacheProvider/)
+  })
+
+  it('Resources consumes provider from ProviderContext', () => {
+    const p = src('pages/ResourcesPage.tsx')
+    expect(p).toMatch(/useProviderContext/)
+    expect(p).toMatch(/cacheProvider/)
+    expect(p).toMatch(/buildResourcesCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildUtilizationCacheKey\(\s*\{[\s\S]*\}\s*,\s*cacheProvider/)
+  })
+
+  it('Optimization consumes provider from ProviderContext', () => {
+    const p = src('pages/OptimizationPage.tsx')
+    expect(p).toMatch(/useProviderContext/)
+    expect(p).toMatch(/cacheProvider/)
+    expect(p).toMatch(/buildCapabilitiesCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildRecommendationsCacheKey\([^)]*cacheProvider/)
+    expect(p).toMatch(/buildSummaryCacheKey\([^)]*cacheProvider/)
+  })
+})
+
+describe('Phase 7C.1 — pages invalidate cache on provider change', () => {
+  const pages = [
+    'DashboardPage.tsx',
+    'CostsPage.tsx',
+    'ResourcesPage.tsx',
+    'OptimizationPage.tsx',
+  ]
+  for (const page of pages) {
+    it(`${page} invalidates FinOps cache when the active provider changes`, () => {
+      const p = src(`pages/${page}`)
+      // Every page has a ref-based effect that calls
+      // invalidateFinopsCache() when either the selection or the
+      // provider changes — i.e. it tracks both refs.
+      expect(p).toMatch(/useProviderContext/)
+      expect(p).toMatch(/invalidateFinopsCache/)
+      expect(p).toMatch(/prevProviderRef/)
+    })
+  }
+})

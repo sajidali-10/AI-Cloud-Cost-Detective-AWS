@@ -17,6 +17,7 @@ import { useFinopsQuery } from '../lib/finops/store'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
 import { monthLabel } from '../types/finops'
@@ -38,20 +39,32 @@ function periodDisplay(period: BillingPeriod): string {
 export function CostsPage() {
   const { period, region } = useFinopsPeriod()
   const { selection } = useAccountContext()
+  const { providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider = providerSlug === 'azure'
+    ? ('azure' as const)
+    : providerSlug === 'rackspace'
+    ? ('rackspace' as const)
+    : ('aws' as const)
   const periodText = periodDisplay(period)
 
   // Phase 7B: invalidate stale data when the account switches.
+  // Phase 7C.1: also invalidate on provider change.
   const prevSelectionRef = useRef(selection)
+  const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
-    if (prevSelectionRef.current !== selection) {
+    if (
+      prevSelectionRef.current !== selection ||
+      prevProviderRef.current !== cacheProvider
+    ) {
       invalidateFinopsCache()
       prevSelectionRef.current = selection
+      prevProviderRef.current = cacheProvider
     }
-  }, [selection])
+  }, [selection, cacheProvider, providerVersion])
 
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion, selection),
+    buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
   )
 

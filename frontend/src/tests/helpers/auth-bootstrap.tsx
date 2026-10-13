@@ -40,6 +40,8 @@ import { render, type RenderOptions, type RenderResult } from '@testing-library/
 import { ThemeProvider } from '../../lib/theme'
 import { AuthProvider, type AuthUser } from '../../lib/auth'
 import { FinopsPeriodProvider } from '../../lib/finops/period'
+import { ProviderProvider } from '../../lib/providerContext'
+import { AccountProvider } from '../../lib/accountContext'
 import { MemoryRouter } from '../../lib/router'
 
 const AUTH_INFO_ENABLED = {
@@ -123,12 +125,16 @@ export async function renderWithAuthDisabled(
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <FinopsPeriodProvider
-            {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
-            {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
-          >
-            {node}
-          </FinopsPeriodProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider
+                {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
+                {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
+              >
+                {node}
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>,
@@ -163,12 +169,16 @@ export async function renderWithAuthEnabled(
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <FinopsPeriodProvider
-            {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
-            {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
-          >
-            {node}
-          </FinopsPeriodProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider
+                {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
+                {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
+              >
+                {node}
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>,
@@ -188,12 +198,16 @@ export function authDisabledElement(
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <FinopsPeriodProvider
-            {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
-            {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
-          >
-            {node}
-          </FinopsPeriodProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider
+                {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
+                {...(opts.initialRegion ? { initialRegion: opts.initialRegion } : {})}
+              >
+                {node}
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>

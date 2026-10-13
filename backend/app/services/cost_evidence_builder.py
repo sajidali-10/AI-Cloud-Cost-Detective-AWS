@@ -65,8 +65,18 @@ def build_evidence(
     cost_warning: Optional[Warning] = None,
     utilization_warning: Optional[Warning] = None,
     resources_warning: Optional[Warning] = None,
+    provider: str = "AWS",
+    account_id: Optional[str] = None,
 ) -> EvidenceResponse:
-    """Compose an ``EvidenceResponse`` from the three sources."""
+    """Compose an ``EvidenceResponse`` from the three sources.
+
+    Phase 7C.1: ``provider`` and ``account_id`` are optional
+    attribution fields threaded through to every
+    :class:`ResourceEvidence` and to the top-level
+    :class:`EvidenceResponse`.  When omitted they default to
+    ``AWS`` and ``None`` respectively so every existing Phase 2
+    caller continues to produce valid evidence.
+    """
     # Index cost-by-service so we can look up the SERVICE-scope spend
     # for each resource.
     service_spend: Dict[str, Decimal] = {}
@@ -118,6 +128,8 @@ def build_evidence(
                     resource_type=resource_type,
                     service=service_name,
                     region=region,
+                    provider=provider,
+                    account_id=item.get("account_id") or account_id,
                     utilization={
                         "series": [
                             {
@@ -181,6 +193,8 @@ def build_evidence(
         days=days,
         status=status,
         cost_summary=cost_summary,
+        provider=provider,
+        account_id=account_id,
         resources=resources,
         warnings=warnings,
     )

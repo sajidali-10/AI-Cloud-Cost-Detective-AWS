@@ -31,6 +31,7 @@ import {
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   BillingPeriod,
@@ -56,29 +57,41 @@ function periodDisplay(period: BillingPeriod): string {
 export function OptimizationPage() {
   const { period, region } = useFinopsPeriod()
   const { selection } = useAccountContext()
+  const { providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider = providerSlug === 'azure'
+    ? ('azure' as const)
+    : providerSlug === 'rackspace'
+    ? ('rackspace' as const)
+    : ('aws' as const)
   const periodText = periodDisplay(period)
 
   // Phase 7B: invalidate stale data on account switch.
+  // Phase 7C.1: also invalidate on provider change.
   const prevSelectionRef = useRef(selection)
+  const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
-    if (prevSelectionRef.current !== selection) {
+    if (
+      prevSelectionRef.current !== selection ||
+      prevProviderRef.current !== cacheProvider
+    ) {
       invalidateFinopsCache()
       prevSelectionRef.current = selection
+      prevProviderRef.current = cacheProvider
     }
-  }, [selection])
+  }, [selection, cacheProvider, providerVersion])
 
   const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion, selection),
+    buildCapabilitiesCacheKey(effectiveRegion, selection, cacheProvider),
     () => fetchCapabilities(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
   const recs = useFinopsQuery<RecommendationsResponse>(
-    buildRecommendationsCacheKey(period, effectiveRegion, selection),
+    buildRecommendationsCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchRecommendations(period, effectiveRegion, { accountId: selection }),
   )
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion, selection),
+    buildSummaryCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )

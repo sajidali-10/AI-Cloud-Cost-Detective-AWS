@@ -11,6 +11,11 @@ Phase 3 optimizer.  It is intentionally deterministic:
   (``high | medium | low | no_data``).
 * ``sources`` is the explicit list of AWS APIs that contributed to
   the item so Phase 3 can attribute every number.
+
+Phase 7C.1 adds ``provider`` and ``account_id`` attribution fields
+so the AI Cost Analyst can distinguish AWS evidence from future
+Azure / Rackspace evidence.  The fields are optional and default
+to AWS so existing callers continue to work unchanged.
 """
 from __future__ import annotations
 
@@ -64,7 +69,15 @@ class CostContext(BaseModel):
 
 
 class ResourceEvidence(BaseModel):
-    """One evidence record per discovered resource."""
+    """One evidence record per discovered resource.
+
+    Phase 7C.1: ``provider`` and ``account_id`` are optional
+    attribution fields.  When omitted they default to ``AWS`` and
+    ``None`` respectively so existing Phase 2 callers continue to
+    produce schemas that pass validation.  Future Azure / Rackspace
+    adapters will always set ``provider`` explicitly so the AI can
+    distinguish AWS evidence from Azure evidence.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -72,6 +85,22 @@ class ResourceEvidence(BaseModel):
     resource_type: str  # "ec2" | "rds" | "lambda" | "alb" | "nlb" | ...
     service: str
     region: str
+    provider: str = Field(
+        default="AWS",
+        description=(
+            "Provider that produced this evidence record.  "
+            "Phase 7C.1 always emits 'AWS'; future adapters will "
+            "set 'AZURE' or 'RACKSPACE'."
+        ),
+    )
+    account_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Provider-native account identifier (12-digit AWS id "
+            "today, subscription GUID for Azure, tenant id for "
+            "Rackspace).  None for the aggregate 'All' view."
+        ),
+    )
     utilization: dict = Field(default_factory=dict)
     cost_context: CostContext
     data_quality: DataQuality = DataQuality.NO_DATA
@@ -93,6 +122,12 @@ class EvidenceResponse(BaseModel):
     days: int
     status: EvidenceStatus
     cost_summary: dict
+    # Phase 7C.1: provider attribution at the top level so the AI
+    # can disambiguate AWS / Azure / Rackspace evidence without
+    # scanning every resource record.  Defaults to AWS.
+    provider: str = Field(default="AWS")
+    # Optional account/subscription attribution at the top level.
+    account_id: Optional[str] = Field(default=None)
     resources: List[ResourceEvidence]
     warnings: List[Warning] = Field(default_factory=list)
 

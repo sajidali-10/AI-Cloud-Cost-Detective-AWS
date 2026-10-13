@@ -1,9 +1,22 @@
-"""Pydantic schemas for the cloud-account registry (Phase 7B).
+"""Pydantic schemas for the cloud-account registry (Phase 7B + 7C).
 
 This module is intentionally provider-agnostic: Phase 7B only
 implements AWS, but the request/response shapes are written so a
 future Azure / Rackspace adapter can plug in without breaking the
 registry API.
+
+Phase 7C.1 makes the validation rules conditional on the
+``provider`` field:
+
+* ``provider='AWS'`` — strict AWS validation: 12-digit account id,
+  IAM role ARN with the embedded account id matching, optional
+  external id, optional preferred region matching the AWS region
+  format.
+* ``provider in ('AZURE', 'RACKSPACE')`` — relaxed validation:
+  ``account_id`` and ``role_arn`` are accepted as opaque strings
+  (the Azure/Rackspace adapters will own their own per-provider
+  validation).  Phase 7C.1 still rejects creation of non-AWS rows
+  — only ``AWS`` is enabled at the API surface today.
 
 Security rules enforced here:
 
@@ -69,12 +82,15 @@ class CloudAccountBase(BaseModel):
     display_name: str = Field(
         ..., min_length=1, max_length=DISPLAY_NAME_MAX_LENGTH
     )
-    role_arn: str = Field(
-        ...,
+    role_arn: Optional[str] = Field(
+        default=None,
         description=(
-            "IAM role ARN to assume in the target AWS account. "
+            "AWS IAM role ARN to assume in the target account. "
             "Must be of the form arn:aws:iam::<account-id>:role/<name> "
-            "and the embedded account ID must match ``account_id``."
+            "and the embedded account ID must match ``account_id``. "
+            "Required for AWS target accounts; ignored for AWS "
+            "management rows (is_management=True).  Nullable for "
+            "future Azure / Rackspace providers."
         ),
     )
     external_id: Optional[str] = Field(
@@ -101,8 +117,8 @@ class CloudAccountBase(BaseModel):
         normalized = (value or "").strip().upper()
         if normalized != "AWS":
             raise ValueError(
-                "Only provider='AWS' is implemented in Phase 7B. "
-                "Azure / Rackspace adapters belong to Phase 7C."
+                "Only provider='AWS' is implemented in Phase 7C.1. "
+                "Azure / Rackspace adapters belong to Phase 7C.2 / 7C.3."
             )
         return normalized
 
@@ -123,7 +139,9 @@ class CloudAccountBase(BaseModel):
 
     @field_validator("role_arn")
     @classmethod
-    def _validate_role_arn(cls, value: str) -> str:
+    def _validate_role_arn(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
         if not isinstance(value, str) or not AWS_IAM_ROLE_ARN_REGEX.match(value):
             raise ValueError(
                 "role_arn must be of the form "
@@ -147,7 +165,7 @@ class CloudAccountBase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_arn_matches_account(self) -> "CloudAccountBase":
-        match = AWS_IAM_ROLE_ARN_REGEX.match(self.role_arn)
+        match = AWS_IAM_ROLE_ARN_REGEX.match(self.role_arn or "")
         if match and match.group("account_id") != self.account_id:
             raise ValueError(
                 "role_arn embeds an account_id that does not match "

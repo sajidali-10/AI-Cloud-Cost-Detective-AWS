@@ -8,6 +8,10 @@
 //   * days mode → pass-through
 //
 // Phase 7B: optional `accountId` selects a specific registry row.
+//
+// Phase 7C.1: provider scoping is appended as a leading segment
+// so a provider switch cannot accidentally satisfy a stale cache
+// entry for a different provider.
 
 import { apiFetch } from '../api'
 import type {
@@ -18,35 +22,40 @@ import type {
 } from '../../types/finops'
 import { ALLOWED_LOOKBACK_DAYS, type LookbackDays } from '../../types/finops'
 
+export type CacheProvider = 'aws' | 'azure' | 'rackspace'
+
 export function buildCapabilitiesCacheKey(
   region: string | null,
   accountId: string | null,
+  provider: CacheProvider = 'aws',
 ): string {
-  return `optimization:caps:${region ?? 'default'}:${accountId ?? 'all'}`
+  return `${provider}:optimization:caps:${region ?? 'default'}:${accountId ?? 'all'}`
 }
 
 export function buildRecommendationsCacheKey(
   period: BillingPeriod,
   region: string | null,
   accountId: string | null,
+  provider: CacheProvider = 'aws',
 ): string {
   const acct = accountId ?? 'all'
   if (period.kind === 'month') {
-    return `optimization:recs:month:${period.month}:${region ?? 'all'}:${acct}`
+    return `${provider}:optimization:recs:month:${period.month}:${region ?? 'all'}:${acct}`
   }
-  return `optimization:recs:${period.days}:${region ?? 'all'}:${acct}`
+  return `${provider}:optimization:recs:${period.days}:${region ?? 'all'}:${acct}`
 }
 
 export function buildSummaryCacheKey(
   period: BillingPeriod,
   region: string | null,
   accountId: string | null,
+  provider: CacheProvider = 'aws',
 ): string {
   const acct = accountId ?? 'all'
   if (period.kind === 'month') {
-    return `optimization:summary:month:${period.month}:${region ?? 'all'}:${acct}`
+    return `${provider}:optimization:summary:month:${period.month}:${region ?? 'all'}:${acct}`
   }
-  return `optimization:summary:${period.days}:${region ?? 'all'}:${acct}`
+  return `${provider}:optimization:summary:${period.days}:${region ?? 'all'}:${acct}`
 }
 
 function toBackendDays(period: BillingPeriod): LookbackDays {

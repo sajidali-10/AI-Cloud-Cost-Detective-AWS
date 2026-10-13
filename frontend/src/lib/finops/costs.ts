@@ -11,6 +11,15 @@
 //
 // Phase 7B: optional `accountId` selects a specific registry row
 // (or `all` to fan out across every enabled account).
+//
+// Phase 7C.1: the cache key is now also scoped on the active
+// provider (default 'aws') so a future Azure adapter cannot
+// accidentally satisfy an AWS request that was cached under a
+// different provider prefix.  The provider segment sits at the
+// front of the key so it dominates the lookup.  Provider switching
+// ALSO triggers a global cache invalidation in the page effect,
+// so the provider segment is belt-and-braces — it prevents stale
+// data even if the global invalidation is skipped.
 
 import { apiFetch } from '../api'
 import type {
@@ -19,16 +28,20 @@ import type {
 } from '../../types/finops'
 import { ALLOWED_LOOKBACK_DAYS } from '../../types/finops'
 
+export type CacheProvider = 'aws' | 'azure' | 'rackspace'
+
 export function buildCostsCacheKey(
   period: BillingPeriod,
   region: string | null,
   accountId: string | null,
+  provider: CacheProvider = 'aws',
 ): string {
   const acct = accountId ?? 'all'
+  const providerSeg = provider
   if (period.kind === 'month') {
-    return `costs:month:${period.month}:${region ?? 'all'}:${acct}`
+    return `${providerSeg}:costs:month:${period.month}:${region ?? 'all'}:${acct}`
   }
-  return `costs:days:${period.days}:${region ?? 'all'}:${acct}`
+  return `${providerSeg}:costs:days:${period.days}:${region ?? 'all'}:${acct}`
 }
 
 export async function fetchCostReport(

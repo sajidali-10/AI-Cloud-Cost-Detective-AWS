@@ -38,6 +38,7 @@ import {
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
@@ -66,50 +67,64 @@ import {
 export function DashboardPage() {
   const { period, region, currentMonth } = useFinopsPeriod()
   const { selection } = useAccountContext()
+  const { providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider = providerSlug === 'azure'
+    ? ('azure' as const)
+    : providerSlug === 'rackspace'
+    ? ('rackspace' as const)
+    : ('aws' as const)
 
   // Phase 7B: invalidate stale data when the user switches accounts.
   // The store's cache is keyed on (period, region, account) so this
   // is belt-and-braces — it ensures no stale entry from a previous
   // account survives while the new fetch is in flight.
+  // Phase 7C.1: also invalidate when the provider changes so an
+  // AWS response cannot satisfy an Azure request that flips in
+  // before the new fetch completes.
   const prevSelectionRef = useRef(selection)
+  const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
-    if (prevSelectionRef.current !== selection) {
+    if (
+      prevSelectionRef.current !== selection ||
+      prevProviderRef.current !== cacheProvider
+    ) {
       invalidateFinopsCache()
       prevSelectionRef.current = selection
+      prevProviderRef.current = cacheProvider
     }
-  }, [selection])
+  }, [selection, cacheProvider, providerVersion])
 
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
-    `identity:${selection}`,
+    `${cacheProvider}:identity:${selection}`,
     () => fetchIdentity({ accountId: selection }),
     { ttlMs: 5 * 60_000 },
   )
 
-  // Cost report — keyed on period + region + account.
+  // Cost report — keyed on period + region + account + provider.
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion, selection),
+    buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
   )
 
   // Capabilities — drives the Optimization Summary card.
   const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion, selection),
+    buildCapabilitiesCacheKey(effectiveRegion, selection, cacheProvider),
     () => fetchCapabilities(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
-  // Optimization summary — keyed on period + region + account.
+  // Optimization summary — keyed on period + region + account + provider.
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion, selection),
+    buildSummaryCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
   // Resources — drives the resource KPI + environment panel.
   const resources = useFinopsQuery<ResourcesResponse>(
-    buildResourcesCacheKey(effectiveRegion, selection),
+    buildResourcesCacheKey(effectiveRegion, selection, cacheProvider),
     () => fetchResources(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
