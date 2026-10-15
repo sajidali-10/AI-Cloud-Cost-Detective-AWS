@@ -70,6 +70,11 @@ class CloudCapability(str, Enum):
     table is the source of truth for what the UI/API can safely
     call.  Adding a capability here is a deliberate API decision:
     every adapter must declare its support.
+
+    Phase 7C.2A adds ``AUTHENTICATION`` and ``SUBSCRIPTIONS`` so
+    the Azure adapter can report connectivity and tenant
+    enumeration without having to wait for Cost Management /
+    Resource Graph / Advisor to ship.
     """
 
     COSTS = "COSTS"
@@ -79,6 +84,9 @@ class CloudCapability(str, Enum):
     BILLING = "BILLING"
     ADVISOR = "ADVISOR"
     AI_EVIDENCE = "AI_EVIDENCE"
+    # Phase 7C.2A — Azure bootstrap capabilities.
+    AUTHENTICATION = "AUTHENTICATION"
+    SUBSCRIPTIONS = "SUBSCRIPTIONS"
 
 
 class CloudCapabilityState(str, Enum):

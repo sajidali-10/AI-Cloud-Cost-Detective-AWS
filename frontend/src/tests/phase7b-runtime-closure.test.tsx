@@ -45,6 +45,7 @@ describe('Phase 7B runtime closure — AccountSelector mounting', () => {
 
   it('AccountSelector renders the "All AWS Accounts" label by default', async () => {
     const { AccountProvider, useAccountContext } = await import('../lib/accountContext')
+    const { ProviderProvider } = await import('../lib/providerContext')
     const { AccountSelector } = await import('../components/AccountSelector')
 
     // Stub fetch so the selectable list fetch does not blow up.
@@ -66,9 +67,11 @@ describe('Phase 7B runtime closure — AccountSelector mounting', () => {
     }
 
     render(
-      <AccountProvider>
-        <Harness />
-      </AccountProvider>,
+      <ProviderProvider>
+        <AccountProvider>
+          <Harness />
+        </AccountProvider>
+      </ProviderProvider>,
     )
     // The selector renders one button (testid='account-selector-button')
     // and the aggregate option when the menu is open.

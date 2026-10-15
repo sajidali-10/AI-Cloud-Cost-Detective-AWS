@@ -18,6 +18,7 @@ import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
+import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
 import { monthLabel } from '../types/finops'
@@ -39,7 +40,7 @@ function periodDisplay(period: BillingPeriod): string {
 export function CostsPage() {
   const { period, region } = useFinopsPeriod()
   const { selection } = useAccountContext()
-  const { providerSlug, providerVersion } = useProviderContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
@@ -47,6 +48,13 @@ export function CostsPage() {
     ? ('rackspace' as const)
     : ('aws' as const)
   const periodText = periodDisplay(period)
+
+  // Phase 7C.2A — Azure Cost Management is NOT yet implemented.
+  // Surface a capability-aware empty state instead of calling
+  // AWS endpoints or showing fake zero values.
+  if (provider === 'AZURE') {
+    return <ProviderCapabilityNotice provider="AZURE" feature="Costs" />
+  }
 
   // Phase 7B: invalidate stale data when the account switches.
   // Phase 7C.1: also invalidate on provider change.

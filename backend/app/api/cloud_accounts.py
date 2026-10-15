@@ -114,6 +114,8 @@ def list_cloud_accounts(
             role_arn=row.role_arn,
             enabled=row.enabled,
             is_management=row.is_management,
+            tenant_id=row.tenant_id,
+            subscription_id=row.subscription_id,
             preferred_region=row.preferred_region,
             created_at=row.created_at,
             updated_at=row.updated_at,
@@ -188,6 +190,8 @@ def create_cloud_account(
         role_arn=row.role_arn,
         enabled=row.enabled,
         is_management=row.is_management,
+        tenant_id=row.tenant_id,
+        subscription_id=row.subscription_id,
         preferred_region=row.preferred_region,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -241,6 +245,8 @@ def update_cloud_account(
         role_arn=row.role_arn,
         enabled=row.enabled,
         is_management=row.is_management,
+        tenant_id=row.tenant_id,
+        subscription_id=row.subscription_id,
         preferred_region=row.preferred_region,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -261,11 +267,44 @@ def validate_cloud_account(
     _admin: AppUser = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> Any:
+    """Validate connectivity to a registered cloud account.
+
+    Routes through the provider registry so AWS rows go through
+    the existing Phase 7B ``resolve_status`` (STS GetCallerIdentity)
+    and Azure rows go through ``AzureCloudProvider.validate_account``
+    (Entra token exchange + ARM subscription GET).
+
+    Disabled rows short-circuit to ``DISABLED`` regardless of
+    provider.
+    """
     row = get_account_by_id(db, account_id)
     if row is None:
         return _row_not_found_response(account_id)
-    status_response = resolve_status(db, row)
-    return status_response.model_dump(mode="json")
+    provider_kind = (row.provider or "AWS").strip().upper()
+    if provider_kind == "AWS":
+        # AWS path unchanged — Phase 7B's resolver handles every
+        # AWS-specific status mapping (ACCESS_DENIED,
+        # ROLE_NOT_FOUND, ERROR, etc.).
+        status_response = resolve_status(db, row)
+        return status_response.model_dump(mode="json")
+    # Azure / future providers: route through the registry so
+    # the adapter owns its own status mapping.
+    try:
+        from app.services.cloud import CloudProviderKind, ProviderRegistry
+
+        kind = CloudProviderKind(provider_kind)
+        adapter = ProviderRegistry.current().require(kind)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "error_code": "UnknownProvider",
+                "message": f"unknown provider {provider_kind!r}",
+            },
+        )
+    result = adapter.validate_account(row)
+    return result.to_dict()
 
 
 # ---------------------------------------------------------------------------

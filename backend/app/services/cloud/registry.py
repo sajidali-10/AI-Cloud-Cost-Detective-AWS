@@ -215,11 +215,19 @@ def _register_known_providers(registry: ProviderRegistry) -> None:
     the adapter — :func:`register` is invoked from inside the
     module's import side effects so we never instantiate a
     provider here.
+
+    Phase 7C.2A: also imports the Azure adapter.  The Azure
+    adapter self-registers as DISABLED when ``AZURE_TENANT_ID`` /
+    ``AZURE_CLIENT_ID`` are not configured so a deployment without
+    Entra still has a stable adapter surface (admin UIs can see
+    that Azure exists, just isn't wired in yet).
     """
     # Import for the side-effect of registering the AWS adapter.
     # No AWS work happens at import time beyond declaring class
     # attributes.
     from app.services.cloud.aws import adapter as _aws_adapter_module  # noqa: F401
+    # Phase 7C.2A — Azure adapter.  Importing is enough to wire it.
+    from app.services.cloud.azure import adapter as _azure_adapter_module  # noqa: F401
 
 
 __all__ = [

@@ -16,3 +16,9 @@ argon2-cffi==23.1.0
 PyJWT==2.10.1
 pytest==8.3.4
 pytest-asyncio==0.24.0
+# Phase 7C.2A — Microsoft Entra ID workload-federation credential.
+# ``azure-identity`` is the only Azure SDK we need for the
+# federation flow; Phase 7C.2B / 7C.2C / 7C.2D will add the
+# targeted management SDKs (azure-mgmt-costmanagement etc.) only
+# when their surfaces are actually used.
+azure-identity==1.18.0

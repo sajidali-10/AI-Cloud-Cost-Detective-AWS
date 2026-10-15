@@ -20,7 +20,7 @@ def client():
     return TestClient(app)
 
 
-def test_list_cloud_providers_includes_aws_and_reserved(client):
+def test_list_cloud_providers_includes_aws_and_azure(client):
     r = client.get("/cloud/providers")
     assert r.status_code == 200
     body = r.json()
@@ -29,11 +29,19 @@ def test_list_cloud_providers_includes_aws_and_reserved(client):
     assert by_kind["AWS"]["is_registered"] is True
     assert by_kind["AWS"]["is_enabled"] is True
     assert "AWS_INSTANCE_PROFILE" in by_kind["AWS"]["credential_strategies"]
-    # Reserved providers must always be reported as not-yet-registered
-    # so the frontend can render a "future release" hint.
-    for reserved in ("AZURE", "RACKSPACE"):
-        assert by_kind[reserved]["is_registered"] is False
-        assert by_kind[reserved]["status"] == "NOT_REGISTERED"
+    # Phase 7C.2A — Azure is now a registered provider (the
+    # adapter is wired in and self-registers at process boot).
+    # Whether it is *enabled* in this particular deployment is
+    # runtime-config dependent (the credential layer disables
+    # itself when AZURE_TENANT_ID / AZURE_CLIENT_ID are missing).
+    # We pin the registration invariant only; the API surface
+    # reports ``is_enabled`` truthfully so the admin UI can show
+    # "configured / not configured" instead of "reserved".
+    assert by_kind["AZURE"]["is_registered"] is True
+    assert by_kind["AZURE"]["status"] in ("OK", "NO_CAPABILITIES", "ERROR")
+    # RACKSPACE remains a reserved provider (Phase 7C.3).
+    assert by_kind["RACKSPACE"]["is_registered"] is False
+    assert by_kind["RACKSPACE"]["status"] == "NOT_REGISTERED"
 
 
 def test_list_cloud_providers_aws_capabilities_include_supported(client):
@@ -75,11 +83,29 @@ def test_selectable_for_unknown_provider_returns_404(client):
     assert r.json()["error_code"] == "UnknownProvider"
 
 
-def test_selectable_for_azure_returns_404_until_adapter_registered(client):
-    """Azure is reserved in the enum but not registered.  The route
-    must explicitly 404 (NOT_REGISTERED) so the frontend can render
-    a meaningful state rather than 500."""
+def test_selectable_for_azure_returns_200_when_adapter_registered(client):
+    """Phase 7C.2A — the Azure adapter IS registered at process
+    boot.  The ``/cloud/accounts/selectable/AZURE`` route therefore
+    returns 200 (with an empty items list when no rows are
+    registered yet).  RACKSPACE remains the only ``NOT_REGISTERED``
+    provider and the test for that case is below.
+    """
     r = client.get("/cloud/accounts/selectable/AZURE")
+    assert r.status_code == 200
+    body = r.json()
+    assert "items" in body and "count" in body
+    # In a fresh test DB the Azure subscriptions table is empty;
+    # the response shape is still the canonical selector payload.
+    assert body["count"] == 0
+    assert body["items"] == []
+
+
+def test_selectable_for_rackspace_returns_404_until_adapter_registered(client):
+    """RACKSPACE is reserved for Phase 7C.3 — the adapter is not
+    wired yet.  The route must explicitly 404 (NOT_REGISTERED) so
+    the frontend can render a meaningful state rather than 500.
+    """
+    r = client.get("/cloud/accounts/selectable/RACKSPACE")
     assert r.status_code == 404
     assert r.json()["error_code"] == "ProviderNotRegistered"
 

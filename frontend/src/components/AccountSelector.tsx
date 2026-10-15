@@ -1,7 +1,13 @@
 // Phase 7B — AWS Account selector (HipLink top-bar).
+// Phase 7C.2A — provider-aware labels: AWS when AWS is selected,
+// Azure when Azure is selected.  Filtering by provider happens at
+// the consumer side (the AccountContext still loads every row);
+// the selector renders only the rows belonging to the active
+// provider so a stale AWS row can never satisfy an Azure request.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAccountContext, AccountSelection } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
 
 interface AccountSelectorProps {
   className?: string
@@ -10,8 +16,30 @@ interface AccountSelectorProps {
 export function AccountSelector({ className = '' }: AccountSelectorProps) {
   const { selection, setSelection, accounts, refreshAccounts, loading, error } =
     useAccountContext()
+  const { provider } = useProviderContext()
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
+
+  // Filter rows to the currently selected provider.  Belt-and-
+  // braces: the per-page FinOps cache keys already include the
+  // provider segment, but the selector UI must never render an
+  // AWS row while Azure is selected (or vice versa).
+  const visibleAccounts = useMemo(
+    () => accounts.filter((a) => a.provider === provider),
+    [accounts, provider],
+  )
+
+  // When the provider changes, drop any stale specific selection
+  // so a stale AWS id never follows the user into an Azure page.
+  useEffect(() => {
+    if (selection !== 'all') {
+      setSelection('all')
+    }
+    // We intentionally exclude `selection` from deps so the effect
+    // fires only on a real provider change, not on every user
+    // click inside the selector.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider])
 
   useEffect(() => {
     if (accounts.length === 0 && !loading) {
@@ -34,13 +62,17 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
     return undefined
   }, [open])
 
+  const isAzure = provider === 'AZURE'
+  const aggregateLabel = isAzure ? 'All Azure Subscriptions' : 'All AWS Accounts'
+  const rowLabel = isAzure ? 'Azure Subscription' : 'AWS Account'
+
   const label = useMemo(() => {
-    if (selection === 'all') return 'All AWS Accounts'
+    if (selection === 'all') return aggregateLabel
     const id = selection.replace(/^acct:/, '')
-    const found = accounts.find((a) => String(a.id) === id)
+    const found = visibleAccounts.find((a) => String(a.id) === id)
     if (found) return `${found.display_name} — ${found.account_id}`
-    return `Account ${id}`
-  }, [selection, accounts])
+    return `${isAzure ? 'Subscription' : 'Account'} ${id}`
+  }, [selection, visibleAccounts, aggregateLabel, isAzure])
 
   function pick(value: AccountSelection) {
     setSelection(value)
@@ -57,7 +89,7 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
         aria-expanded={open}
         data-testid="account-selector-button"
       >
-        <span className="text-fg-muted">AWS Account:</span>
+        <span className="text-fg-muted">{rowLabel}:</span>
         <span className="font-semibold">{label}</span>
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -92,17 +124,20 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
               }`}
               data-testid="account-option-all"
             >
-              <span className="font-semibold">All AWS Accounts</span>
+              <span className="font-semibold">{aggregateLabel}</span>
               <span className="text-xs text-fg-muted">
-                {accounts.length} registered
+                {visibleAccounts.length} registered
               </span>
             </button>
           </li>
-          {accounts.length > 0 && (
+          {visibleAccounts.length > 0 && (
             <li className="my-1 border-t border-border" />
           )}
-          {accounts.map((acc) => {
+          {visibleAccounts.map((acc) => {
             const value = `acct:${acc.id}` as AccountSelection
+            const testId = isAzure
+              ? `azure-sub-option-${acc.id}`
+              : `account-option-${acc.id}`
             return (
               <li key={acc.id}>
                 <button
@@ -115,7 +150,7 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
                       ? 'bg-info-soft text-info'
                       : 'text-fg-primary hover:bg-surface-hover'
                   }`}
-                  data-testid={`account-option-${acc.id}`}
+                  data-testid={testId}
                 >
                   <span className="flex flex-col">
                     <span className="font-semibold">{acc.display_name}</span>
@@ -128,9 +163,11 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
               </li>
             )
           })}
-          {!loading && accounts.length === 0 && (
+          {!loading && visibleAccounts.length === 0 && (
             <li className="px-3 py-2 text-xs text-fg-muted">
-              No accounts registered yet. Ask an ADMIN to add one.
+              {isAzure
+                ? 'No Azure subscriptions registered yet. Ask an ADMIN to add one.'
+                : 'No AWS accounts registered yet. Ask an ADMIN to add one.'}
             </li>
           )}
           {loading && (

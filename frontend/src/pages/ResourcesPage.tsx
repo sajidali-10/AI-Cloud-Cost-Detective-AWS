@@ -29,6 +29,7 @@ import {
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
+import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   ResourcesResponse,
@@ -80,13 +81,20 @@ const KIND_LABELS: Record<ResourceKind, string> = {
 export function ResourcesPage() {
   const { region } = useFinopsPeriod()
   const { selection } = useAccountContext()
-  const { providerSlug, providerVersion } = useProviderContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
     : providerSlug === 'rackspace'
     ? ('rackspace' as const)
     : ('aws' as const)
+
+  // Phase 7C.2A — Azure Resource Graph is NOT yet implemented.
+  // Surface a capability-aware empty state instead of calling
+  // AWS endpoints.
+  if (provider === 'AZURE') {
+    return <ProviderCapabilityNotice provider="AZURE" feature="Resources" />
+  }
 
   // Phase 7B: invalidate stale data on account switch.
   // Phase 7C.1: also invalidate on provider change.

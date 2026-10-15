@@ -39,6 +39,7 @@ import {
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
+import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
@@ -67,13 +68,44 @@ import {
 export function DashboardPage() {
   const { period, region, currentMonth } = useFinopsPeriod()
   const { selection } = useAccountContext()
-  const { providerSlug, providerVersion } = useProviderContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
     : providerSlug === 'rackspace'
     ? ('rackspace' as const)
     : ('aws' as const)
+
+  // Phase 7C.2A — Azure capability-aware empty state.  When
+  // Azure is selected, the dashboard does NOT call AWS endpoints;
+  // it shows a professional capability-aware message that names
+  // the phase that will activate each surface.
+  if (provider === 'AZURE') {
+    return (
+      <div className="space-y-5">
+        <PageHeader
+          eyebrow="AI Cloud Cost Detective"
+          title="Azure Dashboard"
+          subtitle="Azure authentication and subscription access are connected. Cost, resource and optimization data will appear here in their respective phases."
+        />
+        <ProviderCapabilityNotice
+          provider="AZURE"
+          feature="Costs"
+          message="Authentication and subscription access are connected. Cost Management integration will activate in Phase 7C.2B."
+        />
+        <ProviderCapabilityNotice
+          provider="AZURE"
+          feature="Resources"
+          message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
+        />
+        <ProviderCapabilityNotice
+          provider="AZURE"
+          feature="Optimization"
+          message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
+        />
+      </div>
+    )
+  }
 
   // Phase 7B: invalidate stale data when the user switches accounts.
   // The store's cache is keyed on (period, region, account) so this

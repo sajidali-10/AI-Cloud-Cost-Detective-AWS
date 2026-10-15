@@ -136,6 +136,40 @@ def _phase7b_bootstrap_management_account() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 7C.2A: bootstrap the configured Azure subscriptions.
+#
+# Subscription IDs are read from runtime configuration
+# (``AZURE_SUBSCRIPTION_<N>_*`` env vars, see
+# :mod:`app.services.cloud.azure.registrations`) and inserted
+# idempotently on first boot.  When the runtime is not
+# configured (no Entra tenant / client ids), the bootstrap is
+# a silent no-op so a deployment without Azure keeps working.
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+def _phase7c2a_bootstrap_azure_subscriptions() -> None:
+    """Idempotently register the configured Azure subscriptions.
+
+    Wrapped in a try/except so a misconfiguration cannot prevent
+    the application from starting.  Operators can always add
+    subscriptions later through the standard
+    ``POST /api/cloud-accounts`` API.
+    """
+    try:
+        from app.services.cloud.azure.adapter import (
+            bootstrap_azure_subscriptions_once,
+        )
+
+        bootstrap_azure_subscriptions_once()
+    except Exception as exc:  # noqa: BLE001 — bootstrap must never block startup
+        logger.warning(
+            "phase7c2a bootstrap_azure_subscriptions failed: %s",
+            type(exc).__name__,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Flatten HTTPException ``detail`` dicts into the top-level response
 # body so auth/RBAC errors share the same envelope as the rest of
 # the API (``{status, error_code, message, ...}``).

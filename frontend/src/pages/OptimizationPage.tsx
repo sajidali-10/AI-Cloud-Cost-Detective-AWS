@@ -32,6 +32,7 @@ import {
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
+import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   BillingPeriod,
@@ -57,13 +58,18 @@ function periodDisplay(period: BillingPeriod): string {
 export function OptimizationPage() {
   const { period, region } = useFinopsPeriod()
   const { selection } = useAccountContext()
-  const { providerSlug, providerVersion } = useProviderContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
     : providerSlug === 'rackspace'
     ? ('rackspace' as const)
     : ('aws' as const)
+
+  // Phase 7C.2A — Azure Advisor is NOT yet implemented.
+  if (provider === 'AZURE') {
+    return <ProviderCapabilityNotice provider="AZURE" feature="Optimization" />
+  }
   const periodText = periodDisplay(period)
 
   // Phase 7B: invalidate stale data on account switch.

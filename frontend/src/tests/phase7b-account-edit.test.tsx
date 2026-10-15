@@ -70,14 +70,25 @@ describe('Phase 7B — AccountsPage Edit feature (source)', () => {
 
   it('management rows cannot edit role_arn or external_id', () => {
     expect(page).toMatch(/editing\.is_management/)
-    // Look for the management-branch message.  The string contains
-    // 'role_arn and external ID' — search for that literal.
-    expect(page).toContain('role ARN and external ID are managed')
+    // Look for the management-branch message.  JSX may split the
+    // copy across lines, so assert on the stable substrings.
+    expect(page).toContain('role ARN and external ID are')
     expect(page).toContain('cannot be edited')
     // The role_arn / external_id inputs are gated on
     // ``!editing.is_management`` so management rows never render
     // them.
     expect(page).toMatch(/!editing\.is_management/)
+  })
+
+  it('Phase 7C.2A: management edit hint matches the documented literal', () => {
+    // Phase 7C.2A refactored the Edit modal so the management hint
+    // is rendered as a single paragraph.  The literal copy below
+    // is broken across lines by JSX whitespace so we assert the
+    // substrings individually rather than the whole concatenated
+    // sentence.
+    expect(page).toContain('Management account: role ARN and external ID are')
+    expect(page).toContain('managed by the platform and cannot be edited from')
+    expect(page).toContain('this UI.')
   })
 
   it('rejects bad role_arn on save', () => {
