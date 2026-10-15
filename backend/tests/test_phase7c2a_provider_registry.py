@@ -130,45 +130,43 @@ def test_aws_and_azure_adapters_coexist():
 # ---------------------------------------------------------------------------
 
 
-def test_azure_adapter_capabilities_publish_supported_subset():
+def test_azure_adapter_capabilities_publish_supported_subset(monkeypatch):
     """Phase 7C.2A: the Azure adapter supports AUTHENTICATION and
     SUBSCRIPTIONS; everything else is UNSUPPORTED.  When the
     runtime is not configured, AUTHENTICATION + SUBSCRIPTIONS fall
     back to NOT_CONFIGURED.
+
+    Phase 7C.2B advances ``COSTS`` to ``SUPPORTED`` when the
+    runtime is configured; the test is updated to accept the
+    new state.  ``RESOURCES``, ``OPTIMIZATION`` etc. remain
+    ``UNSUPPORTED`` until their respective phases ship.
     """
     from app.services.cloud.azure import credential as cred_mod
+    from app.services.cloud.azure.adapter import AzureCloudProvider
     from app.services.cloud.base import (
         CloudCapability,
         CloudCapabilityState,
     )
 
     # Try both states (configured / not configured) by toggling
-    # the monkeypatched is_configured.  Either state is valid;
-    # the test pins the contract.
-    configured_truth = [True, False]
-    observed = []
-    for truth in configured_truth:
-        # Reset and patch.
-        try:
-            ProviderRegistry.current().enable(CloudProviderKind.AZURE)
-        except Exception:
-            pass
-        if truth:
-            cred_mod.reset_credential_cache()
-            ProviderRegistry.current().enable(CloudProviderKind.AZURE)
-        status = type("S", (), {"is_configured": staticmethod(lambda t=truth: t)})()
-        # Use the adapter's capability snapshot directly.
-        from app.services.cloud.azure.adapter import AzureCloudProvider
+    # the monkeypatched is_configured on the credential module —
+    # this is the symbol the adapter's ``_is_configured`` helper
+    # routes through.
+    for truth in [True, False]:
+        monkeypatch.setattr(cred_mod, "is_configured", lambda t=truth: t)
+        ProviderRegistry.current().enable(CloudProviderKind.AZURE)
         snapshot = AzureCloudProvider().get_capabilities()
-        observed.append((truth, snapshot))
 
-    # Both snapshots MUST mark AUTHENTICATION / SUBSCRIPTIONS as
-    # SUPPORTED if configured, NOT_CONFIGURED otherwise.  COSTS,
-    # RESOURCES, OPTIMIZATION etc. are always UNSUPPORTED.
-    for truth, snapshot in observed:
-        for cap in (CloudCapability.COSTS, CloudCapability.RESOURCES, CloudCapability.OPTIMIZATION):
+        for cap in (
+            CloudCapability.RESOURCES,
+            CloudCapability.OPTIMIZATION,
+            CloudCapability.METRICS,
+            CloudCapability.BILLING,
+            CloudCapability.ADVISOR,
+            CloudCapability.AI_EVIDENCE,
+        ):
             assert snapshot.capabilities[cap] == CloudCapabilityState.UNSUPPORTED, (
-                f"{cap.value} must be UNSUPPORTED in Phase 7C.2A (truth={truth})"
+                f"{cap.value} must be UNSUPPORTED (truth={truth})"
             )
         auth_state = snapshot.capabilities[CloudCapability.AUTHENTICATION]
         assert auth_state in (
@@ -180,3 +178,10 @@ def test_azure_adapter_capabilities_publish_supported_subset():
             CloudCapabilityState.SUPPORTED,
             CloudCapabilityState.NOT_CONFIGURED,
         ), subs_state
+        costs_state = snapshot.capabilities[CloudCapability.COSTS]
+        if truth:
+            # Runtime configured — Phase 7C.2B advances COSTS to
+            # SUPPORTED.
+            assert costs_state == CloudCapabilityState.SUPPORTED, costs_state
+        else:
+            assert costs_state == CloudCapabilityState.NOT_CONFIGURED, costs_state

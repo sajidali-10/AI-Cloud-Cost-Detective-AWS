@@ -230,13 +230,14 @@ class AzureCloudProvider(CloudProvider):
     ) -> CloudProviderStatus:
         """Return the Azure capability snapshot.
 
-        Phase 7C.2A only supports ``AUTHENTICATION`` and
-        ``SUBSCRIPTIONS``.  Every other capability is reported as
-        ``UNSUPPORTED`` with a ``phase`` detail pointing at the
-        delivery phase (7C.2B / 7C.2C / 7C.2D).  When the runtime
-        configuration is missing, ``AUTHENTICATION`` /
-        ``SUBSCRIPTIONS`` both fall back to ``NOT_CONFIGURED`` so
-        the UI can show the operator-facing remediation copy.
+        Phase 7C.2A: supports ``AUTHENTICATION`` and
+        ``SUBSCRIPTIONS``.
+
+        Phase 7C.2B: also supports ``COSTS`` — Cost Management
+        integration is wired and live.  RESOURCES / OPTIMIZATION /
+        METRICS / BILLING / ADVISOR / AI_EVIDENCE remain
+        ``UNSUPPORTED`` until their respective delivery phases
+        (7C.2C / 7C.2D).
         """
         runtime_configured = _credential_mod.is_configured()
         auth_state = (
@@ -249,11 +250,16 @@ class AzureCloudProvider(CloudProvider):
             if runtime_configured
             else CloudCapabilityState.NOT_CONFIGURED
         )
+        costs_state = (
+            CloudCapabilityState.SUPPORTED
+            if runtime_configured
+            else CloudCapabilityState.NOT_CONFIGURED
+        )
         capabilities: Dict[CloudCapability, CloudCapabilityState] = {
             CloudCapability.AUTHENTICATION: auth_state,
             CloudCapability.SUBSCRIPTIONS: subs_state,
+            CloudCapability.COSTS: costs_state,
             # Future phases:
-            CloudCapability.COSTS: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.RESOURCES: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.OPTIMIZATION: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.METRICS: CloudCapabilityState.UNSUPPORTED,
@@ -273,7 +279,16 @@ class AzureCloudProvider(CloudProvider):
                 "validation_endpoint": "GET /subscriptions/{id}",
                 "configured": runtime_configured,
             },
-            CloudCapability.COSTS: {"phase": "7C.2B", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.COSTS: {
+                "phase": "7C.2B",
+                "status": "SUPPORTED" if runtime_configured else "NOT_CONFIGURED",
+                "source": "Microsoft Cost Management Query API",
+                "api_version": "2026-06-01",
+                "cost_type": "ActualCost",
+                "scope": "subscription",
+                "dimensions": ["ServiceName", "ResourceLocation"],
+                "granularity": ["Daily", "None"],
+            },
             CloudCapability.RESOURCES: {"phase": "7C.2C", "status": "NOT_IMPLEMENTED"},
             CloudCapability.OPTIMIZATION: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
             CloudCapability.METRICS: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
@@ -386,31 +401,93 @@ class AzureCloudProvider(CloudProvider):
         finally:
             client.close()
 
-    # ---- Stubs (out of scope for 7C.2A) ------------------------------------
+    # ---- Cost (Phase 7C.2B) ---------------------------------------------
+
+    async def get_cost_summary(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        period_start: date,
+        period_end: date,
+        previous_period_start: date,
+        previous_period_end: date,
+        region: Optional[str] = None,
+    ) -> CloudCostSummary:
+        """Aggregate Cost Management data for ``accounts`` over the window.
+
+        ``accounts`` is the set of registry rows the caller wants
+        included; the adapter fans out across subscriptions with
+        bounded concurrency and folds the per-subscription snapshots
+        into a single provider-neutral
+        :class:`~app.services.cloud.models.CloudCostSummary`.
+        """
+        from app.services.cloud.azure.cost_aggregator import (
+            aggregate_cost_summary_for_subscriptions,
+        )
+
+        rows = list(accounts) if accounts else []
+        summary, failures = await aggregate_cost_summary_for_subscriptions(
+            rows=rows,
+            period_start=period_start,
+            period_end=period_end,
+            previous_period_start=previous_period_start,
+            previous_period_end=previous_period_end,
+            today=date.today(),
+            region=region,
+        )
+        return summary
+
+    async def get_cost_trend(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        period_start: date,
+        period_end: date,
+        region: Optional[str] = None,
+    ) -> CloudCostTrend:
+        from app.services.cloud.azure.cost_aggregator import (
+            aggregate_cost_trend_for_subscriptions,
+        )
+
+        rows = list(accounts) if accounts else []
+        trend, failures, currency_status = await aggregate_cost_trend_for_subscriptions(
+            rows=rows,
+            period_start=period_start,
+            period_end=period_end,
+            today=date.today(),
+        )
+        return trend
+
+    async def get_cost_by_service(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        period_start: date,
+        period_end: date,
+        region: Optional[str] = None,
+    ) -> List[CloudServiceCost]:
+        from app.services.cloud.azure.cost_aggregator import (
+            aggregate_cost_by_service_for_subscriptions,
+        )
+
+        rows = list(accounts) if accounts else []
+        items, status, failures = await aggregate_cost_by_service_for_subscriptions(
+            rows=rows,
+            period_start=period_start,
+            period_end=period_end,
+            today=date.today(),
+        )
+        return list(items)
+
+    # ---- Stubs (out of scope for 7C.2B) ------------------------------------
 
     # The following methods are abstract on ``CloudProvider``.  They
     # will only ever be called if a future caller asks the Azure
-    # adapter to produce cost / resource / recommendation data,
-    # which Phase 7C.2A explicitly refuses to do.  We still
-    # implement them so the adapter can be instantiated; each
-    # raises ``NotImplementedError`` with a stable message so any
+    # adapter to produce resource / recommendation data, which
+    # Phase 7C.2B explicitly refuses to do.  We still implement
+    # them so the adapter can be instantiated; each raises
+    # ``NotImplementedError`` with a stable message so any
     # regression that calls into the stubs is loud.
-
-    async def get_cost_summary(self, **_kwargs: Any) -> CloudCostSummary:
-        raise NotImplementedError(
-            "Azure Cost Management is scheduled for Phase 7C.2B; "
-            "the AzureCloudProvider refuses to return fabricated cost data."
-        )
-
-    async def get_cost_trend(self, **_kwargs: Any) -> CloudCostTrend:
-        raise NotImplementedError(
-            "Azure Cost Management is scheduled for Phase 7C.2B."
-        )
-
-    async def get_cost_by_service(self, **_kwargs: Any) -> List[CloudServiceCost]:
-        raise NotImplementedError(
-            "Azure Cost Management is scheduled for Phase 7C.2B."
-        )
 
     async def get_resources(self, **_kwargs: Any) -> List[CloudResource]:
         raise NotImplementedError(

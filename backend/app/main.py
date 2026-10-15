@@ -41,6 +41,10 @@ from app.api import cloud_accounts  # noqa: F401  (registers /api/cloud-accounts
 # surface; the AWS-specific routes below remain for backwards
 # compatibility.
 from app.api.cloud_providers import router as cloud_providers_router
+# Phase 7C.2B: provider-neutral cloud cost surface.  Mounted
+# alongside cloud_providers so the canonical route is
+# ``/api/cloud/costs`` after Nginx strips ``/api/``.
+from app.api.cloud_costs import router as cloud_costs_router
 # Phase 5A: authentication + admin user management routers.  These
 # are mounted with their own prefixes (/auth, /admin/users); nginx
 # strips /api/ as usual.
@@ -102,6 +106,8 @@ app.include_router(ws_conversations_router)
 
 # Phase 7C.1: provider-neutral cloud routes mounted under /api/cloud/*.
 app.include_router(cloud_providers_router)
+# Phase 7C.2B: provider-neutral cloud cost route mounted under /api/cloud/*.
+app.include_router(cloud_costs_router)
 
 
 # ---------------------------------------------------------------------------

@@ -203,10 +203,110 @@ class MultiAccountCostReportResponse(BaseModel):
     expires_at: Optional[datetime] = None
 
 
+# ---------------------------------------------------------------------------
+# Phase 7C.2B — provider-neutral Cloud cost envelope.
+# ---------------------------------------------------------------------------
+
+
+class CloudCostAccountShare(BaseModel):
+    """A single subscription's contribution to a Cloud cost rollup.
+
+    For AWS rows ``account_id`` carries the 12-digit AWS account ID.
+    For Azure rows it carries the subscription GUID.  ``display_name``
+    is the operator-supplied label.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    account_id: str
+    display_name: str
+    amount: Decimal
+    currency: Optional[str] = None
+
+
+class CloudCostAccountError(BaseModel):
+    """A sanitised per-scope failure surfaced in the aggregate.
+
+    For Azure rows ``account_id`` carries the subscription GUID.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    account_id: str
+    display_name: str
+    code: str
+    message: str
+
+
+class CloudCostReport(BaseModel):
+    """The provider-neutral multi-account cost envelope.
+
+    ``provider`` is one of ``"AWS"`` / ``"AZURE"`` (future
+    ``"RACKSPACE"``).  ``scope_kind`` distinguishes
+    ``"all"`` / ``"single"`` so the frontend can render
+    "All Accounts" / "Account X" / "All Subscriptions" /
+    "Subscription X" without re-parsing the scope token.
+
+    ``by_account`` doubles as ``by_subscription`` for Azure —
+    the shape is identical (id, display_name, amount).  We do
+    NOT add a separate ``by_subscription`` field; the model
+    stays single-shape so the shared UI does not need provider-
+    specific branching.
+
+    ``currency_status`` is ``"OK"`` / ``"MIXED_CURRENCY"`` /
+    ``"EMPTY"`` / ``"NO_DATA"``.  ``MIXED_CURRENCY`` is a
+    *distinct* state from ``OK`` — the totals are zeroed and
+    the UI must render an explicit "mixed currency" message
+    instead of inventing an FX rate.
+
+    ``status`` is the same ``SUCCESS`` / ``PARTIAL_SUCCESS`` /
+    ``ERROR`` vocabulary the Phase 7B AWS route uses.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    provider: str = Field(description="AWS | AZURE | RACKSPACE")
+    scope: str = Field(description="all | acct:<id> | sub:<id>")
+    scope_kind: str = Field(description="all | single")
+    status: str
+    currency_status: str = "OK"
+    account_id: Optional[str] = None
+    account_display_name: Optional[str] = None
+    period: CostPeriod
+    previous_period: CostPeriod
+    currency: str = "USD"
+    total_cost: Decimal
+    previous_period_cost: Decimal
+    change_amount: Decimal
+    change_percent: Optional[Decimal]
+    estimated: bool = False
+    daily_trend: List[DailyCostPoint]
+    by_service: List[ServiceCost]
+    by_region: List[RegionCost]
+    by_account: List[CloudCostAccountShare] = Field(default_factory=list)
+    account_errors: List[CloudCostAccountError] = Field(default_factory=list)
+    source: str = "CLOUD_COST"
+
+
+class CloudCostReportResponse(BaseModel):
+    """The wire envelope for a provider-neutral cost report."""
+
+    model_config = ConfigDict(frozen=True)
+
+    report: CloudCostReport
+    cache_status: CacheStatus
+    cached_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
 __all__ = [
     "AccountCostError",
     "AccountCostShare",
     "CacheStatus",
+    "CloudCostAccountError",
+    "CloudCostAccountShare",
+    "CloudCostReport",
+    "CloudCostReportResponse",
     "CostPeriod",
     "CostReport",
     "CostReportResponse",

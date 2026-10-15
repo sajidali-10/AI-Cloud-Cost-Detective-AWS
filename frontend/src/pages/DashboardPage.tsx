@@ -29,6 +29,11 @@ import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery } from '../lib/finops/store'
 import { fetchIdentity } from '../lib/finops/identity'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
+import {
+  fetchCloudCostReport,
+  adaptCloudCostReport,
+  buildCloudCostsCacheKey,
+} from '../lib/finops/cloudCosts'
 import { fetchResources, buildResourcesCacheKey } from '../lib/finops/resources'
 import {
   fetchCapabilities,
@@ -76,37 +81,6 @@ export function DashboardPage() {
     ? ('rackspace' as const)
     : ('aws' as const)
 
-  // Phase 7C.2A — Azure capability-aware empty state.  When
-  // Azure is selected, the dashboard does NOT call AWS endpoints;
-  // it shows a professional capability-aware message that names
-  // the phase that will activate each surface.
-  if (provider === 'AZURE') {
-    return (
-      <div className="space-y-5">
-        <PageHeader
-          eyebrow="AI Cloud Cost Detective"
-          title="Azure Dashboard"
-          subtitle="Azure authentication and subscription access are connected. Cost, resource and optimization data will appear here in their respective phases."
-        />
-        <ProviderCapabilityNotice
-          provider="AZURE"
-          feature="Costs"
-          message="Authentication and subscription access are connected. Cost Management integration will activate in Phase 7C.2B."
-        />
-        <ProviderCapabilityNotice
-          provider="AZURE"
-          feature="Resources"
-          message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
-        />
-        <ProviderCapabilityNotice
-          provider="AZURE"
-          feature="Optimization"
-          message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
-        />
-      </div>
-    )
-  }
-
   // Phase 7B: invalidate stale data when the user switches accounts.
   // The store's cache is keyed on (period, region, account) so this
   // is belt-and-braces — it ensures no stale entry from a previous
@@ -126,6 +100,22 @@ export function DashboardPage() {
       prevProviderRef.current = cacheProvider
     }
   }, [selection, cacheProvider, providerVersion])
+
+  // Phase 7C.2B — Azure dashboard reuses the same layout as AWS
+  // but routes cost data through the canonical
+  // ``/api/cloud/costs`` endpoint.  Resources and Optimization
+  // remain placeholders until 7C.2C / 7C.2D ship.
+  if (provider === 'AZURE') {
+    return (
+      <AzureDashboard
+        period={period}
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+        currentMonth={currentMonth}
+      />
+    )
+  }
 
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
@@ -729,4 +719,224 @@ function fieldGrid() {
 }
 function summaryByCategory(rows: SummaryByCategory[]) {
   return rows
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7C.2B — Azure Dashboard
+// ---------------------------------------------------------------------------
+
+function AzureDashboard({
+  period,
+  selection,
+  cacheProvider,
+  providerVersion: _providerVersion,
+  currentMonth,
+}: {
+  period: import('../types/finops').BillingPeriod
+  selection: string | null
+  cacheProvider: 'aws' | 'azure' | 'rackspace'
+  providerVersion: number
+  currentMonth: string
+}) {
+  // Cost report — provider-neutral route.
+  const cost = useFinopsQuery<CostReportResponse>(
+    buildCloudCostsCacheKey(period, null, selection, cacheProvider),
+    () =>
+      fetchCloudCostReport(period, {
+        provider: 'AZURE',
+        accountId: selection,
+      }).then(adaptCloudCostReport),
+  )
+  const report = cost.entry.data?.report ?? null
+  const activeMonthLabel = period.kind === 'month' ? monthLabel(period.month) : monthLabel(currentMonth)
+
+  const refreshAll = () => {
+    cost.refresh()
+  }
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="AI Cloud Cost Detective"
+        title="Azure Dashboard"
+        subtitle="Azure Cost Management, subscription access and AI-powered FinOps analysis"
+        context={
+          <>
+            <ContextItem
+              label="Subscription"
+              value={
+                report?.account_id
+                  ? maskAccountId(report.account_id)
+                  : selection === 'all' || selection === null
+                    ? 'All Azure Subscriptions'
+                    : maskAccountId(selection)
+              }
+            />
+            <ContextItem label="Month" value={activeMonthLabel} />
+            <ContextItem
+              label="Status"
+              value={
+                <StatusBadge
+                  tone={
+                    cost.entry.status === 'success'
+                      ? 'success'
+                      : cost.entry.status === 'error'
+                        ? 'danger'
+                        : 'info'
+                  }
+                >
+                  {cost.entry.status === 'success'
+                    ? 'Live'
+                    : cost.entry.status === 'loading'
+                      ? 'Loading'
+                      : cost.entry.status === 'refreshing'
+                        ? 'Refreshing'
+                        : cost.entry.status === 'error'
+                          ? 'Unavailable'
+                          : 'Idle'}
+                </StatusBadge>
+              }
+            />
+            <ContextItem label="Last updated" value={formatLocalTime(cost.entry.refreshedAt)} />
+          </>
+        }
+        actions={
+          <div className="flex items-center gap-2">
+            <PeriodSelector />
+            <RefreshButton onClick={refreshAll} />
+          </div>
+        }
+      />
+
+      {cost.entry.error && !cost.entry.data && (
+        <PartialWarning
+          warnings={[
+            {
+              source: 'costs',
+              code: 'error',
+              message: cost.entry.error.message,
+              region: null,
+            },
+          ]}
+          title="Cost data could not be loaded"
+        />
+      )}
+
+      <DashboardHero
+        accountLabel={
+          report?.account_id
+            ? maskAccountId(report.account_id)
+            : selection === 'all' || selection === null
+              ? 'All Azure Subscriptions'
+              : maskAccountId(selection)
+        }
+        regionLabel={null}
+        refreshedLabel={formatLocalTime(cost.entry.refreshedAt)}
+        dataStatus={
+          cost.entry.status === 'success'
+            ? 'live'
+            : cost.entry.status === 'loading'
+              ? 'loading'
+              : cost.entry.status === 'refreshing'
+                ? 'refreshing'
+                : cost.entry.status === 'error'
+                  ? 'unavailable'
+                  : 'idle'
+        }
+      />
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ResourcesKpiAzure />
+        <OptimizeKpiAzure />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <SectionCard
+          title="Cost Trend"
+          description={`Daily spend · ${activeMonthLabel}`}
+          actions={
+            <StatusBadge tone={cost.entry.data?.cache_status === 'HIT' ? 'neutral' : 'info'}>
+              Cache: {cost.entry.data?.cache_status ?? '—'}
+            </StatusBadge>
+          }
+        >
+          {cost.entry.status === 'loading' && <LoadingSkeleton className="h-[200px] w-full" />}
+          {cost.entry.error && <ErrorState message={cost.entry.error.message} />}
+          {cost.entry.data && (
+            <CostTrendChart
+              points={cost.entry.data.report.daily_trend}
+              currency={cost.entry.data.report.currency}
+              ariaLabel={`Daily cost trend for ${activeMonthLabel}`}
+            />
+          )}
+        </SectionCard>
+        <SectionCard
+          title="Cost by Service"
+          description="Top services by spend"
+          actions={
+            <StatusBadge tone={report?.estimated ? 'warning' : 'success'}>
+              {report?.estimated ? 'Estimated' : 'Final'}
+            </StatusBadge>
+          }
+        >
+          {cost.entry.status === 'loading' && <LoadingSkeletonRows rows={6} />}
+          {cost.entry.error && <ErrorState message={cost.entry.error.message} />}
+          {cost.entry.data && (
+            <HorizontalBarChart
+              rows={serviceRows(cost.entry.data.report.by_service)}
+              currency={cost.entry.data.report.currency}
+              maxRows={10}
+              showShare
+              safeShare
+            />
+          )}
+        </SectionCard>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <SectionCard
+          title="Optimization"
+          description="Advisor integration"
+        >
+          <ProviderCapabilityNotice
+            provider="AZURE"
+            feature="Optimization"
+            message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
+          />
+        </SectionCard>
+        <SectionCard
+          title="Azure Resources"
+          description="Resource Graph inventory"
+        >
+          <ProviderCapabilityNotice
+            provider="AZURE"
+            feature="Resources"
+            message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
+          />
+        </SectionCard>
+      </div>
+    </div>
+  )
+}
+
+function ResourcesKpiAzure() {
+  return (
+    <MetricCard
+      label="Resources"
+      value="—"
+      description="Coming in Phase 7C.2C"
+    />
+  )
+}
+
+function OptimizeKpiAzure() {
+  return (
+    <MetricCard
+      label="Optimize"
+      value="—"
+      description="Coming in Phase 7C.2D"
+    />
+  )
 }
