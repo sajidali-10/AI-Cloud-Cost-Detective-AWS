@@ -61,12 +61,6 @@ class TestAzureCapabilities:
             CloudCapabilityState.SUPPORTED
         )
 
-    def test_resources_unimplemented(self, azure_adapter, azure_runtime_configured):
-        status = azure_adapter.get_capabilities()
-        assert status.capabilities[CloudCapability.RESOURCES] == (
-            CloudCapabilityState.UNSUPPORTED
-        )
-
     def test_optimization_unimplemented(
         self, azure_adapter, azure_runtime_configured
     ):
@@ -134,10 +128,12 @@ class TestAzureAdapterCostMethods:
         source = inspect.getsource(azure_adapter.get_cost_by_service)
         assert "NotImplementedError" not in source
 
-    def test_get_resources_is_still_stub(self, azure_adapter):
-        """Phase 7C.2C — resources not yet implemented."""
+    def test_get_resources_no_longer_stub(self, azure_adapter):
+        """Phase 7C.2C advances ``get_resources`` to a real
+        implementation; the Phase 7C.2A/2B ``NotImplementedError``
+        stub is gone."""
         source = inspect.getsource(azure_adapter.get_resources)
-        assert "NotImplementedError" in source
+        assert "NotImplementedError" not in source
 
     def test_get_recommendations_is_still_stub(self, azure_adapter):
         """Phase 7C.2D — recommendations not yet implemented."""

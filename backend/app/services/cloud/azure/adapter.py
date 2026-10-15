@@ -234,10 +234,13 @@ class AzureCloudProvider(CloudProvider):
         ``SUBSCRIPTIONS``.
 
         Phase 7C.2B: also supports ``COSTS`` — Cost Management
-        integration is wired and live.  RESOURCES / OPTIMIZATION /
-        METRICS / BILLING / ADVISOR / AI_EVIDENCE remain
+        integration is wired and live.
+
+        Phase 7C.2C: also supports ``RESOURCES`` — Resource Graph
+        inventory is wired and live.  ``OPTIMIZATION`` / ``METRICS`` /
+        ``BILLING`` / ``ADVISOR`` / ``AI_EVIDENCE`` remain
         ``UNSUPPORTED`` until their respective delivery phases
-        (7C.2C / 7C.2D).
+        (7C.2D).
         """
         runtime_configured = _credential_mod.is_configured()
         auth_state = (
@@ -255,12 +258,17 @@ class AzureCloudProvider(CloudProvider):
             if runtime_configured
             else CloudCapabilityState.NOT_CONFIGURED
         )
+        resources_state = (
+            CloudCapabilityState.SUPPORTED
+            if runtime_configured
+            else CloudCapabilityState.NOT_CONFIGURED
+        )
         capabilities: Dict[CloudCapability, CloudCapabilityState] = {
             CloudCapability.AUTHENTICATION: auth_state,
             CloudCapability.SUBSCRIPTIONS: subs_state,
             CloudCapability.COSTS: costs_state,
+            CloudCapability.RESOURCES: resources_state,
             # Future phases:
-            CloudCapability.RESOURCES: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.OPTIMIZATION: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.METRICS: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.BILLING: CloudCapabilityState.UNSUPPORTED,
@@ -289,7 +297,22 @@ class AzureCloudProvider(CloudProvider):
                 "dimensions": ["ServiceName", "ResourceLocation"],
                 "granularity": ["Daily", "None"],
             },
-            CloudCapability.RESOURCES: {"phase": "7C.2C", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.RESOURCES: {
+                "phase": "7C.2C",
+                "status": "SUPPORTED" if runtime_configured else "NOT_CONFIGURED",
+                "source": "Microsoft Resource Graph Query API",
+                "api_version": "2024-04-01",
+                "scope": "subscription",
+                "default_columns": [
+                    "id",
+                    "name",
+                    "type",
+                    "location",
+                    "resourceGroup",
+                    "subscriptionId",
+                    "tags",
+                ],
+            },
             CloudCapability.OPTIMIZATION: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
             CloudCapability.METRICS: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
             CloudCapability.BILLING: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
@@ -479,25 +502,59 @@ class AzureCloudProvider(CloudProvider):
         )
         return list(items)
 
-    # ---- Stubs (out of scope for 7C.2B) ------------------------------------
+    # ---- Resources (Phase 7C.2C) -----------------------------------------
 
-    # The following methods are abstract on ``CloudProvider``.  They
-    # will only ever be called if a future caller asks the Azure
-    # adapter to produce resource / recommendation data, which
-    # Phase 7C.2B explicitly refuses to do.  We still implement
-    # them so the adapter can be instantiated; each raises
-    # ``NotImplementedError`` with a stable message so any
-    # regression that calls into the stubs is loud.
+    async def get_resources(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        region: Optional[str] = None,
+    ) -> List[CloudResource]:
+        """Enumerate resources via Azure Resource Graph.
 
-    async def get_resources(self, **_kwargs: Any) -> List[CloudResource]:
-        raise NotImplementedError(
-            "Azure Resource Graph is scheduled for Phase 7C.2C."
+        ``accounts`` is the set of registry rows the caller wants
+        included; the adapter fans out across subscriptions with
+        bounded concurrency and folds the per-subscription snapshots
+        into a single flat list of normalised
+        :class:`~app.services.cloud.models.CloudResource` shapes.
+        The ``region`` argument is intentionally ignored: Azure
+        Resource Graph returns location as a column, not a query
+        parameter; future region filtering belongs at the route
+        layer.
+        """
+        from app.services.cloud.azure.resource_aggregator import (
+            aggregate_resources_for_subscriptions,
         )
 
-    async def get_resource_summary(self, **_kwargs: Any) -> CloudResourceSummary:
-        raise NotImplementedError(
-            "Azure Resource Graph is scheduled for Phase 7C.2C."
+        rows = list(accounts) if accounts else []
+        _summary, flat, _failures = await aggregate_resources_for_subscriptions(
+            rows=rows
         )
+        return list(flat)
+
+    async def get_resource_summary(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        region: Optional[str] = None,
+    ) -> CloudResourceSummary:
+        """Aggregate a resource summary via Azure Resource Graph."""
+        from app.services.cloud.azure.resource_aggregator import (
+            aggregate_resources_for_subscriptions,
+        )
+
+        rows = list(accounts) if accounts else []
+        summary, _flat, _failures = await aggregate_resources_for_subscriptions(
+            rows=rows
+        )
+        return summary
+
+    # ---- Stubs (out of scope for 7C.2C) ------------------------------------
+
+    # Phase 7C.2D — recommendations / Advisor — is the only remaining
+    # abstract method on ``CloudProvider`` that the Azure adapter has
+    # not implemented.  Keep it as a NotImplementedError so any
+    # regression that calls into it is loud.
 
     async def get_recommendations(self, **_kwargs: Any) -> List[CloudRecommendation]:
         raise NotImplementedError(

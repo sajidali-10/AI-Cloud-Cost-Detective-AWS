@@ -158,7 +158,6 @@ def test_azure_adapter_capabilities_publish_supported_subset(monkeypatch):
         snapshot = AzureCloudProvider().get_capabilities()
 
         for cap in (
-            CloudCapability.RESOURCES,
             CloudCapability.OPTIMIZATION,
             CloudCapability.METRICS,
             CloudCapability.BILLING,
@@ -179,9 +178,12 @@ def test_azure_adapter_capabilities_publish_supported_subset(monkeypatch):
             CloudCapabilityState.NOT_CONFIGURED,
         ), subs_state
         costs_state = snapshot.capabilities[CloudCapability.COSTS]
+        resources_state = snapshot.capabilities[CloudCapability.RESOURCES]
         if truth:
             # Runtime configured — Phase 7C.2B advances COSTS to
-            # SUPPORTED.
+            # SUPPORTED; Phase 7C.2C advances RESOURCES to SUPPORTED.
             assert costs_state == CloudCapabilityState.SUPPORTED, costs_state
+            assert resources_state == CloudCapabilityState.SUPPORTED, resources_state
         else:
             assert costs_state == CloudCapabilityState.NOT_CONFIGURED, costs_state
+            assert resources_state == CloudCapabilityState.NOT_CONFIGURED, resources_state

@@ -223,7 +223,11 @@ class TestCloudCostsRoute:
     ):
         # The route module already has a local binding to the
         # original function, so we patch the *route's* binding
-        # rather than the source module.
+        # rather than the source module.  We use a numeric
+        # selection so the route's digit-only fast path picks up
+        # the patched resolver; the GUID-specific path falls
+        # through to a direct SQLAlchemy query and is exercised by
+        # Phase 7C.2C's live-validation script instead.
         from app.api import cloud_costs
 
         def fake_resolve(db, selection):
@@ -237,7 +241,7 @@ class TestCloudCostsRoute:
             params={
                 "provider": "AZURE",
                 "days": "30",
-                "account_id": "sub-aaaa-aaaa-aaaa",
+                "account_id": "sub:1",
             },
             headers={"Authorization": "Bearer test-token-not-real"},
         )
@@ -245,7 +249,10 @@ class TestCloudCostsRoute:
         body = response.json()
         report = body["report"]
         assert report["scope_kind"] == "single"
-        assert report["account_id"] == "sub-aaaa-aaaa-aaaa"
+        # The route canonicalises the scope to ``sub:<row.account_id>``
+        # regardless of the selector the caller supplied; that's the
+        # scoped cache key the route resolves to.
+        assert report["scope"] == f"sub:{single_row[0].account_id}"
 
     def test_month_parameter_accepted(self, client, auth_user, azure_adapter_stub, cloud_rows):
         response = client.get(
