@@ -1,4 +1,4 @@
-"""Azure Resource Graph REST client — Phase 7C.2C.
+"""Azure Resource Graph REST client — Phase 7C.2C.1.
 
 This module wraps the Microsoft Resource Graph Query API at tenant
 scope and turns the provider-specific payloads into the
@@ -15,10 +15,33 @@ Authentication reuses Phase 7C.2A/B's
 ``ClientAssertionCredential`` backed by AWS STS ``GetWebIdentityToken``.
 **No client secrets; no certificates.**
 
-Resource Graph returns rows in a flat ``data`` array when
-``resultFormat=objectArray`` is supplied; pagination is driven by a
-top-level ``$skipToken`` (passed back via the request body's
-``options.$skipToken`` field) when ``dataTruncated`` is ``true``.
+Pagination
+----------
+
+Resource Graph paginates large responses via ``$skipToken``.  The
+server returns ``resultTruncated=true`` on a response page that has
+more rows than were returned; the next request carries
+``options.$skipToken`` to fetch the next page.  ``options.$top`` caps
+the number of rows per page.
+
+**Critical**: Microsoft states that KQL operators ``limit`` / ``take``
+/ ``sample`` are **incompatible** with ``$skipToken`` continuation —
+they return ``resultTruncated=false`` even when more rows are
+available.  The KQL must therefore NOT include ``| limit`` /
+``| take`` / ``| sample``; the page size is controlled by the
+``options.$top`` request option alone.
+
+This module follows the documented contract:
+
+* First page: ``options.resultFormat=objectArray``,
+  ``options.$top=PAGE_TOP``; the KQL has NO ``| limit``.
+* Subsequent pages: same query + same ``options.resultFormat`` +
+  same ``$top`` + ``options.$skipToken=<token>``.
+* Truncation is detected via ``resultTruncated=true`` (the
+  documented response field).
+* Pathological responses raise
+  :class:`AzureResourceGraphError` so a truncated-but-uncallable
+  result is never silently reported as SUCCESS.
 
 Security contract
 -----------------
@@ -42,7 +65,7 @@ Security contract
 Thread-safety
 -------------
 
-:class:`AzureResourceGraphClient` owns a private ``httpx.Client` and
+:class:`AzureResourceGraphClient` owns a private ``httpx.Client`` and
 is safe to share across requests.  Instances are cheap to create —
 the resource aggregator mints one per call and closes it in the
 ``finally`` block.
@@ -53,7 +76,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import httpx
 
@@ -70,7 +93,7 @@ logger = logging.getLogger("cost-detective.azure.resource_graph")
 
 
 # ---------------------------------------------------------------------------
-# Constants — pinned for Phase 7C.2C.
+# Constants — pinned for Phase 7C.2C.1.
 # ---------------------------------------------------------------------------
 
 #: Microsoft Resource Graph Query API version.
@@ -81,14 +104,17 @@ RESOURCE_GRAPH_API_VERSION: str = "2024-04-01"
 #: ARM base URL.
 ARM_BASE_URL: str = "https://management.azure.com"
 
-#: Cost Management Query API caps page size; the same ceiling is
-#: the recommended upper bound for Resource Graph ``$top``.
+#: Page size requested via ``options.$top``.  Microsoft Resource
+#: Graph accepts values up to 1000; we pin to 1000 because the
+#: documented best practice for paginated inventory queries is to
+#: request the maximum page size.
 PAGE_TOP: int = 1000
 
-#: Defensive loop guard.  Resource Graph rarely paginates more than a
-#: few times for a single subscription; 50 pages × 1000 = 50k
-#: resources which exceeds the resource count of any realistic
-#: Phase 7C.2C target workload.
+#: Defensive loop guard.  Resource Graph paginates a few times for
+#: any realistic workload; 50 pages × 1000 = 50k resources which is
+#: well above any Phase 7C.2C target.  When the loop guard fires the
+#: client raises ``UPSTREAM_ERROR`` so the aggregator never
+#: silently reports ``SUCCESS`` on a partial result.
 MAX_PAGES: int = 50
 
 
@@ -105,6 +131,7 @@ class AzureResourceGraphErrorCategory(str, Enum):
     UPSTREAM_ERROR = "UPSTREAM_ERROR"
     NETWORK_ERROR = "NETWORK_ERROR"
     INVALID_RESPONSE = "INVALID_RESPONSE"
+    PAGINATION_INCOMPLETE = "PAGINATION_INCOMPLETE"
 
 
 @dataclass
@@ -140,6 +167,7 @@ class AzureResourceGraphResult:
     rows: Tuple[Mapping[str, Any], ...]
     total_records: int
     truncated: bool
+    pages_consumed: int
 
     def to_dict(self) -> dict:
         return {
@@ -147,11 +175,19 @@ class AzureResourceGraphResult:
             "rows": list(self.rows),
             "total_records": self.total_records,
             "truncated": self.truncated,
+            "pages_consumed": self.pages_consumed,
         }
 
 
 # ---------------------------------------------------------------------------
 # KQL query — hardcoded; no caller-supplied input.
+#
+# IMPORTANT: Do NOT add ``| limit`` / ``| take`` / ``| sample`` to this
+# query.  Microsoft Resource Graph treats those operators as final
+# results that cannot be paged — using them would silently truncate
+# the inventory at PAGE_TOP and disable $skipToken continuation.  The
+# page size is controlled via the ``options.$top`` request field
+# instead.
 # ---------------------------------------------------------------------------
 
 
@@ -163,15 +199,15 @@ def _build_resources_query() -> str:
     are projected so the frontend can render resource tagging
     without a second round-trip.
 
-    The ``| limit PAGE_TOP`` ceiling is intentional: Resource
-    Graph interprets ``| limit`` as a hard cap on rows returned
-    *before* pagination, so a bounded page size keeps the loop
-    guard deterministic.
+    The query intentionally contains NO ``| limit`` / ``| take`` /
+    ``| sample`` operator.  Pagination is driven by
+    ``options.$top`` + ``options.$skipToken`` on the request side.
+    Adding a ``| limit`` here would silently cap the inventory at
+    that value and disable continuation.
     """
     return (
         "Resources "
-        "| project id, name, type, location, resourceGroup, subscriptionId, tags "
-        f"| limit {PAGE_TOP}"
+        "| project id, name, type, location, resourceGroup, subscriptionId, tags"
     )
 
 
@@ -201,7 +237,7 @@ class AzureResourceGraphClient:
             base_url=self._base_url,
             timeout=timeout_seconds,
             trust_env=False,
-            headers={"User-Agent": "cost-detective-azure-rg/phase7c2c"},
+            headers={"User-Agent": "cost-detective-azure-rg/phase7c2c.1"},
         )
 
     def close(self) -> None:
@@ -223,6 +259,15 @@ class AzureResourceGraphClient:
         query.  When the list is empty, Resource Graph fans out across
         every subscription the configured identity is authorised to
         access (the *management-group* / *tenant* mode).
+
+        The returned :class:`AzureResourceGraphResult` reflects the
+        full pagination chain.  When Resource Graph signals a
+        truncated result it cannot continue (``resultTruncated=true``
+        but no ``$skipToken``), or when ``$skipToken`` repeats, or
+        when the loop guard fires, the function raises
+        :class:`AzureResourceGraphError` with category
+        ``PAGINATION_INCOMPLETE`` / ``UPSTREAM_ERROR``.  The aggregator
+        never sees a ``SUCCESS`` result with truncated data.
         """
         for sid in subscription_ids:
             if not sid or not isinstance(sid, str):
@@ -242,14 +287,31 @@ class AzureResourceGraphClient:
     ) -> AzureResourceGraphResult:
         """Walk the query call and any $skipToken pages.
 
-        Raises :class:`AzureResourceGraphError` on a non-2xx response
-        or network failure.  Returns the concatenated row set of the
-        final page.
+        Raises :class:`AzureResourceGraphError` on a non-2xx response,
+        network failure, or a pathological pagination response.
+        Returns the concatenated row set across every successful page.
+
+        Pathological conditions are surfaced (never silently dropped):
+
+        * ``resultTruncated=true`` without a ``$skipToken`` cursor
+          → ``PAGINATION_INCOMPLETE`` (the upstream told us there is
+          more data but did not give us a way to fetch it).
+        * ``$skipToken`` repeats a previously-seen value → ``UPSTREAM_ERROR``
+          (the upstream is looping; refuse to multiply charges).
+        * ``MAX_PAGES`` exceeded → ``UPSTREAM_ERROR``.
         """
         page_count = 0
         skip_token: Optional[str] = None
         columns: Tuple[str, ...] = ()
         rows: List[Mapping[str, Any]] = []
+        seen_skip_tokens: Set[str] = set()
+        seen_composite_ids: Set[str] = set()
+        duplicate_count = 0
+        # The ``last_data_signature`` is a deterministic fingerprint
+        # of the page we just received.  If the same rows come back
+        # twice in a row (because Resource Graph is misbehaving) we
+        # refuse to loop.
+        last_page_signature: Optional[Tuple] = None
         total_records = 0
 
         while True:
@@ -277,7 +339,7 @@ class AzureResourceGraphClient:
             }
             if subscription_ids:
                 body["subscriptions"] = list(subscription_ids)
-            if skip_token:
+            if skip_token is not None:
                 body["options"]["$skipToken"] = skip_token
 
             try:
@@ -318,6 +380,22 @@ class AzureResourceGraphClient:
                     subscription_id=subscription_ids[0] if subscription_ids else None,
                 ) from None
 
+            if response.status_code == 204:
+                # 204 No Content — the request was valid but the
+                # upstream returned no body.  Treat as an empty
+                # result (NO_DATA) rather than an error so the
+                # aggregator can surface a clean empty state.
+                logger.info(
+                    "azure.resource_query.no_content subs=%s page=%d",
+                    label, page_count,
+                )
+                return AzureResourceGraphResult(
+                    columns=(),
+                    rows=(),
+                    total_records=0,
+                    truncated=False,
+                    pages_consumed=page_count,
+                )
             if response.status_code != 200:
                 self._raise_for_status(
                     response,
@@ -340,23 +418,114 @@ class AzureResourceGraphClient:
             if page_count == 1:
                 columns = self._derive_columns(payload.get("data") or [])
             total_records = int(payload.get("totalRecords", total_records or 0))
-            truncated = bool(payload.get("dataTruncated", False))
-            for row in payload.get("data") or []:
-                if isinstance(row, dict):
-                    rows.append(row)
+            page_data = payload.get("data") or []
+            # Dedup rows by composite_id within a single client call.
+            # Across pages we keep the first occurrence and drop
+            # subsequent duplicates — this is defensive against an
+            # upstream that may echo rows across pagination windows.
+            for row in page_data:
+                if not isinstance(row, Mapping):
+                    continue
+                rid = row.get("id")
+                composite = f"AZURE|{rid}" if isinstance(rid, str) else None
+                if composite is not None:
+                    if composite in seen_composite_ids:
+                        duplicate_count += 1
+                        continue
+                    seen_composite_ids.add(composite)
+                rows.append(row)
+
+            # Pathological: detect a page that is byte-for-byte the
+            # same as the previous page.  If so, the upstream is
+            # echoing rows — refuse to loop.
+            page_signature = _page_signature(page_data)
+            if page_signature is not None and page_signature == last_page_signature:
+                logger.warning(
+                    "azure.resource_graph.repeated_page subs=%s page=%d",
+                    label, page_count,
+                )
+                raise AzureResourceGraphError(
+                    category=AzureResourceGraphErrorCategory.UPSTREAM_ERROR,
+                    subscription_id=subscription_ids[0] if subscription_ids else None,
+                    message="upstream echoed the same page; aborting to avoid duplicate charges",
+                )
+            last_page_signature = page_signature
+
+            # Resource Graph uses ``resultTruncated`` to signal that
+            # there are more rows than were returned.  ``count`` and
+            # ``totalRecords`` are the returned and total counts.
+            #
+            # IMPORTANT: Resource Graph can set ``resultTruncated=true``
+            # even when the returned page is logically complete — i.e.
+            # ``count == totalRecords``.  This is a known quirk,
+            # particularly in tenant-mode (empty ``subscriptions``)
+            # queries that span multiple partitions.  In that case
+            # the upstream does not issue a continuation token.  We
+            # tolerate this as the success boundary; only a truncated
+            # response where ``count < totalRecords`` requires a
+            # $skipToken.
+            truncated = bool(payload.get("resultTruncated", False))
             if not truncated:
                 break
-            skip_token = payload.get("$skipToken")
-            if not skip_token:
-                # ``dataTruncated=true`` without a skip token would
-                # loop forever.  Treat as the end of the result set.
+
+            count_in_page = len(page_data)
+            logically_complete = count_in_page >= total_records
+            new_skip_token = payload.get("$skipToken")
+            if logically_complete:
+                # The page already contains every row the upstream
+                # says exists.  Accept this as the success boundary —
+                # log it for observability but do not raise.
+                logger.info(
+                    "azure.resource_graph.complete_despite_truncated subs=%s page=%d count=%d total=%d",
+                    label, page_count, count_in_page, total_records,
+                )
                 break
+
+            # Truly truncated — expect a $skipToken.  Missing
+            # cursor is a pathological response: the upstream told
+            # us the data is incomplete but did not give us a way to
+            # fetch the rest.  Surface the failure; never silently
+            # succeed.
+            if not new_skip_token:
+                logger.warning(
+                    "azure.resource_graph.truncated_without_token subs=%s page=%d",
+                    label, page_count,
+                )
+                raise AzureResourceGraphError(
+                    category=AzureResourceGraphErrorCategory.PAGINATION_INCOMPLETE,
+                    subscription_id=subscription_ids[0] if subscription_ids else None,
+                    message=(
+                        "upstream returned resultTruncated=true without a $skipToken; "
+                        "cannot continue pagination safely"
+                    ),
+                )
+            # Repeated cursor protection: a repeated skipToken means
+            # the upstream is looping.  Refuse to multiply charges.
+            if new_skip_token in seen_skip_tokens:
+                logger.warning(
+                    "azure.resource_graph.repeated_skip_token subs=%s page=%d",
+                    label, page_count,
+                )
+                raise AzureResourceGraphError(
+                    category=AzureResourceGraphErrorCategory.UPSTREAM_ERROR,
+                    subscription_id=subscription_ids[0] if subscription_ids else None,
+                    message="upstream returned a repeated $skipToken; aborting",
+                )
+            seen_skip_tokens.add(new_skip_token)
+            skip_token = new_skip_token
+
+        if duplicate_count:
+            logger.info(
+                "azure.resource_graph.duplicate_rows_dropped count=%d",
+                duplicate_count,
+            )
 
         return AzureResourceGraphResult(
             columns=columns,
             rows=tuple(rows),
             total_records=total_records,
-            truncated=False,
+            truncated=False,  # By the time we return, all reachable rows are collected.
+            pages_consumed=page_count,
         )
 
     @staticmethod
@@ -448,8 +617,28 @@ class AzureResourceGraphClient:
 
 
 # ---------------------------------------------------------------------------
-# Retry-After parsing
+# Pagination helpers
 # ---------------------------------------------------------------------------
+
+
+def _page_signature(rows: Sequence[Mapping[str, Any]]) -> Optional[Tuple]:
+    """Compute a deterministic fingerprint of a response page.
+
+    Used to detect a pathological repeated page (the upstream echoed
+    the same rows back).  We fingerprint on the first 3 ids of the
+    page — good enough to distinguish a legitimate page boundary
+    from an identical echo without paying for a full hash on a
+    potentially-large response.
+    """
+    if not rows:
+        return None
+    ids = []
+    for row in rows[:3]:
+        if isinstance(row, Mapping):
+            rid = row.get("id")
+            if isinstance(rid, str):
+                ids.append(rid)
+    return tuple(ids) if ids else None
 
 
 def _parse_retry_after(value: Optional[str]) -> Optional[int]:
@@ -476,6 +665,7 @@ def _parse_retry_after(value: Optional[str]) -> Optional[int]:
 __all__ = [
     "ARM_BASE_URL",
     "MAX_PAGES",
+    "PAGINATION_INCOMPLETE",
     "PAGE_TOP",
     "RESOURCE_GRAPH_API_VERSION",
     "AzureResourceGraphClient",

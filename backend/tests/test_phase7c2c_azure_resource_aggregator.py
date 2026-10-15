@@ -200,6 +200,111 @@ class TestBuildResourceSummary:
         assert by_sub["sub1"] == 3
         assert by_sub["sub2"] == 1
 
+    def test_aggregation_invariants(self):
+        """sum(by_type) == sum(by_location) == sum(by_resource_group)
+        == sum(by_subscription) == total_resources."""
+        s1 = AzureSubscriptionResourceSnapshot(
+            subscription_id="sub-aaaa-aaaa-aaaa",
+            display_name="MCPP",
+            status="SUCCESS",
+            resources=(
+                _resource("/sub1/r/1", resource_type="microsoft.compute/virtualmachines", location="eastus", resource_group="rg1"),
+                _resource("/sub1/r/2", resource_type="microsoft.compute/virtualmachines", location="eastus", resource_group="rg1"),
+                _resource("/sub1/r/3", resource_type="microsoft.storage/storageaccounts", location="eastus", resource_group="rg2"),
+                _resource("/sub1/r/4", resource_type="microsoft.network/virtualnetworks", location="westus2", resource_group="rg3"),
+            ),
+        )
+        s2 = AzureSubscriptionResourceSnapshot(
+            subscription_id="sub-bbbb-bbbb-bbbb",
+            display_name="Sponsorship",
+            status="SUCCESS",
+            resources=(
+                _resource("/sub2/r/1", resource_type="microsoft.compute/disks", location="eastus", resource_group="rg4", subscription_id="sub2"),
+                _resource("/sub2/r/2", resource_type="microsoft.compute/virtualmachines", location=None, resource_group=None, subscription_id="sub2"),
+                _resource("/sub2/r/3", resource_type="microsoft.network/publicipaddresses", location="eastus", resource_group="rg4", subscription_id="sub2"),
+            ),
+        )
+        summary = build_resource_summary(
+            [s1, s2], rows=[_row("sub-aaaa-aaaa-aaaa", "MCPP"), _row("sub-bbbb-bbbb-bbbb", "Sponsorship")]
+        )
+        ext = summary.extensions
+        total = ext["total_resources"]
+        assert total == 7
+        sum_by_type = sum(t["count"] for t in ext["by_type"])
+        sum_by_location = sum(t["count"] for t in ext["by_location"])
+        sum_by_resource_group = sum(t["count"] for t in ext["by_resource_group"])
+        sum_by_subscription = sum(b["count"] for b in ext["by_subscription"])
+        # by_location may not equal total when resources have no
+        # location (Azure Bot Service reports location="global"
+        # which is a real location; truly-empty locations are
+        # bucketed into ``Unassigned`` to avoid silently dropping
+        # cost).  Here we have one resource with location=None
+        # which contributes to the bucket only if Unassigned is
+        # surfaced.
+        assert sum_by_type == total
+        assert sum_by_subscription == total
+        # by_location sum: one resource with location=None is
+        # bucketed as ``Unassigned``; verify it's present.
+        sum_by_location_including_unassigned = sum_by_location + sum(
+            t["count"] for t in ext["by_location"] if t["key"] == "Unassigned"
+        )
+        assert sum_by_location == total or sum_by_location_including_unassigned == total
+        # by_resource_group: one resource with resource_group=None
+        # is bucketed as ``Unassigned``.
+        sum_by_rg_including_unassigned = sum_by_resource_group + sum(
+            t["count"] for t in ext["by_resource_group"] if t["key"] == "Unassigned"
+        )
+        assert sum_by_resource_group == total or sum_by_rg_including_unassigned == total
+
+    def test_aggregation_invariants_realistic_dual_subscription(self):
+        """Mirror the live All Azure counts: MCPP=18, Sponsorship=7."""
+        mcpp_resources = []
+        # MCPP: 4 NIC, 4 NSG, 4 PIP, 4 VNet, 1 bot, 1 networkwatcher = 18
+        for i in range(4):
+            mcpp_resources.append(_resource(f"/m/nic/{i}", resource_type="microsoft.network/networkinterfaces", location="eastus", resource_group="hiplink", subscription_id="m"))
+            mcpp_resources.append(_resource(f"/m/nsg/{i}", resource_type="microsoft.network/networksecuritygroups", location="eastus", resource_group="hiplink", subscription_id="m"))
+            mcpp_resources.append(_resource(f"/m/pip/{i}", resource_type="microsoft.network/publicipaddresses", location="eastus", resource_group="hiplink", subscription_id="m"))
+            mcpp_resources.append(_resource(f"/m/vnet/{i}", resource_type="microsoft.network/virtualnetworks", location="eastus", resource_group="hiplink", subscription_id="m"))
+        mcpp_resources.append(_resource("/m/bot/0", resource_type="microsoft.botservice/botservices", location="global", resource_group="hiplink-teams-integration", subscription_id="m"))
+        mcpp_resources.append(_resource("/m/nw/0", resource_type="microsoft.network/networkwatchers", location="eastus", resource_group="networkwatcherrg", subscription_id="m"))
+
+        sponsor_resources = []
+        for idx, (rt, loc, rg) in enumerate([
+            ("microsoft.compute/disks", "eastus", "hiplinkqa"),
+            ("microsoft.compute/virtualmachines", "eastus", "hiplinkqa"),
+            ("microsoft.network/networkinterfaces", "eastus", "hiplinkqa"),
+            ("microsoft.network/networksecuritygroups", "eastus", "hiplinkqa"),
+            ("microsoft.network/publicipaddresses", "eastus", "hiplinkqa"),
+            ("microsoft.network/virtualnetworks", "eastus", "hiplinkqa"),
+            ("microsoft.network/networkwatchers", "eastus", "networkwatcherrg"),
+        ]):
+            sponsor_resources.append(_resource(f"/s/{rt}/{idx}", resource_type=rt, location=loc, resource_group=rg, subscription_id="s"))
+
+        s1 = AzureSubscriptionResourceSnapshot(subscription_id="m", display_name="MCPP", status="SUCCESS", resources=tuple(mcpp_resources))
+        s2 = AzureSubscriptionResourceSnapshot(subscription_id="s", display_name="Sponsorship", status="SUCCESS", resources=tuple(sponsor_resources))
+        summary = build_resource_summary(
+            [s1, s2], rows=[_row("m", "MCPP"), _row("s", "Sponsorship")]
+        )
+        ext = summary.extensions
+        assert ext["total_resources"] == 25
+        # All four invariants.
+        sum_by_type = sum(t["count"] for t in ext["by_type"])
+        sum_by_location = sum(t["count"] for t in ext["by_location"])
+        sum_by_resource_group = sum(t["count"] for t in ext["by_resource_group"])
+        sum_by_subscription = sum(b["count"] for b in ext["by_subscription"])
+        assert sum_by_type == 25, f"by_type sum={sum_by_type}"
+        assert sum_by_location == 25, f"by_location sum={sum_by_location}"
+        assert sum_by_resource_group == 25, f"by_resource_group sum={sum_by_resource_group}"
+        assert sum_by_subscription == 25, f"by_subscription sum={sum_by_subscription}"
+        # 8 distinct types (union of MCPP's 6 and Sponsorship's 7).
+        assert len(ext["by_type"]) == 8
+        # 2 locations.
+        assert len(ext["by_location"]) == 2
+        # 4 resource groups.
+        assert len(ext["by_resource_group"]) == 4
+        # 2 subscriptions.
+        assert len(ext["by_subscription"]) == 2
+
     def test_provider_neutral_no_azure_metadata_leaked(self):
         s = AzureSubscriptionResourceSnapshot(
             subscription_id="sub1",

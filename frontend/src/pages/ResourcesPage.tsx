@@ -30,6 +30,7 @@ import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
 import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
+import { AzureResourcesView } from './AzureResourcesView'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   ResourcesResponse,
@@ -89,11 +90,17 @@ export function ResourcesPage() {
     ? ('rackspace' as const)
     : ('aws' as const)
 
-  // Phase 7C.2A — Azure Resource Graph is NOT yet implemented.
-  // Surface a capability-aware empty state instead of calling
-  // AWS endpoints.
+  // Phase 7C.2C.1 — Azure Resource Graph is wired and live.
+  // Render the dedicated Azure inventory view when Azure is
+  // selected; the AWS view below is unchanged.
   if (provider === 'AZURE') {
-    return <ProviderCapabilityNotice provider="AZURE" feature="Resources" />
+    return (
+      <AzureResourcesView
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+      />
+    )
   }
 
   // Phase 7B: invalidate stale data on account switch.

@@ -499,19 +499,24 @@ def build_resource_summary(
     # By location
     by_location_counts: Dict[str, int] = {}
     for r in all_resources:
-        if r.region:
-            by_location_counts[r.region] = by_location_counts.get(r.region, 0) + 1
+        # Bucket resources without a region under "Unassigned" so
+        # the per-location sum equals the total resource count
+        # (the canonical aggregation invariant).
+        key = r.region if r.region else "Unassigned"
+        by_location_counts[key] = by_location_counts.get(key, 0) + 1
     by_location = sorted(
         ({"key": k, "count": v} for k, v in by_location_counts.items()),
         key=lambda item: (-item["count"], item["key"]),
     )
 
-    # By resource group
+    # By resource group — bucket resources without a resource
+    # group under "Unassigned" so the per-group sum equals the
+    # total resource count.
     by_rg_counts: Dict[str, int] = {}
     for r in all_resources:
         rg = (r.metadata or {}).get("resource_group") if r.metadata else None
-        if rg:
-            by_rg_counts[rg] = by_rg_counts.get(rg, 0) + 1
+        key = rg if rg else "Unassigned"
+        by_rg_counts[key] = by_rg_counts.get(key, 0) + 1
     by_resource_group = sorted(
         ({"key": k, "count": v} for k, v in by_rg_counts.items()),
         key=lambda item: (-item["count"], item["key"]),

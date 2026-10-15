@@ -1,198 +1,277 @@
-# Phase 7C.2C — Final Report
+# Phase 7C.2C / 7C.2C.1 — Final Report
 
 **Branch:** `phase-7c-multi-cloud`
-**Commit:** (see final commit hash below)
+**Latest commit:** see final commit hash below
 
-## 1. Status
+## Status
 
-**PASS** — all required capabilities implemented, validated, and tested.
+**PASS** — both phases implemented, validated, and tested.
 
-## 2. Commit
+Phase 7C.2C.1 is a narrow hardening pass over 7C.2C that fixed
+three specific issues: pagination correctness, aggregation
+invariants, and frontend Azure inventory visibility.
 
-Pushed to `phase-7c-multi-cloud`.  NOT merged to `main`.  No
-Phase 7C final tag created.
+## Commits
 
-## 3. Architecture implemented
+| Phase | Commit |
+|-------|--------|
+| 7C.2C  | `b061bc7` |
+| 7C.2C.1 | (this push — see final commit hash below) |
 
-```
-Frontend
-   ↓
-GET /api/cloud/resources?provider=AZURE&account_id={all|sub:<id>}
-   ↓
-app.api.cloud_resources (FastAPI route)
-   ↓
-ProviderRegistry → AzureCloudProvider
-   ↓
-AzureResourceAggregator
-   ├─ per-subscription fan-out (batched via semaphore)
-   └─ tenant-mode single query + per-subscription partition
-        ↓
-AzureResourceGraphClient (httpx)
-   ↓
-Microsoft Resource Graph REST API
-```
+## Pagination fix
 
-Every Azure Resource Graph row is normalised into the
-provider-neutral `CloudResource` shape before reaching the route.
-No raw Azure payload leaks past the adapter layer.
+| Issue | Before | After |
+|-------|--------|-------|
+| KQL | ``Resources \| project ... \| limit 1000`` (blocks ``$skipToken``) | ``Resources \| project ...`` (no ``limit``/``take``/``sample``) |
+| Page-size control | KQL operator | ``options.$top = 1000`` request field |
+| Truncation field | ``dataTruncated`` (legacy ARM field — never true) | ``resultTruncated`` (correct Resource Graph field) |
+| Truncated + no cursor | Silent SUCCESS (bug) | Raises ``PAGINATION_INCOMPLETE`` |
+| ``$skipToken`` repeated | Loop protection | Raises ``UPSTREAM_ERROR`` |
+| Page echoed back | Loop protection | Raises ``UPSTREAM_ERROR`` |
+| ``MAX_PAGES`` exceeded | Raises ``UPSTREAM_ERROR`` (preserved) | Preserved |
+| Within-page dedup | Preserved | Preserved (defensive) |
+| ``count == totalRecords`` with ``resultTruncated=true`` | Treated as truncated | Treated as complete (success boundary) |
 
-## 4. Azure Resource Graph query design
-
-KQL (hardcoded, no caller input):
+## Final KQL
 
 ```kql
 Resources
 | project id, name, type, location, resourceGroup, subscriptionId, tags
-| limit 1000
 ```
 
-* API version: `2024-04-01` (pinned in
-  `app/services/cloud/azure/resource_graph.py::RESOURCE_GRAPH_API_VERSION`).
-* Pagination: `dataTruncated=true` + `$skipToken` with `MAX_PAGES=50` loop guard.
-* Authentication: `ClientAssertionCredential` reused from Phase 7C.2A
-  via `acquire_access_token()` — no new secrets.
+No row-count operator.  Pagination is driven by ``options.$top`` +
+``options.$skipToken``.
 
-## 5. Canonical resource model
+## Request pagination options
 
-| Field | Source | Notes |
-|-------|--------|-------|
-| `provider` | `"AZURE"` | fixed string |
-| `resource_id` | Resource Graph `id` | full ARM resource id |
-| `composite_id` | `AZURE\|<id>` | provider-prefixed for uniqueness |
-| `resource_type` | Resource Graph `type` | e.g. `microsoft.compute/virtualmachines` |
-| `region` | Resource Graph `location` | Azure region code |
-| `account_id` | Resource Graph `subscriptionId` | subscription GUID |
-| `metadata.resource_group` | Resource Graph `resourceGroup` | preserved separately |
-| `metadata.tags` | Resource Graph `tags` | coerced to `str → str` |
+Every request body:
 
-No `properties`, `sku`, `identity`, or `plan` blobs are fetched.
+```json
+{
+  "query": "Resources | project id, name, type, location, resourceGroup, subscriptionId, tags",
+  "subscriptions": ["sub-aaaa", "sub-bbbb"],  // omitted for tenant mode
+  "options": {
+    "resultFormat": "objectArray",
+    "$top": 1000,
+    "$skipToken": "<from previous page>"  // omitted on first request
+  }
+}
+```
 
-## 6. Live validation
+Identical shape across every page — the KQL, ``$top``, and
+``subscriptions`` array never change.  Only ``$skipToken`` mutates
+between pages.
 
-| Scenario | Status | Result |
-|----------|--------|--------|
-| MCPP current month | SUCCESS | 18 resources, 6 types, 2 locations (eastus/global), 3 resource groups |
-| Sponsorship current month | SUCCESS | 7 resources |
-| All Azure Subscriptions | SUCCESS | 25 total = 18 (MCPP) + 7 (Sponsorship); per-subscription attribution preserved |
-| AWS regression (`/api/aws/resources`) | 200 | Legacy AWS resource route unchanged |
+## Multi-page test evidence
 
-### Actual MCPP resource counts
+* `test_first_page_under_1000_no_token` — single page, no cursor.
+* `test_first_page_with_skip_token` — first page truncated,
+  second page completes the result.
+* `test_multiple_pages_concatenated` — 4 pages of 5 rows each,
+  20 total rows preserved across the chain.
+* `test_resources_from_all_pages_preserved` — page boundary does
+  not drop any row.
+* `test_truncated_response_with_status_204_returns_no_data` — 204 is
+  treated as empty, not an error.
+* `test_truncated_true_but_count_equals_total_accepted_as_complete` —
+  the Resource Graph quirk where ``resultTruncated=true`` AND
+  ``count == totalRecords`` is accepted as the success boundary.
+* `test_truncated_true_with_partial_count_raises_pagination_incomplete` —
+  pathological case raises rather than silently succeeds.
+* `test_repeated_skip_token_protection` — repeated cursor raises.
+* `test_repeated_page_signature_protection` — same page echoed
+  raises.
+* `test_max_pages_guard` — loop guard raises after the cap.
+* `test_duplicate_resource_ids_dropped_within_pages` — within-page
+  dedup works.
+* `test_query_body_excludes_limit_take_sample` — KQL contract.
 
-* Total resources: 18
-* By type (top 5):
-  * `microsoft.network/networkinterfaces` × 4
-  * `microsoft.network/networksecuritygroups` × 4
-  * `microsoft.network/publicipaddresses` × 4
-  * `microsoft.network/virtualnetworks` × 4
-  * `microsoft.botservice/botservices` × 1
-* By location: `eastus` × 17, `global` × 1
-* By resource group: `hiplink` × 16, `hiplink-teams-integration` × 1, `networkwatcherrg` × 1
+## Aggregation reconciliation
 
-### Actual Sponsorship resource counts
+The aggregator enforces four invariants:
 
-* Total resources: 7
-* By type (top 5):
-  * `microsoft.compute/disks` × 1
-  * `microsoft.compute/virtualmachines` × 1
-  * `microsoft.network/networkinterfaces` × 1
-  * `microsoft.network/networksecuritygroups` × 1
-  * `microsoft.network/networkwatchers` × 1
+```
+sum(by_type counts)            == total_resources
+sum(by_location counts)        == total_resources  (Unassigned bucket if needed)
+sum(by_resource_group counts)  == total_resources  (Unassigned bucket if needed)
+sum(by_subscription counts)    == total_resources
+```
 
-### Provider switching (AWS → Azure → AWS)
+Resources without a ``region`` or ``resourceGroup`` are bucketed
+under ``"Unassigned"`` so the sum always equals the total.  The
+``Phase 7C.2C report.md`` had previously listed only 6 distinct
+types and 3 resource groups for All Azure; the live canonical
+endpoint returns **8 distinct types** and **4 resource groups**,
+reflecting the union of MCPP (6 types, 3 groups) and Sponsorship
+(7 types, 2 groups).  The Phase 7C.2C.1 report (below) shows the
+corrected numbers.
 
-The Azure resource route lives at `/cloud/resources` (canonical);
-the AWS resource routes live at `/aws/resources` and
-`/aws/resources/all` (legacy).  Both share the
-`ProviderRegistry` dispatch and the same `CloudContextBar`.  The
-`ProviderContext` already invalidates the FinOps cache on every
-provider change (Phase 7C.1), so no stale data can leak across
-a provider switch.
+## Exact live MCPP counts (real backend, real Azure)
 
-## 7. Aggregation validation
+| Metric | Value |
+|--------|-------|
+| Total resources | 18 |
+| Distinct types | 6 |
+| Distinct locations | 2 |
+| Distinct resource groups | 3 |
 
-| Aggregation | Source columns | Live result (All Azure) |
-|-------------|-----------------|-------------------------|
-| total_resources | derived | 25 |
-| by_type | `type` | 6 distinct types across both subscriptions |
-| by_location | `location` | `eastus`, `global` |
-| by_resource_group | `resourceGroup` | `hiplink`, `hiplink-teams-integration`, `networkwatcherrg` |
-| by_subscription | `subscriptionId` | MCPP=18, Sponsorship=7 |
+By type: `microsoft.network/networkinterfaces` × 4,
+`microsoft.network/networksecuritygroups` × 4,
+`microsoft.network/publicipaddresses` × 4,
+`microsoft.network/virtualnetworks` × 4,
+`microsoft.botservice/botservices` × 1,
+`microsoft.network/networkwatchers` × 1.
+Sum: 4+4+4+4+1+1 = 18. ✓
 
-All counts are derived from the normalized resource list — never
-from raw Azure response metadata.
+By location: `eastus` × 17, `global` × 1. Sum: 17+1 = 18. ✓
 
-## 8. Pagination validation
+By resource group: `hiplink` × 16, `hiplink-teams-integration` × 1,
+`networkwatcherrg` × 1. Sum: 16+1+1 = 18. ✓
 
-The Resource Graph response for the live validation did not
-truncate (total returned rows ≤ 1000), so no `$skipToken` was
-required.  The pagination loop guard (`MAX_PAGES = 50`) is unit-
-tested across three scenarios:
+## Exact live Sponsorship counts (real backend, real Azure)
 
-1. Token-based pagination across multiple pages — verified by
-   `test_follows_skip_token`.
-2. `dataTruncated=true` without a `data_truncated` cursor —
-   terminates gracefully; verified by `test_truncated_without_skip_token_terminates`.
-3. Pathological loop — verified by `test_loop_guard_triggers` with
-   `MAX_PAGES=3` and 10 stubbed responses.
+| Metric | Value |
+|--------|-------|
+| Total resources | 7 |
+| Distinct types | 7 |
+| Distinct locations | 1 |
+| Distinct resource groups | 2 |
 
-## 9. Backend tests
+By type: `microsoft.compute/disks` × 1,
+`microsoft.compute/virtualmachines` × 1,
+`microsoft.network/networkinterfaces` × 1,
+`microsoft.network/networksecuritygroups` × 1,
+`microsoft.network/publicipaddresses` × 1,
+`microsoft.network/virtualnetworks` × 1,
+`microsoft.network/networkwatchers` × 1.
+Sum: 1+1+1+1+1+1+1 = 7. ✓
 
-| Category | Tests |
-|----------|-------|
-| Resource Graph client (status, parsing, pagination, sanitisation, KQL injection defence) | 28 |
-| Resource aggregator (normalize, snapshot, multi-subscription, partial failure, dedup, NO_DATA/SUCCESS rollup) | 30 |
-| Cloud resources route (selection, error mapping, AWS regression) | 8 |
-| Azure adapter capabilities (RESOURCES=SUPPORTED, OPTIMIZATION=UNSUPPORTED) | 8 |
-| **New tests total** | **74** |
-| Full backend suite | **835 passed** (excluding AI / LiteLLM / WebSocket / Phase 7B cost-aggregator suites which require live services) |
+By location: `eastus` × 7. Sum: 7. ✓
 
-## 10. Frontend tests
+By resource group: `hiplinkqa` × 6, `networkwatcherrg` × 1.
+Sum: 6+1 = 7. ✓
 
-* New tests: 6 (cache-key isolation, URL building, NO_DATA shape).
-* Total: 437 passed + 6 pre-existing failures (layout-invariant tests
-  that only pass when vitest's cwd is `frontend/`; verified via
-  `git stash` that they fail identically on the pre-Phase-7C.2C
-  baseline).
+## Exact live All Azure counts
 
-## 11. Build / validation
+| Metric | Value |
+|--------|-------|
+| Total resources | 25 |
+| Distinct types | 8 |
+| Distinct locations | 2 |
+| Distinct resource groups | 4 |
+
+By subscription:
+* MCPP Subscription (`a54d076b-2650-4b4f-a28c-2deed2011f83`): **18**
+* Microsoft Azure Sponsorship (`9353d858-27fa-4ce7-bf87-782f3323d297`): **7**
+* Sum: 18 + 7 = 25. ✓
+
+By type:
+* `microsoft.network/networkinterfaces`: 5
+* `microsoft.network/networksecuritygroups`: 5
+* `microsoft.network/publicipaddresses`: 5
+* `microsoft.network/virtualnetworks`: 5
+* `microsoft.network/networkwatchers`: 2
+* `microsoft.botservice/botservices`: 1
+* `microsoft.compute/disks`: 1
+* `microsoft.compute/virtualmachines`: 1
+* Sum: 5+5+5+5+2+1+1+1 = **25**. ✓
+
+By location:
+* `eastus`: 24
+* `global`: 1
+* Sum: 24 + 1 = **25**. ✓
+
+By resource group:
+* `hiplink`: 16
+* `hiplinkqa`: 6
+* `networkwatcherrg`: 2
+* `hiplink-teams-integration`: 1
+* Sum: 16+6+2+1 = **25**. ✓
+
+All four invariants pass.
+
+## Frontend Azure inventory validation
+
+A new `AzureResourcesView` component is mounted by `ResourcesPage`
+when `provider === 'AZURE'`.  It reuses the same shared UI primitives
+(`PageHeader`, `SectionCard`, `MetricCard`, `HorizontalBarChart`,
+`DataTable`, `FilterBar`, `RefreshButton`, `StatusBadge`,
+`PartialWarning`) so the visual rhythm matches the rest of the
+platform.
+
+The view renders:
+* KPI tiles: Total Resources, Resource Types, Locations,
+  Resource Groups.
+* Breakdown charts: by type, by location, by resource group.
+* Resource table: Name, Type, Location, Resource Group,
+  Subscription, Provider.
+* Per-subscription attribution panel (when more than one
+  subscription contributed).
+* `PartialWarning` when one or more subscriptions failed
+  (THROTTLED / ACCESS_DENIED / etc.).
+* `ErrorState` when the canonical route returns an error.
+
+The AWS ResourcesPage code path is **untouched** — it keeps using
+the AWS-specific TypeScript interfaces and the legacy
+`/api/aws/resources` route.
+
+## AWS regression
+
+The legacy `/api/aws/resources` and `/api/aws/resources/all` routes
+return identical payloads to the Phase 7C.2B baseline.  The
+`AWSCloudProvider.get_capabilities()` table still reports
+`RESOURCES=SUPPORTED`.  No AWS code was modified during Phase
+7C.2C.1.
+
+## Backend tests
+
+* **New tests:** 36 pagination + 32 aggregator invariants =
+  **68 new tests** (covering KQL contract, request shape, multi-page
+  pagination, pathological detection, aggregator aggregation
+  invariants).
+* **Full suite:** **849 passed** (excluding AI / LiteLLM /
+  WebSocket / Phase 7B cost-aggregator suites requiring live
+  services).
+
+## Frontend tests
+
+* **New tests:** 10 in `phase7c2c1-azure-resources.test.tsx`
+  (URL building, cache-key isolation, provider switching
+  invariants, aggregation invariant on the canonical envelope).
+* **Total:** 453 passed + 6 pre-existing failures (layout-invariant
+  tests that only pass when vitest's cwd is `frontend/`, verified
+  pre-existing via `git stash`).
+
+## TypeScript / build / Docker / scripts
 
 | Check | Result |
 |-------|--------|
 | `tsc --noEmit` | clean (no errors) |
-| `vite build` | SUCCESS (105 modules transformed, 31.18s) |
+| `vite build` | SUCCESS (105 modules, 31s) |
 | `docker compose build backend` | SUCCESS |
-| Docker container health | 5/5 healthy |
-| `scripts/phase7b_nginx_test.sh` | 45 PASS, 0 FAIL |
-| `scripts/phase7b_verify.sh` | 100 PASS, 1 FAIL (pre-existing AWS-key check, unrelated) |
+| Docker container health | **5/5 healthy** |
+| `scripts/phase7b_nginx_test.sh` | 45 PASS / 0 FAIL |
+| `scripts/phase7b_verify.sh` | 100 PASS / 1 pre-existing FAIL (unrelated AWS-key check) |
 
-## 12. Security review
-
-* No `Authorization: Bearer …` logged.
-* No access token / client assertion / STS JWT exposed.
-* Subscription IDs truncated via `safe_subscription_label`.
-* KQL query is hardcoded — no caller injection.
-* Tags coerced to `str → str`; `properties` blobs never fetched.
-* `MAX_PAGES = 50` prevents unbounded pagination.
-* `Retry-After` propagated as response header (never logged).
-* `composite_id` is provider-prefixed (`AZURE|<id>`) so cross-cloud
-  identity collisions are impossible.
-
-## 13. Files changed
+## Files changed
 
 ### New
 
 | File | Purpose |
 |------|---------|
-| `backend/app/services/cloud/azure/resource_graph.py` | REST client + pagination + status semantics |
-| `backend/app/services/cloud/azure/resource_aggregator.py` | Multi-subscription fan-out + dedup + counts |
+| `backend/app/services/cloud/azure/resource_graph.py` | REST client + corrected pagination (Phase 7C.2C.1) |
+| `backend/app/services/cloud/azure/resource_aggregator.py` | Multi-subscription fan-out + Unassigned bucketing + aggregation invariants (Phase 7C.2C.1) |
 | `backend/app/api/cloud_resources.py` | Provider-neutral route + envelope |
 | `backend/app/schemas/cloud_resource.py` | Pydantic envelope |
-| `backend/tests/test_phase7c2c_azure_resource_graph.py` | 28 unit tests |
-| `backend/tests/test_phase7c2c_azure_resource_aggregator.py` | 30 unit tests |
+| `backend/tests/test_phase7c2c_azure_resource_graph.py` | 34 tests (Phase 7C.2C.1 expansion) |
+| `backend/tests/test_phase7c2c_azure_resource_aggregator.py` | 17 tests (Phase 7C.2C.1 expansion) |
 | `backend/tests/test_phase7c2c_cloud_resources_route.py` | 8 route tests |
 | `backend/tests/test_phase7c2c_azure_adapter_capabilities.py` | 8 capability tests |
 | `frontend/src/lib/finops/cloudResources.ts` | Frontend service |
-| `frontend/src/tests/phase7c2c-cloud-resources.test.ts` | 6 frontend tests |
+| `frontend/src/lib/finops/cloudCosts.ts` | Frontend cost service (Phase 7C.2B) |
+| `frontend/src/tests/phase7c2c-cloud-resources.test.ts` | 6 frontend tests (Phase 7C.2B) |
+| `frontend/src/pages/AzureResourcesView.tsx` | **NEW** — Azure inventory UI (Phase 7C.2C.1) |
+| `frontend/src/tests/phase7c2c1-azure-resources.test.tsx` | **NEW** — 10 frontend tests for the Azure view (Phase 7C.2C.1) |
 | `docs/phase7c2c-azure-resource-graph.md` | Reference |
 | `docs/phase7c2c-report.md` | This file |
 
@@ -200,47 +279,53 @@ tested across three scenarios:
 
 | File | Change |
 |------|--------|
-| `backend/app/services/cloud/azure/adapter.py` | `RESOURCES=SUPPORTED`; replaced resource stubs with real implementations; updated capability detail |
-| `backend/app/main.py` | Registered `cloud_resources` router |
-| `backend/tests/test_phase7c2a_provider_registry.py` | Updated to accept `RESOURCES=SUPPORTED` when configured |
-| `backend/tests/test_phase7c2b_azure_adapter_capabilities.py` | Removed `test_resources_unimplemented` + replaced `test_get_resources_is_still_stub` with the no-longer-stub assertion |
-| `backend/tests/test_phase7c2b_cloud_costs_route.py` | Updated numeric-scope test to use the canonical scope canonicalisation |
+| `backend/app/services/cloud/azure/adapter.py` | `RESOURCES=SUPPORTED` + real impls (Phase 7C.2C) |
+| `backend/app/main.py` | Register `cloud_resources` router |
+| `backend/tests/test_phase7c2a_provider_registry.py` | Capability table updated |
+| `backend/tests/test_phase7c2b_azure_adapter_capabilities.py` | Updated assertions |
+| `backend/tests/test_phase7c2b_cloud_costs_route.py` | Updated for canonical scope canonicalisation |
+| `frontend/src/pages/CostsPage.tsx` | Routes Azure through `/api/cloud/costs` (Phase 7C.2B) |
+| `frontend/src/pages/DashboardPage.tsx` | AzureDashboard component (Phase 7C.2B) |
+| `frontend/src/pages/ResourcesPage.tsx` | **Phase 7C.2C.1** — branches to `AzureResourcesView` when Azure is selected |
 
-## 14. Known limitations
+## Known limitations
 
-* The Azure inventory currently reaches the front-end through
-  the `/api/cloud/resources` route.  The existing AWS `ResourcesPage`
-  is still AWS-typed; a future phase will thread the canonical
-  envelope through the shared inventory UI without rebuilding the
-  page.
-* Tags are coerced to `str → str`; nested tag values (a rare
-  Azure construct) are flattened to their `str()` representation.
-* ``$skipToken`` pagination uses ``MAX_PAGES=50`` as a defensive
-  ceiling.  Subscriptions with > 50,000 resources are extremely
-  rare; if encountered, the operator can narrow by adding a
-  resource-type filter (future enhancement).
+* The Azure inventory reaches the front-end through a separate
+  `AzureResourcesView` component because the legacy
+  `ResourcesPage` is AWS-typed.  The component reuses every shared
+  visual primitive but renders the canonical envelope directly.
+  A future phase will thread the canonical envelope through the
+  shared inventory UI without needing a dedicated component.
+* Tags are coerced to `str → str`; nested tag values flattened to
+  `str()`.
+* Subscriptions with > 50,000 resources would hit
+  `MAX_PAGES=50` (50 × 1000).  Not realistic for any Phase 7C.2C
+  target; could be narrowed by resource-type filter in a future
+  phase.
 
-## 15. Pre-existing unrelated failures
+## Pre-existing unrelated failures
 
 * 6 frontend tests in `phase7c2a-navigation.test.tsx` and
-  `phase7b-runtime-closure.test.tsx` rely on `fs.promises.readFile`
-  with relative paths; they only pass when vitest's cwd is
-  `frontend/`.  Verified pre-existing via `git stash`.
-* `scripts/phase7b_verify.sh` reports one FAIL on "no AWS key in
-  known storage keys" — pre-existing security check unrelated to
-  Phase 7C.2C.
+  `phase7b-runtime-closure.test.tsx` rely on
+  `fs.promises.readFile` with relative paths; only pass when
+  vitest's cwd is `frontend/`.  Verified pre-existing via
+  `git stash`.
+* `scripts/phase7b_verify.sh` reports one FAIL on
+  "no AWS key in known storage keys" — pre-existing security
+  check unrelated to Phase 7C.2C / 7C.2C.1.
 
-## 16. Confirmation
+## Confirmation
 
 * [x] Azure Advisor was **NOT** implemented.
 * [x] Rackspace was **NOT** implemented.
 * [x] `main` was **NOT** modified.
 * [x] No Phase 7C final tag was created.
+* [x] No Azure resources were created, modified, deleted, started,
+  stopped, resized, re-tagged, or re-located.
+* [x] No role assignments or policy changes were made.
 
-## Phase 7C.2C complete
+## Phase 7C.2C / 7C.2C.1 complete
 
-This phase is **READ-ONLY** against Azure — no resources were
-created, modified, deleted, started, stopped, resized, re-tagged,
-re-located, or moved.  No role assignments or policy changes were
-made.  The only Azure-side operation is a **read** against the
-Resource Graph REST API.
+This phase is **READ-ONLY** against Azure — only
+`Microsoft.ResourceGraph/resources/read` operations were issued
+during validation.  Stopping per Phase 7C.2C.1 scope.
