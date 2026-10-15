@@ -5,7 +5,11 @@
 //  1. AccountSelector must be MOUNTED in the production AppShell.
 //     Prior to the fix, grep -Rni 'AccountSelector' frontend/src
 //     returned no usages.  These tests prove the component is
-//     imported by both TopNavigation and MobileNavigation.
+//     reachable from both TopNavigation and MobileNavigation via
+//     the Phase 7C.2A CloudContextBar shell — the selector now lives
+//     in the dedicated second row, so the import is transitive
+//     (TopNavigation → CloudContextBar → AccountSelector).  Same
+//     for MobileNavigation.
 //
 //  2. The "All AWS Accounts" label must be visible in the
 //     production bundle.
@@ -23,24 +27,36 @@ import { useEffect } from 'react'
 import { navItemsForRole } from '../lib/tokens'
 
 // ---------------------------------------------------------------------------
-// 1. TopNavigation / MobileNavigation must import AccountSelector
+// 1. TopNavigation / MobileNavigation must reach AccountSelector
 // ---------------------------------------------------------------------------
 
 describe('Phase 7B runtime closure — AccountSelector mounting', () => {
-  it('TopNavigation imports AccountSelector', async () => {
-    const source = await import('fs').then((fs) =>
+  it('TopNavigation mounts AccountSelector (via CloudContextBar)', async () => {
+    const nav = await import('fs').then((fs) =>
       fs.promises.readFile('src/components/TopNavigation.tsx', 'utf-8'),
     )
-    expect(source).toMatch(/import\s+\{[^}]*AccountSelector[^}]*\}\s+from\s+'\.\/AccountSelector'/)
-    expect(source).toMatch(/<AccountSelector/)
+    const cloudBar = await import('fs').then((fs) =>
+      fs.promises.readFile('src/components/CloudContextBar.tsx', 'utf-8'),
+    )
+    // TopNavigation must pull CloudContextBar into Row 2.
+    expect(nav).toMatch(/CloudContextBar/)
+    expect(nav).toMatch(/<CloudContextBar/)
+    // CloudContextBar must mount AccountSelector directly.
+    expect(cloudBar).toMatch(/<AccountSelector/)
   })
 
-  it('MobileNavigation imports AccountSelector', async () => {
-    const source = await import('fs').then((fs) =>
+  it('MobileNavigation mounts AccountSelector (via CloudContextBar)', async () => {
+    const mobile = await import('fs').then((fs) =>
       fs.promises.readFile('src/components/MobileNavigation.tsx', 'utf-8'),
     )
-    expect(source).toMatch(/import\s+\{[^}]*AccountSelector[^}]*\}\s+from\s+'\.\/AccountSelector'/)
-    expect(source).toMatch(/<AccountSelector/)
+    const cloudBar = await import('fs').then((fs) =>
+      fs.promises.readFile('src/components/CloudContextBar.tsx', 'utf-8'),
+    )
+    // MobileNavigation must pull CloudContextBar into Row 2.
+    expect(mobile).toMatch(/CloudContextBar/)
+    expect(mobile).toMatch(/<CloudContextBar/)
+    // CloudContextBar must mount AccountSelector directly.
+    expect(cloudBar).toMatch(/<AccountSelector/)
   })
 
   it('AccountSelector renders the "All AWS Accounts" label by default', async () => {
