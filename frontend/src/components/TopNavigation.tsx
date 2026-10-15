@@ -1,11 +1,18 @@
 // Phase 6A — TopNavigation.
 //
 // Horizontal nav bar patterned after the HipLink reference:
-//   [Brand] | [Nav items ...] | [ThemeToggle] [UserMenu]
+//   [Brand] | [Nav items ...] | [ProviderSelector] [AccountSelector] | [ThemeToggle] [UserMenu]
 //
-// Active item uses the cyan primary-soft background with primary
-// text and a subtle primary border.  Inactive items remain slate.
-// No giant SaaS landing-page tabs — compact, dense, enterprise.
+// Phase 7C.2A closure — refined alignment:
+//   * every right-side control is h-9 so vertical centering is exact;
+//   * the right cluster is a single inline-flex group with a
+//     subtle vertical divider between the cloud selectors and the
+//     theme / user controls;
+//   * long display names truncate cleanly inside each selector;
+//   * selectors + theme toggle hide on small screens so the
+//     brand and user menu remain the only horizontal content;
+//   * wrap is allowed (flex-wrap) so long display names push
+//     into a second row without overflowing the viewport.
 
 import { Link, useLocation } from '../lib/router'
 import { navItemsForRole } from '../lib/tokens'
@@ -23,16 +30,19 @@ export function TopNavigation() {
 
   return (
     <header
-      className="
-        sticky top-0 z-20 border-b border-border bg-bg-elevated
-      "
+      className="sticky top-0 z-20 border-b border-border bg-bg-elevated"
       data-testid="top-navigation"
     >
-      <div className="mx-auto flex h-14 max-w-screen-2xl items-center gap-3 px-3 sm:px-5">
+      <div
+        className="
+          mx-auto flex h-14 max-w-screen-2xl flex-wrap items-center
+          gap-x-3 gap-y-2 px-3 sm:px-5
+        "
+      >
         <BrandHeader />
         <nav
           aria-label="Primary"
-          className="ml-2 hidden flex-1 items-center gap-1 lg:flex"
+          className="ml-1 hidden min-w-0 flex-1 items-center gap-1 lg:flex"
         >
           {items.map((item) => {
             const active = isActive(pathname, item.path)
@@ -53,14 +63,31 @@ export function TopNavigation() {
             )
           })}
         </nav>
-        <div className="ml-auto flex items-center gap-2">
-          <span className="hidden lg:inline-flex">
+        <div
+          className="
+            ml-auto flex flex-wrap items-center gap-2
+          "
+        >
+          {/* Provider + Account selectors — only visible on lg+ to
+              keep the header breathable on smaller viewports. */}
+          <div
+            className="
+              hidden items-center gap-2 lg:flex
+            "
+            data-testid="top-nav-selectors"
+          >
             <ProviderSelector />
-          </span>
-          <span className="hidden lg:inline-flex">
             <AccountSelector />
-          </span>
-          <span className="hidden md:inline">
+          </div>
+          {/* Divider — separates the cloud-context selectors from the
+              user-facing controls (theme + identity).  Hidden on
+              small viewports because the selectors themselves are
+              hidden there. */}
+          <span
+            aria-hidden
+            className="mx-1 hidden h-6 w-px bg-border lg:inline-block"
+          />
+          <span className="hidden md:inline-flex">
             <ThemeToggle />
           </span>
           <UserMenu />

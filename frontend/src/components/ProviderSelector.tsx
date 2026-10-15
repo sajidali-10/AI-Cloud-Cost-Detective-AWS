@@ -116,18 +116,26 @@ export function ProviderSelector({ className = '' }: ProviderSelectorProps) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center gap-2 rounded-md border border-border bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary shadow-sm hover:bg-surface-hover"
+        className="
+          group inline-flex h-9 max-w-[14rem] items-center gap-2
+          rounded-md border border-border bg-surface
+          px-3 text-sm font-medium text-fg-primary shadow-sm
+          hover:bg-surface-hover focus:outline-none
+          focus-visible:shadow-focus transition-colors
+        "
         aria-haspopup="listbox"
         aria-expanded={open}
         data-testid="provider-selector-button"
       >
-        <span className="text-fg-muted">Cloud Provider:</span>
-        <span className="font-semibold">{labelForProvider(provider)}</span>
+        <span className="shrink-0 text-fg-muted">Cloud Provider:</span>
+        <span className="min-w-0 flex-1 truncate text-left font-semibold">
+          {labelForProvider(provider)}
+        </span>
         <svg
           xmlns="http://www.w3.org/2000/svg"
           viewBox="0 0 20 20"
           fill="currentColor"
-          className="h-4 w-4"
+          className="h-4 w-4 shrink-0 text-fg-muted transition-transform group-aria-expanded:rotate-180"
           aria-hidden
         >
           <path
@@ -140,7 +148,7 @@ export function ProviderSelector({ className = '' }: ProviderSelectorProps) {
       {open && (
         <ul
           role="listbox"
-          className="absolute right-0 z-30 mt-1 max-h-72 w-56 overflow-auto rounded-md border border-border bg-surface py-1 text-sm shadow-lg"
+          className="absolute right-0 z-30 mt-1 max-h-80 w-64 overflow-auto rounded-md border border-border bg-surface py-1 text-sm shadow-lg"
           data-testid="provider-selector-menu"
         >
           {selectable.length === 0 ? (

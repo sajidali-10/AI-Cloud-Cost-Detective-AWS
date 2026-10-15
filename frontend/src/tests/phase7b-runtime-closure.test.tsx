@@ -113,6 +113,7 @@ describe('Phase 7B runtime closure — sessionStorage persistence', () => {
 
   it('selection survives remount (sessionStorage re-hydrates)', async () => {
     window.sessionStorage.setItem('cd.account.selection.v1', 'acct:42')
+    const { ProviderProvider } = await import('../lib/providerContext')
     const { AccountProvider, useAccountContext } = await import('../lib/accountContext')
 
     function Probe() {
@@ -122,15 +123,18 @@ describe('Phase 7B runtime closure — sessionStorage persistence', () => {
     }
 
     render(
-      <AccountProvider>
-        <Probe />
-      </AccountProvider>,
+      <ProviderProvider>
+        <AccountProvider>
+          <Probe />
+        </AccountProvider>
+      </ProviderProvider>,
     )
     const probe = screen.getByTestId('probe')
     expect(probe.getAttribute('data-selection')).toBe('acct:42')
   })
 
   it('writing the selection updates sessionStorage', async () => {
+    const { ProviderProvider } = await import('../lib/providerContext')
     const { AccountProvider, useAccountContext } = await import('../lib/accountContext')
 
     function Probe() {
@@ -147,15 +151,18 @@ describe('Phase 7B runtime closure — sessionStorage persistence', () => {
     }
 
     render(
-      <AccountProvider>
-        <Probe />
-      </AccountProvider>,
+      <ProviderProvider>
+        <AccountProvider>
+          <Probe />
+        </AccountProvider>
+      </ProviderProvider>,
     )
     await userEvent.click(screen.getByTestId('set'))
     expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('acct:7')
   })
 
   it('does NOT use localStorage for the selection', async () => {
+    const { ProviderProvider } = await import('../lib/providerContext')
     const { AccountProvider, useAccountContext } = await import('../lib/accountContext')
 
     function Probe() {
@@ -172,9 +179,11 @@ describe('Phase 7B runtime closure — sessionStorage persistence', () => {
     }
 
     render(
-      <AccountProvider>
-        <Probe />
-      </AccountProvider>,
+      <ProviderProvider>
+        <AccountProvider>
+          <Probe />
+        </AccountProvider>
+      </ProviderProvider>,
     )
     await userEvent.click(screen.getByTestId('set'))
     // localStorage must remain empty — the contract forbids it.

@@ -14,6 +14,7 @@ import { BrandHeader } from './BrandHeader'
 import { ThemeToggle } from './ThemeToggle'
 import { UserMenu } from './UserMenu'
 import { AccountSelector } from './AccountSelector'
+import { ProviderSelector } from './ProviderSelector'
 
 export function MobileNavigation() {
   const { role } = useAuth()
@@ -84,6 +85,7 @@ export function MobileNavigation() {
           <BrandHeader compact />
           <div className="ml-auto flex items-center gap-2">
             <AccountSelector />
+            <ProviderSelector />
             <ThemeToggle />
             <UserMenu />
           </div>
