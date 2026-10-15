@@ -187,8 +187,22 @@ run_check "CloudAccountCreate validates AWS account_id regex" \
   bash -c "grep -q 'AWS_ACCOUNT_ID_REGEX' backend/app/schemas/cloud_account.py"
 run_check "CloudAccountCreate validates IAM role ARN regex" \
   bash -c "grep -q 'AWS_IAM_ROLE_ARN_REGEX' backend/app/schemas/cloud_account.py"
-run_check "CloudAccountCreate rejects providers other than AWS" \
-  bash -c "grep -q 'Only provider' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate validates Azure subscription GUID regex" \
+  bash -c "grep -q 'AZURE_SUBSCRIPTION_ID_REGEX' backend/app/schemas/cloud_account.py"
+# Phase 7C.2A widened the provider enum from "AWS only" to AWS / AZURE
+# / RACKSPACE.  AWS and AZURE rows are accepted; anything else is still
+# refused at the schema layer.  The narrowing below pins exactly that
+# contract — no validation rule was weakened.
+run_check "CloudAccountCreate accepts provider=AWS" \
+  bash -c "grep -qE \"expected one of: .*AWS.*AZURE|RACKSPACE\" backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate accepts provider=AZURE" \
+  bash -c "grep -qE 'expected one of: .*AWS.*AZURE|RACKSPACE' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate still rejects unknown providers" \
+  bash -c "grep -qE 'is not recognised|provider=.*is not recognised' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate rejects role_arn on AZURE rows" \
+  bash -c "grep -q 'MUST NOT have role_arn' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate validates tenant_id is a GUID when set" \
+  bash -c "grep -q 'tenant_id must be a valid Microsoft Entra tenant GUID' backend/app/schemas/cloud_account.py"
 run_check "CloudAccountResponse does NOT expose external_id as a field" \
   bash -c "! awk '/^class CloudAccountResponse/,/^class [A-Z]/' backend/app/schemas/cloud_account.py | grep -qE '^[[:space:]]*external_id[[:space:]]*:'"
 

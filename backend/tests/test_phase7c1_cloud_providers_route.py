@@ -69,12 +69,16 @@ def test_list_cloud_accounts_selectable_includes_provider(client):
     body = r.json()
     assert "items" in body and "count" in body
     # The Phase 7B management row is provisioned by ``bootstrap_once``
-    # during lifespan startup.  With an empty DB (the default test
-    # fixture), no rows exist — but the response shape is stable.
-    if body["items"]:
-        for item in body["items"]:
-            assert "provider" in item
-            assert item["provider"] == "AWS"
+    # during lifespan startup; Phase 7C.2A additionally inserts any
+    # configured Azure subscriptions from ``AZURE_SUBSCRIPTION_<N>_*``.
+    # The DB state therefore varies by deployment — we pin the
+    # response SHAPE, not the row content.
+    assert body["count"] == len(body["items"])
+    for item in body["items"]:
+        # Every item carries a stable ``provider`` field that the
+        # frontend uses to route requests through the right adapter.
+        assert "provider" in item
+        assert item["provider"] in {"AWS", "AZURE", "RACKSPACE"}
 
 
 def test_selectable_for_unknown_provider_returns_404(client):
@@ -86,18 +90,23 @@ def test_selectable_for_unknown_provider_returns_404(client):
 def test_selectable_for_azure_returns_200_when_adapter_registered(client):
     """Phase 7C.2A — the Azure adapter IS registered at process
     boot.  The ``/cloud/accounts/selectable/AZURE`` route therefore
-    returns 200 (with an empty items list when no rows are
-    registered yet).  RACKSPACE remains the only ``NOT_REGISTERED``
-    provider and the test for that case is below.
+    returns 200 with the canonical selector payload.  The number
+    of items depends on how many Azure subscriptions the
+    deployment has bootstrapped from
+    ``AZURE_SUBSCRIPTION_<N>_*`` env vars — the contract under test
+    here is the response shape, not the row count.
     """
     r = client.get("/cloud/accounts/selectable/AZURE")
     assert r.status_code == 200
     body = r.json()
     assert "items" in body and "count" in body
-    # In a fresh test DB the Azure subscriptions table is empty;
-    # the response shape is still the canonical selector payload.
-    assert body["count"] == 0
-    assert body["items"] == []
+    # Every item must be an Azure row; AWS rows MUST NOT leak into
+    # the Azure selector (otherwise the frontend could route an
+    # AWS request through the Azure adapter).
+    for item in body["items"]:
+        assert item["provider"] == "AZURE"
+    # ``count`` MUST equal ``len(items)`` — the canonical contract.
+    assert body["count"] == len(body["items"])
 
 
 def test_selectable_for_rackspace_returns_404_until_adapter_registered(client):
