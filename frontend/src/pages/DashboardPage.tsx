@@ -45,7 +45,7 @@ import {
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
-import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
+import { Link } from '../lib/router'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
@@ -324,6 +324,7 @@ function AwsDashboard({
 
       {/* Centred HipLink AI Assistant hero — uses real data only. */}
       <DashboardHero
+        provider="AWS"
         accountLabel={
           identity.entry.data ? maskAccountId(identity.entry.data.account) : null
         }
@@ -866,7 +867,7 @@ function AzureDashboard({
       <PageHeader
         eyebrow="AI Cloud Cost Detective"
         title="Azure Dashboard"
-        subtitle="Azure Cost Management, subscription access and AI-powered FinOps analysis"
+        subtitle="Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis"
         context={
           <>
             <ContextItem
@@ -930,6 +931,7 @@ function AzureDashboard({
       )}
 
       <DashboardHero
+        provider="AZURE"
         accountLabel={
           report?.account_id
             ? maskAccountId(report.account_id)
@@ -953,7 +955,7 @@ function AzureDashboard({
       />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="Azure Spend" />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="Total Spend" />
         <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpiAzure />
         <OptimizeKpiAzure />
@@ -1004,24 +1006,48 @@ function AzureDashboard({
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <SectionCard
-          title="Optimization"
-          description="Azure Advisor Cost recommendations"
+          title="Azure Optimization"
+          description="View active Azure Advisor Cost recommendations."
+          actions={
+            <Link
+              to="/optimization"
+              className="
+                inline-flex items-center rounded-md border border-border
+                bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary
+                hover:bg-surface-hover focus:outline-none focus-visible:shadow-focus
+              "
+              data-testid="azure-dashboard-optimization-link"
+            >
+              Open Optimization
+            </Link>
+          }
         >
-          <ProviderCapabilityNotice
-            provider="AZURE"
-            feature="Optimization"
-            message="Active Azure Advisor Cost recommendations appear in the dedicated Optimization page."
-          />
+          <p className="text-xs text-fg-muted">
+            Active Azure Advisor Cost recommendations for the current subscription are
+            available in the Optimization page.
+          </p>
         </SectionCard>
         <SectionCard
           title="Azure Resources"
-          description="Resource Graph inventory"
+          description="View Azure Resource Graph inventory for the selected subscription."
+          actions={
+            <Link
+              to="/resources"
+              className="
+                inline-flex items-center rounded-md border border-border
+                bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary
+                hover:bg-surface-hover focus:outline-none focus-visible:shadow-focus
+              "
+              data-testid="azure-dashboard-resources-link"
+            >
+              Open Resources
+            </Link>
+          }
         >
-          <ProviderCapabilityNotice
-            provider="AZURE"
-            feature="Resources"
-            message="Full Azure Resource Graph inventory appears in the dedicated Resources page."
-          />
+          <p className="text-xs text-fg-muted">
+            Full Azure Resource Graph inventory for the current subscription is
+            available in the Resources page.
+          </p>
         </SectionCard>
       </div>
     </div>
