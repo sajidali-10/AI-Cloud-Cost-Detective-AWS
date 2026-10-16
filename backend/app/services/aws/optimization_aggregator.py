@@ -287,15 +287,24 @@ def _merge_recommendations(
             # account as the primary identity (it's the one whose
             # recommendation we kept), but expand the display name
             # to mention the others.
-            others = ", ".join(
-                f"{name} ({aid})"
-                for aid, name in contributors[1:]
+            #
+            # Phase 7D.1: ``Recommendation`` is a frozen Pydantic
+            # model — direct attribute assignment raises
+            # ``ValidationError`` (frozen_instance).  Re-issue via
+            # ``model_copy(update=...)`` instead and preserve the
+            # primary account_id so backend drill-in still works for
+            # the canonical recommendation.
+            primary_display = (
+                getattr(rec, "account_display_name", None)
+                or contributors[0][1]
             )
-            rec.account_display_name = (
-                f"{rec.account_display_name or contributors[0][1]} + {len(contributors) - 1} more"
+            rec = rec.model_copy(
+                update={
+                    "account_display_name": (
+                        f"{primary_display} + {len(contributors) - 1} more"
+                    )
+                }
             )
-            # Preserve the primary account_id so backend drill-in
-            # still works for the canonical recommendation.
         out.append(rec)
     out.sort(key=lambda r: (parse_savings_desc(r.estimated_monthly_savings), r.resource_id))
     return out

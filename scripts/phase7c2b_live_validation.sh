@@ -37,7 +37,7 @@ echo "=========================================="
 
 # 1. Authentication CONNECTED.
 S=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
-    "$API/api/cloud-accounts/selectable?provider=AZURE")
+    "$API/api/cloud/accounts/selectable?provider=AZURE")
 CODE=$(echo "$S" | tail -1)
 BODY=$(echo "$S" | head -n -1)
 [ "$CODE" = "200" ] && report "Azure subscriptions selectable" PASS || report "Azure subscriptions selectable (HTTP $CODE)" FAIL

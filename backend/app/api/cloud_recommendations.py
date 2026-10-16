@@ -57,6 +57,7 @@ from app.api.deps import get_current_user
 from app.db.models import AppUser
 from app.db.session import get_db
 from app.schemas.cloud_recommendation import (
+    CloudRecommendationAccountError,
     CloudRecommendationCurrencyTotal,
     CloudRecommendationGroupCount,
     CloudRecommendationItem,
@@ -81,12 +82,67 @@ from app.services.cloud.azure.advisor_aggregator import (
     AdvisorRollup,
     aggregate_advisor_recommendations_for_subscriptions,
 )
+from app.services.cloud.aws.recommendation_aggregator import (
+    AwsRecommendationRollup,
+    aggregate_aws_recommendations_for_accounts,
+)
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("cost-detective-backend.cloud_recommendations")
 
 
 router = APIRouter(prefix="/cloud", tags=["cloud"])
+
+
+# ---------------------------------------------------------------------------
+# Cache key — must include EVERY dimension that affects the response.
+# Phase 7D.1 adds an AWS/Azure-isolated key so recommendation caches
+# for the two providers (and All-AWS vs All-Azure) can never collide.
+# ---------------------------------------------------------------------------
+
+
+def _build_recommendation_cache_key(
+    *,
+    user_id: int,
+    provider: str,
+    scope: str,
+    region: Optional[str],
+    days: int,
+) -> str:
+    """Stable cache key for the canonical recommendation route.
+
+    Mirrors the isolation rules from :mod:`app.api.cloud_costs` and
+    :mod:`app.api.cloud_resources`: every dimension that can change
+    the response is folded into the key so an AWS request can never
+    satisfy an Azure request, and ``All AWS Accounts`` can never
+    satisfy ``All Azure Subscriptions``.  The route does not persist
+    to the ``cost_cache`` table; the key is used as a stable
+    correlation id and is asserted directly by the cache-isolation
+    regression tests.
+    """
+    import hashlib
+
+    raw = "|".join(
+        [
+            "v1",
+            provider.upper(),
+            scope,
+            f"user={user_id}",
+            region or "all",
+            f"days={days}",
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:48]
+
+
+# The selector prefixes that are only meaningful to one provider.  A
+# selector minted for one provider must never be interpreted by the
+# other (an Azure ``sub:<guid>`` must never reach AWS, and an AWS
+# ``acct:<id>`` must never reach Azure).
+_SELECTOR_PREFIX_BY_PROVIDER = {
+    CloudProviderKind.AWS: "acct:",
+    CloudProviderKind.AZURE: "sub:",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +173,24 @@ def _resolve_rows(
                 },
             )
         return rows, "all", None
+
+    # Phase 7D.1 — provider-specific selector coercion.  Reject a
+    # selector minted for the *other* provider explicitly so it is
+    # never misinterpreted as a provider-native id.
+    other_prefix = "sub:" if provider == CloudProviderKind.AWS else "acct:"
+    if selection.startswith(other_prefix):
+        return None, "invalid", JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "status": "error",
+                "error_code": "ProviderSelectorMismatch",
+                "message": (
+                    f"selector {selection!r} is not valid for "
+                    f"provider={provider.value}; expected "
+                    f"{_SELECTOR_PREFIX_BY_PROVIDER.get(provider, provider.value.lower() + ':')!r}"
+                ),
+            },
+        )
 
     cleaned = selection
     if provider == CloudProviderKind.AZURE and cleaned.startswith("sub:"):
@@ -219,6 +293,30 @@ def _build_azure_envelope(
         )
         for item in raw_errors
     ]
+    # Phase 7D.1 — provider-neutral aliases so AWS and Azure expose
+    # the same generic fields (subscription -> account, type ->
+    # action, subscription_errors -> account_errors).  The legacy
+    # fields above are retained for backward compatibility.
+    account_errors = [
+        CloudRecommendationAccountError(
+            account_id=item.subscription_id,
+            display_name=item.display_name,
+            code=item.category,
+            message=item.message,
+        )
+        for item in raw_errors
+    ]
+    by_account = list(by_subscription)
+    by_action = list(by_type)
+    by_source = (
+        [
+            CloudRecommendationGroupCount(
+                key="AZURE_ADVISOR", count=rollup.total_recommendations
+            )
+        ]
+        if rollup.total_recommendations
+        else []
+    )
     savings_by_currency = [
         CloudRecommendationCurrencyTotal(currency=currency, amount=amount)
         for currency, amount in sorted(rollup.savings_by_currency.items())
@@ -234,6 +332,8 @@ def _build_azure_envelope(
         recommendations_with_savings=rollup.recommendations_with_savings,
         recommendations_without_savings=rollup.recommendations_without_savings,
         potential_annual_savings=rollup.potential_annual_savings,
+        potential_savings=rollup.potential_annual_savings,
+        savings_period="ANNUAL",
         savings_by_currency=savings_by_currency,
         by_impact=by_impact,
         by_resource_type=by_resource_type,
@@ -242,6 +342,10 @@ def _build_azure_envelope(
         by_type=by_type,
         by_subcategory=by_subcategory,
         subscription_errors=subscription_errors,
+        by_account=by_account,
+        by_source=by_source,
+        by_action=by_action,
+        account_errors=account_errors,
         source="AZURE_ADVISOR",
     )
     items = [
@@ -255,6 +359,95 @@ def _build_azure_envelope(
             service=rec.service,
             action=rec.action,
             title=rec.title,
+            category=rec.category,
+            impact=rec.impact,
+            description=rec.description,
+            estimated_savings=rec.estimated_savings,
+            currency=rec.currency,
+            source=rec.source,
+            extensions=dict(rec.extensions) if rec.extensions else {},
+        )
+        for rec in flat_recommendations
+    ]
+    return CloudRecommendationListResponse(summary=summary_envelope, recommendations=items)
+
+
+def _group_counts(mapping) -> list:
+    """Sort a ``{key: count}`` mapping into a stable group-count list."""
+    return [
+        CloudRecommendationGroupCount(key=k, count=v)
+        for k, v in sorted(mapping.items(), key=lambda x: (-x[1], x[0]))
+    ]
+
+
+def _build_aws_envelope(
+    flat_recommendations,
+    rollup: AwsRecommendationRollup,
+    *,
+    scope: str,
+) -> CloudRecommendationListResponse:
+    """Translate AWS canonical recommendations into the envelope.
+
+    AWS-specific attribution (per-account) is surfaced through the
+    provider-neutral ``by_account`` field; the AWS-native source
+    values (``AWS_COST_OPTIMIZATION_HUB`` / ``AWS_COMPUTE_OPTIMIZER``
+    / ``UNKNOWN``) ride in ``by_source``.  Savings are MONTHLY and
+    are never summed across currencies.
+    """
+    savings_by_currency = [
+        CloudRecommendationCurrencyTotal(currency=currency, amount=amount)
+        for currency, amount in sorted(rollup.savings_by_currency.items())
+    ]
+    account_errors = [
+        CloudRecommendationAccountError(
+            account_id=e.account_id,
+            display_name=e.display_name,
+            code=e.code,
+            message=e.message,
+        )
+        for e in rollup.account_errors
+    ]
+    summary_envelope = CloudRecommendationSummaryEnvelope(
+        provider="AWS",
+        scope=scope,
+        scope_kind="all" if scope == "all" else "single",
+        status=rollup.status,
+        savings_status=rollup.savings_status,
+        currency=rollup.currency,
+        total_recommendations=rollup.total_recommendations,
+        recommendations_with_savings=rollup.recommendations_with_savings,
+        recommendations_without_savings=rollup.recommendations_without_savings,
+        potential_annual_savings=None,
+        potential_savings=rollup.potential_savings,
+        savings_period=rollup.savings_period,
+        savings_by_currency=savings_by_currency,
+        by_impact=_group_counts(rollup.by_impact),
+        by_resource_type=_group_counts(rollup.by_resource_type),
+        by_subscription=[],
+        by_resource_group=[],
+        by_type=[],
+        by_subcategory=[],
+        subscription_errors=[],
+        by_account=_group_counts(rollup.by_account),
+        by_source=_group_counts(rollup.by_source),
+        by_action=_group_counts(rollup.by_action),
+        account_errors=account_errors,
+        source="AWS_OPTIMIZATION",
+    )
+    items = [
+        CloudRecommendationItem(
+            provider="AWS",
+            account_id=rec.account_id,
+            region=rec.region,
+            recommendation_id=rec.recommendation_id,
+            resource_id=rec.resource_id,
+            resource_type=rec.resource_type,
+            service=rec.service,
+            action=rec.action,
+            title=rec.title,
+            category=rec.category,
+            impact=rec.impact,
+            description=rec.description,
             estimated_savings=rec.estimated_savings,
             currency=rec.currency,
             source=rec.source,
@@ -282,6 +475,18 @@ async def get_cloud_recommendations(
             "Default 'all'.  For AWS: 'acct:<id>' or a registry row id.  "
             "For Azure: 'sub:<id>' or a registry row id."
         ),
+    ),
+    region: Optional[str] = Query(
+        default=None,
+        description=(
+            "Optional region scope.  AWS defaults to the configured "
+            "default region when omitted; Azure ignores it (Advisor "
+            "recommendations are subscription-scoped)."
+        ),
+    ),
+    days: int = Query(
+        default=30,
+        description="Lookback window in days (AWS).  Azure ignores it.",
     ),
     user: AppUser = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -315,6 +520,47 @@ async def get_cloud_recommendations(
     if rows_err is not None:
         return rows_err
 
+    # AWS keeps the legacy default-region behaviour: absent an
+    # explicit region the recommendation fan-out scopes to the
+    # configured default region (matching /api/aws/optimization/*).
+    effective_region = region
+    if kind == CloudProviderKind.AWS and not effective_region:
+        from app.core.config import get_settings
+        effective_region = get_settings().aws_default_region
+
+    # Stable, provider+account+region+window isolated correlation id.
+    # Not persisted (the canonical route is stateless) but asserted by
+    # the cache-isolation regression tests.
+    _cache_key = _build_recommendation_cache_key(
+        user_id=getattr(user, "id", 0) or 0,
+        provider=kind.value,
+        scope=scope,
+        region=effective_region,
+        days=days,
+    )
+    _ = _cache_key
+
+    if kind == CloudProviderKind.AWS:
+        try:
+            flat, rollup_aws, _errors = await aggregate_aws_recommendations_for_accounts(
+                rows=rows, region=effective_region, days=days
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitised
+            logger.warning(
+                "cloud.recommendations.upstream_failed provider=%s code=%s",
+                kind.value, type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "error_code": "UPSTREAM_ERROR",
+                    "message": "upstream recommendations provider failed",
+                },
+            )
+        envelope = _build_aws_envelope(flat, rollup_aws, scope=scope)
+        return envelope.model_dump(mode="json")
+
     if kind == CloudProviderKind.AZURE:
         try:
             flat, rollup, failures = await aggregate_advisor_recommendations_for_subscriptions(
@@ -339,18 +585,18 @@ async def get_cloud_recommendations(
             flat, rollup, rows=rows, scope=scope, failures=failures,
         )
         return envelope.model_dump(mode="json")
-    # AWS keeps its existing /api/aws/optimization/* routes
-    # (Phase 7B).  This canonical Azure route returns 400 for AWS
-    # so callers are routed to the AWS-specific surface that
-    # carries the Phase 7B RecommendationReport envelope.
+
+    # Any other (future) provider kind is not wired for the canonical
+    # recommendation contract yet.  AWS and Azure are both served
+    # above; this is a defensive guard for RACKSPACE and beyond.
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={
             "status": "error",
             "error_code": "UnsupportedProviderForCanonicalRoute",
             "message": (
-                "AWS recommendations are served by /api/aws/optimization/*; "
-                "this canonical route currently supports provider=AZURE."
+                f"canonical recommendations do not support "
+                f"provider={kind.value}"
             ),
         },
     )

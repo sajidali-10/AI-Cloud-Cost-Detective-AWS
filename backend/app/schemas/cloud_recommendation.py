@@ -59,10 +59,33 @@ class CloudRecommendationItem(BaseModel):
     service: str
     action: str
     title: str
+    # Phase 7D.1 — generic fields promoted from extensions so both
+    # providers expose one shape (AWS + Azure).  Optional + defaulted
+    # so older payloads stay valid.
+    category: Optional[str] = None
+    impact: Optional[str] = None
+    description: Optional[str] = None
     estimated_savings: Optional[Decimal] = None
     currency: Optional[str] = None
     source: str
     extensions: Mapping[str, Any] = Field(default_factory=dict)
+
+
+class CloudRecommendationAccountError(BaseModel):
+    """A sanitised per-account / per-subscription failure.
+
+    Provider-neutral rename of the Azure-only
+    ``CloudRecommendationSubscriptionError``.  ``account_id`` carries
+    the AWS account id or the Azure subscription id depending on the
+    provider.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    account_id: str
+    display_name: str
+    code: str
+    message: str
 
 
 class CloudRecommendationGroupCount(BaseModel):
@@ -109,7 +132,15 @@ class CloudRecommendationSummaryEnvelope(BaseModel):
     total_recommendations: int
     recommendations_with_savings: int
     recommendations_without_savings: int
+    # ``potential_annual_savings`` is the Azure Advisor figure (kept
+    # for backward compatibility).  ``potential_savings`` + the
+    # generic ``savings_period`` are the provider-neutral pair: AWS
+    # populates them with a MONTHLY figure, Azure likewise alongside
+    # the legacy annual field.  Never both meaningfully populated for
+    # AWS (its annual field stays None).
     potential_annual_savings: Optional[Decimal] = None
+    potential_savings: Optional[Decimal] = None
+    savings_period: Optional[str] = None  # MONTHLY | ANNUAL | None
     savings_by_currency: List[CloudRecommendationCurrencyTotal] = Field(default_factory=list)
     by_impact: List[CloudRecommendationGroupCount] = Field(default_factory=list)
     by_resource_type: List[CloudRecommendationGroupCount] = Field(default_factory=list)
@@ -118,6 +149,12 @@ class CloudRecommendationSummaryEnvelope(BaseModel):
     by_type: List[CloudRecommendationGroupCount] = Field(default_factory=list)
     by_subcategory: List[CloudRecommendationGroupCount] = Field(default_factory=list)
     subscription_errors: List[CloudRecommendationSubscriptionError] = Field(default_factory=list)
+    # Phase 7D.1 — provider-neutral attribution (AWS accounts / Azure
+    # subscriptions) and a provider-neutral failure list.
+    by_account: List[CloudRecommendationGroupCount] = Field(default_factory=list)
+    by_source: List[CloudRecommendationGroupCount] = Field(default_factory=list)
+    by_action: List[CloudRecommendationGroupCount] = Field(default_factory=list)
+    account_errors: List[CloudRecommendationAccountError] = Field(default_factory=list)
     source: str = "CLOUD_RECOMMENDATIONS"
 
 
@@ -131,6 +168,7 @@ class CloudRecommendationListResponse(BaseModel):
 
 
 __all__ = [
+    "CloudRecommendationAccountError",
     "CloudRecommendationCurrencyTotal",
     "CloudRecommendationGroupCount",
     "CloudRecommendationItem",

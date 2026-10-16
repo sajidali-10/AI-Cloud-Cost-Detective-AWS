@@ -494,6 +494,12 @@ def advisor_recommendations_to_cloud(
                 service=rec.resource_type,
                 action=rec.recommendation_type_id or "ADVISOR_RECOMMENDATION",
                 title=rec.title or rec.description or rec.recommendation_type_id,
+                # Phase 7D.1 — promote generic columns onto the shared
+                # contract (kept in ``extensions`` too for backward
+                # compatibility with the Phase 7C.2D frontend).
+                category=rec.category,
+                impact=rec.impact,
+                description=rec.description,
                 estimated_savings=rec.annual_savings,
                 currency=rec.savings_currency,
                 source="AZURE_ADVISOR",
