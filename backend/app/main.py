@@ -35,6 +35,25 @@ from app.api import aws_optimization  # noqa: F401  (registers /api/aws/optimiza
 # aws_router so the public URL is /api/cloud-accounts/* after Nginx
 # strips /api/.
 from app.api import cloud_accounts  # noqa: F401  (registers /api/cloud-accounts/*)
+# Phase 7C.1: provider-neutral routes.  Mounted with the
+# ``/cloud`` prefix so the public URL is /api/cloud/* after
+# Nginx strips /api/.  These are the canonical provider-neutral
+# surface; the AWS-specific routes below remain for backwards
+# compatibility.
+from app.api.cloud_providers import router as cloud_providers_router
+# Phase 7C.2B: provider-neutral cloud cost surface.  Mounted
+# alongside cloud_providers so the canonical route is
+# ``/api/cloud/costs`` after Nginx strips ``/api/``.
+from app.api.cloud_costs import router as cloud_costs_router
+# Phase 7C.2C: provider-neutral cloud resource surface.  Mounted
+# alongside cloud_providers / cloud_costs so the canonical route
+# is ``/api/cloud/resources`` after Nginx strips ``/api/``.
+from app.api.cloud_resources import router as cloud_resources_router
+# Phase 7C.2D: provider-neutral cloud recommendations surface.
+# Mounted alongside cloud_providers / cloud_costs / cloud_resources
+# so the canonical route is ``/api/cloud/recommendations`` after
+# Nginx strips ``/api/``.
+from app.api.cloud_recommendations import router as cloud_recommendations_router
 # Phase 5A: authentication + admin user management routers.  These
 # are mounted with their own prefixes (/auth, /admin/users); nginx
 # strips /api/ as usual.
@@ -94,6 +113,15 @@ app.include_router(conversations_router)
 # responsible for the WebSocket upgrade headers.
 app.include_router(ws_conversations_router)
 
+# Phase 7C.1: provider-neutral cloud routes mounted under /api/cloud/*.
+app.include_router(cloud_providers_router)
+# Phase 7C.2B: provider-neutral cloud cost route mounted under /api/cloud/*.
+app.include_router(cloud_costs_router)
+# Phase 7C.2C: provider-neutral cloud resource route mounted under /api/cloud/*.
+app.include_router(cloud_resources_router)
+# Phase 7C.2D: provider-neutral cloud recommendations route mounted under /api/cloud/*.
+app.include_router(cloud_recommendations_router)
+
 
 # ---------------------------------------------------------------------------
 # Phase 7B: bootstrap the management-account row.
@@ -122,6 +150,40 @@ def _phase7b_bootstrap_management_account() -> None:
     except Exception as exc:  # noqa: BLE001 — bootstrap must never block startup
         logger.warning(
             "phase7b bootstrap_management_account failed: %s",
+            type(exc).__name__,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 7C.2A: bootstrap the configured Azure subscriptions.
+#
+# Subscription IDs are read from runtime configuration
+# (``AZURE_SUBSCRIPTION_<N>_*`` env vars, see
+# :mod:`app.services.cloud.azure.registrations`) and inserted
+# idempotently on first boot.  When the runtime is not
+# configured (no Entra tenant / client ids), the bootstrap is
+# a silent no-op so a deployment without Azure keeps working.
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+def _phase7c2a_bootstrap_azure_subscriptions() -> None:
+    """Idempotently register the configured Azure subscriptions.
+
+    Wrapped in a try/except so a misconfiguration cannot prevent
+    the application from starting.  Operators can always add
+    subscriptions later through the standard
+    ``POST /api/cloud-accounts`` API.
+    """
+    try:
+        from app.services.cloud.azure.adapter import (
+            bootstrap_azure_subscriptions_once,
+        )
+
+        bootstrap_azure_subscriptions_once()
+    except Exception as exc:  # noqa: BLE001 — bootstrap must never block startup
+        logger.warning(
+            "phase7c2a bootstrap_azure_subscriptions failed: %s",
             type(exc).__name__,
         )
 

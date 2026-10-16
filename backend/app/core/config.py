@@ -51,6 +51,40 @@ class Settings(BaseSettings):
     # --- AWS region (no AWS keys in Phase 0) ---
     aws_default_region: str = Field(default="us-east-1")
 
+    # --- Phase 7C.2A: Microsoft Entra ID tenant/client identifiers ---
+    # These are identifiers (not secrets) used by the Azure
+    # workload-federation credential layer.  They MUST be supplied
+    # via runtime configuration (deployment .env / secret manager).
+    # No Azure client secret is ever stored — authentication is
+    # provided by AWS outbound federation into Microsoft Entra.
+    #
+    # Tenant + client together drive ``ClientAssertionCredential``;
+    # the AWS federation assertion provider (``AWSWorkloadFederationCredential``)
+    # is invoked on demand by ``azure-identity``.
+    azure_tenant_id: str = Field(default="")
+    azure_client_id: str = Field(default="")
+    # AWS outbound identity federation audience — pinned by the
+    # Entra federated credential.  Exposed via env so future
+    # operators can override if their Entra app is configured
+    # against a different audience.  Defaults to the canonical
+    # ``api://AzureADTokenExchange`` audience which matches the
+    # AWS-side permission grant on the EC2 IAM role.
+    azure_federation_audience: str = Field(default="api://AzureADTokenExchange")
+    # Short-lived AWS JWT lifetime for the federated credential.
+    # Entra accepts assertions up to ~5 minutes; we request 300s.
+    # Short-lived AWS JWT lifetime for the federated credential.
+    # Entra accepts assertions up to ~5 minutes; we request 300s.
+    # The bounds are enforced in the model validator below so a
+    # misconfigured deployment clamps to 900 (max Entra accepts)
+    # rather than failing startup.
+    azure_federation_assertion_seconds: int = Field(default=300)
+    # Azure ARM scope used by the AzureCloudProvider for
+    # subscription validation.  Defaults to the canonical
+    # Resource Manager management scope.
+    azure_arm_scope: str = Field(
+        default="https://management.azure.com/.default"
+    )
+
     # --- Phase 4: AI Cost Analyst (LiteLLM Gateway) ---
     # Master switch. When False, every /api/ai/* generation endpoint
     # returns a controlled "AI_DISABLED" response without contacting
@@ -120,6 +154,42 @@ class Settings(BaseSettings):
                 "litellm_base_url",
                 f"http://{self.litellm_host}:{self.litellm_port}",
             )
+        return self
+
+    @model_validator(mode="after")
+    def _clamp_azure_federation_assertion_seconds(self) -> "Settings":
+        """Clamp the federated-credential JWT lifetime to Entra's band.
+
+        Microsoft Entra's federated-credential contract accepts
+        assertions up to ~5 minutes (900 s); anything outside that
+        band is silently rejected.  We clamp rather than refuse so
+        an operator who mistakenly sets a 24-hour lifetime still
+        gets a working deployment (with the maximum valid
+        lifetime), instead of a hard startup failure.
+
+        A ``0`` value is treated as a programming error and is
+        refused at startup — an operator who never wants the
+        federation should unset ``AZURE_TENANT_ID`` instead of
+        requesting a zero-second assertion.  Values < 60 are
+        clamped up to 60; values > 900 are clamped down to 900.
+        """
+        raw = self.azure_federation_assertion_seconds
+        if raw is None:
+            value = 300
+        else:
+            value = int(raw)
+            if value == 0:
+                raise ValueError(
+                    "azure_federation_assertion_seconds must be > 0; "
+                    "use AZURE_TENANT_ID='' to disable the federation"
+                )
+        if value < 60:
+            value = 60
+        elif value > 900:
+            value = 900
+        object.__setattr__(
+            self, "azure_federation_assertion_seconds", value,
+        )
         return self
 
     @model_validator(mode="after")

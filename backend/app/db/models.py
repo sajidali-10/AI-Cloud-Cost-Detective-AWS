@@ -403,7 +403,7 @@ class ConversationMessage(Base):
 #   profile lives in.  This row is inserted on first boot via the
 #   ``ensure_management_account_row`` helper.
 
-CLOUD_ACCOUNT_PROVIDERS: tuple[str, ...] = ("AWS",)
+CLOUD_ACCOUNT_PROVIDERS: tuple[str, ...] = ("AWS", "AZURE", "RACKSPACE")
 
 
 class CloudAccount(Base):
@@ -416,6 +416,14 @@ class CloudAccount(Base):
     * Target row (``is_management=false``): use
       ``STS AssumeRole(RoleArn=role_arn, ExternalId=external_id)``
       to obtain short-lived credentials.
+
+    Phase 7C.1 generalises the table for future Azure / Rackspace
+    adapters: ``account_id`` widens to 64 chars, ``role_arn`` is
+    nullable, and two Azure-specific columns (``tenant_id``,
+    ``subscription_id``) plus a generic ``provider_metadata``
+    JSONB column are added.  No Azure / Rackspace data is inserted
+    in this phase; the columns exist so a future migration does not
+    need to ALTER the table again.
     """
 
     __tablename__ = "cloud_accounts"
@@ -435,7 +443,7 @@ class CloudAccount(Base):
             sqlite_where=text("is_management = 1"),
         ),
         CheckConstraint(
-            "provider IN ('AWS')",
+            "provider IN ('AWS', 'AZURE', 'RACKSPACE')",
             name="ck_cloud_accounts_provider",
         ),
         # ``enabled`` and ``is_management`` are BOOLEAN columns; the
@@ -448,14 +456,30 @@ class CloudAccount(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
 
     provider: Mapped[str] = mapped_column(String(16), nullable=False)
-    account_id: Mapped[str] = mapped_column(String(12), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
 
-    role_arn: Mapped[str] = mapped_column(String(2048), nullable=False)
+    role_arn: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     # External IDs are optional; the API layer treats them as
     # write-only secrets.  We never SELECT them into a response.
     external_id: Mapped[str | None] = mapped_column(
         String(1224), nullable=True
+    )
+
+    # Phase 7C.1 — Azure / Rackspace metadata.  AWS rows leave
+    # these columns NULL.  ``tenant_id`` carries the Entra ID
+    # tenant GUID for Azure rows; ``subscription_id`` carries the
+    # Azure subscription GUID.  Rackspace rows may use either for
+    # their own tenant / region identifiers.
+    tenant_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Per-provider federation / connection metadata.  Stored as
+    # JSONB on Postgres, JSON on SQLite / tests.  AWS rows store
+    # ``{}``; future Azure rows will store the workload federation
+    # subject and audience here.
+    provider_metadata: Mapped[dict] = mapped_column(
+        _JSONBType, nullable=False, server_default=text("'{}'")
     )
 
     enabled: Mapped[bool] = mapped_column(

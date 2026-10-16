@@ -15,8 +15,14 @@ import { LoadingSkeleton, LoadingSkeletonRows } from '../components/LoadingSkele
 import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery } from '../lib/finops/store'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
+import {
+  fetchCloudCostReport,
+  adaptCloudCostReport,
+  buildCloudCostsCacheKey,
+} from '../lib/finops/cloudCosts'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
 import { monthLabel } from '../types/finops'
@@ -35,24 +41,67 @@ function periodDisplay(period: BillingPeriod): string {
   return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
 }
 
+function providerSubtitle(provider: string): string {
+  if (provider === 'AZURE') {
+    return 'Browse Azure cost data by subscription, service and region'
+  }
+  if (provider === 'RACKSPACE') {
+    return 'Browse Rackspace cost data (coming soon)'
+  }
+  return 'Browse AWS cost data by account, service and region'
+}
+
 export function CostsPage() {
   const { period, region } = useFinopsPeriod()
   const { selection } = useAccountContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider = providerSlug === 'azure'
+    ? ('azure' as const)
+    : providerSlug === 'rackspace'
+    ? ('rackspace' as const)
+    : ('aws' as const)
   const periodText = periodDisplay(period)
 
+  // Phase 7C.2B: Azure routes through the provider-neutral
+  // ``/api/cloud/costs`` endpoint, which delegates to the Azure
+  // Cost Management adapter.  AWS keeps the legacy AWS-only
+  // endpoint to preserve every Phase 7A / 7B / 7C.1 regression
+  // contract.  Both shapes are normalised into the shared
+  // ``CostReportResponse`` model before reaching the components
+  // below — the UI is unchanged.
+  const useCanonical = provider === 'AZURE'
+
   // Phase 7B: invalidate stale data when the account switches.
+  // Phase 7C.1: also invalidate on provider change.
   const prevSelectionRef = useRef(selection)
+  const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
-    if (prevSelectionRef.current !== selection) {
+    if (
+      prevSelectionRef.current !== selection ||
+      prevProviderRef.current !== cacheProvider
+    ) {
       invalidateFinopsCache()
       prevSelectionRef.current = selection
+      prevProviderRef.current = cacheProvider
     }
-  }, [selection])
+  }, [selection, cacheProvider, providerVersion])
 
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion, selection),
-    () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
+    useCanonical
+      ? buildCloudCostsCacheKey(period, effectiveRegion, selection, cacheProvider)
+      : buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
+    () =>
+      useCanonical
+        ? fetchCloudCostReport(period, {
+            provider: 'AZURE',
+            region: effectiveRegion,
+            accountId: selection,
+          }).then(adaptCloudCostReport)
+        : fetchCostReport(period, {
+            region: effectiveRegion,
+            accountId: selection,
+          }),
   )
 
   const report = cost.entry.data?.report ?? null
@@ -66,7 +115,7 @@ export function CostsPage() {
       <PageHeader
         eyebrow="AI Cloud Cost Detective"
         title="Costs"
-        subtitle="Browse AWS cost data by account, service and region"
+        subtitle={providerSubtitle(provider)}
         context={
           <>
             <span className="text-fg-muted">Period</span>
@@ -149,8 +198,12 @@ export function CostsPage() {
           )}
         </SectionCard>
         <SectionCard
-          title="Cost by Region"
-          description="Regional distribution"
+          title={provider === 'AZURE' ? 'Cost by Region / Location' : 'Cost by Region'}
+          description={
+            provider === 'AZURE'
+              ? 'Azure ResourceLocation distribution'
+              : 'Regional distribution'
+          }
           actions={
             <StatusBadge tone="neutral">
               {report?.by_region.length ?? 0} regions

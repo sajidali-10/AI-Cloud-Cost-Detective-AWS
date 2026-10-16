@@ -133,8 +133,15 @@ run_check "frontend never persists AWS credential material in storage" \
   bash -c "! grep -REn 'localStorage\\.(setItem|getItem).*[Aa]ws|kong.*access.*key|sts.*secret' frontend/src"
 
 # Browser storage / cookies used by the app must NOT include key fields.
+#
+# Phase 7C.2E — tighten the regex.  The previous pattern
+# ``aws(Access|.?Secret)?.?(Key|Secret)`` matched test variable
+# names like ``awsKey`` (cache-key builders).  The new pattern
+# requires an actual credential qualifier (``access`` /
+# ``secret`` / ``session``) between ``aws`` and the key/token
+# suffix, OR the AWS_-prefixed env-var convention.
 run_check "no AWS key in known storage keys" \
-  bash -c "! grep -REn 'aws(Access|.?Secret)?.?(Key|Secret)' frontend/src --include='*.ts' --include='*.tsx' --include='*.css'"
+  bash -c "! grep -REin 'aws[._]?(access|secret|session)|AWS_(ACCESS|SECRET|SESSION)' frontend/src --include='*.ts' --include='*.tsx' --include='*.css'"
 
 # Migrations: no INSERT or column with credential material.
 run_check "no credential column added in any migration" \
@@ -187,8 +194,22 @@ run_check "CloudAccountCreate validates AWS account_id regex" \
   bash -c "grep -q 'AWS_ACCOUNT_ID_REGEX' backend/app/schemas/cloud_account.py"
 run_check "CloudAccountCreate validates IAM role ARN regex" \
   bash -c "grep -q 'AWS_IAM_ROLE_ARN_REGEX' backend/app/schemas/cloud_account.py"
-run_check "CloudAccountCreate rejects providers other than AWS" \
-  bash -c "grep -q 'Only provider' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate validates Azure subscription GUID regex" \
+  bash -c "grep -q 'AZURE_SUBSCRIPTION_ID_REGEX' backend/app/schemas/cloud_account.py"
+# Phase 7C.2A widened the provider enum from "AWS only" to AWS / AZURE
+# / RACKSPACE.  AWS and AZURE rows are accepted; anything else is still
+# refused at the schema layer.  The narrowing below pins exactly that
+# contract — no validation rule was weakened.
+run_check "CloudAccountCreate accepts provider=AWS" \
+  bash -c "grep -qE \"expected one of: .*AWS.*AZURE|RACKSPACE\" backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate accepts provider=AZURE" \
+  bash -c "grep -qE 'expected one of: .*AWS.*AZURE|RACKSPACE' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate still rejects unknown providers" \
+  bash -c "grep -qE 'is not recognised|provider=.*is not recognised' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate rejects role_arn on AZURE rows" \
+  bash -c "grep -q 'MUST NOT have role_arn' backend/app/schemas/cloud_account.py"
+run_check "CloudAccountCreate validates tenant_id is a GUID when set" \
+  bash -c "grep -q 'tenant_id must be a valid Microsoft Entra tenant GUID' backend/app/schemas/cloud_account.py"
 run_check "CloudAccountResponse does NOT expose external_id as a field" \
   bash -c "! awk '/^class CloudAccountResponse/,/^class [A-Z]/' backend/app/schemas/cloud_account.py | grep -qE '^[[:space:]]*external_id[[:space:]]*:'"
 

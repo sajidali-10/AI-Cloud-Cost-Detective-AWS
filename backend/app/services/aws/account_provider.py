@@ -161,6 +161,8 @@ def _to_response(row: CloudAccount) -> CloudAccountResponse:
         role_arn=row.role_arn,
         enabled=row.enabled,
         is_management=row.is_management,
+        tenant_id=row.tenant_id,
+        subscription_id=row.subscription_id,
         preferred_region=row.preferred_region,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -241,13 +243,28 @@ def create_account(db: Session, payload: CloudAccountCreate) -> CloudAccount:
 
     Raises :class:`AccountAlreadyExists` on duplicate
     ``(provider, account_id)``.  The new row is enabled by default.
+
+    Phase 7C.2A: the row carries ``tenant_id`` / ``subscription_id``
+    / ``provider_metadata`` for AZURE rows.  AWS rows continue to
+    leave those columns empty.
     """
+    provider = (payload.provider or "AWS").strip().upper()
+    tenant_id = payload.tenant_id
+    subscription_id = payload.subscription_id or (
+        payload.account_id if provider == "AZURE" else None
+    )
+    metadata = dict(getattr(payload, "provider_metadata", None) or {})
+    if provider == "AZURE":
+        metadata.setdefault("credential_strategy", "AZURE_WORKLOAD_FEDERATION")
     row = CloudAccount(
-        provider=payload.provider,
+        provider=provider,
         account_id=payload.account_id,
         display_name=payload.display_name,
         role_arn=payload.role_arn,
         external_id=payload.external_id,
+        tenant_id=tenant_id,
+        subscription_id=subscription_id,
+        provider_metadata=metadata,
         enabled=bool(payload.enabled),
         is_management=False,
         preferred_region=payload.preferred_region,
@@ -297,6 +314,16 @@ def update_account(
                 "role_arn embeds an account_id that does not match the registered account_id"
             )
         row.role_arn = data["role_arn"]
+    # AZURE rows MUST NOT have a role_arn; Azure authentication is
+    # workload-federation only.  An UPDATE that sets role_arn on an
+    # Azure row is refused here (defence in depth — the request
+    # schema also rejects it, but a misuse of the API should never
+    # be able to corrupt the registry).
+    if row.provider == "AZURE" and data.get("role_arn"):
+        raise ValueError(
+            "AZURE rows cannot have a role_arn; Azure authentication "
+            "is workload-federation only"
+        )
     if "display_name" in data and data["display_name"] is not None:
         row.display_name = data["display_name"]
     if "enabled" in data and data["enabled"] is not None and not row.is_management:
@@ -307,6 +334,27 @@ def update_account(
     # persist it here.  We never log the value and never return it.
     if "external_id" in data:
         row.external_id = data["external_id"]
+    # Phase 7C.2A: Azure metadata updates.  ``tenant_id`` is
+    # refreshed from runtime configuration when the row was
+    # bootstrapped; operators can PATCH it to align with a
+    # different Entra tenant, but only via the standard
+    # ADMIN-only API surface.
+    if "tenant_id" in data and data["tenant_id"] is not None:
+        if row.provider != "AZURE":
+            raise ValueError(
+                "tenant_id can only be set on AZURE rows"
+            )
+        row.tenant_id = data["tenant_id"]
+    if "subscription_id" in data and data["subscription_id"] is not None:
+        if row.provider != "AZURE":
+            raise ValueError(
+                "subscription_id can only be set on AZURE rows"
+            )
+        if data["subscription_id"] != row.account_id:
+            raise ValueError(
+                "AZURE subscription_id must match the account_id"
+            )
+        row.subscription_id = data["subscription_id"]
     db.commit()
     db.refresh(row)
     logger.info(

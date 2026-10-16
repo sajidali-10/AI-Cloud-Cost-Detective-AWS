@@ -35,13 +35,18 @@ describe('Phase 7B — AccountsPage lifecycle (source)', () => {
     expect(page).toMatch(/disable-confirm-modal/)
     expect(page).toMatch(/disable-confirm-confirm/)
     expect(page).toMatch(/disable-confirm-cancel/)
-    expect(page).toMatch(/onClick=\{\(\) => setPendingDisable\(row\)\}/)
+    // Phase 7C.2A refactored the inline callbacks into shared
+    // handlers — the Disable button now calls a wrapper that
+    // invokes ``setPendingDisable(row)``; the wrapper may carry
+    // extra whitespace / closure state.  Accept any shape that
+    // forwards the row into ``setPendingDisable``.
+    expect(page).toMatch(/setPendingDisable\(row\)/)
   })
 
   it('Enable fires immediately without confirmation', () => {
     // The Enable button does NOT route through setPendingDisable or
     // any confirmation state — it calls setEnabled directly.
-    expect(page).toMatch(/onClick=\{\(\) => void setEnabled\(row, true\)\}/)
+    expect(page).toMatch(/setEnabled\(row,\s*true\)/)
   })
 
   it('surfaces the full status enum (CONNECTED / ENABLED / DISABLED / ACCESS_DENIED / ROLE_NOT_FOUND / ERROR)', () => {

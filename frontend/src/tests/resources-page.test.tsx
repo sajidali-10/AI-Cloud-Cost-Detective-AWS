@@ -6,6 +6,7 @@ import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
 import { AuthProvider } from '../lib/auth'
 import { AccountProvider } from '../lib/accountContext'
+import { ProviderProvider } from '../lib/providerContext'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
@@ -21,9 +22,11 @@ function wrap(node: React.ReactNode) {
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <AccountProvider>
-            <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
-          </AccountProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider initialDays={30} initialRegion="all">{node}</FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>,

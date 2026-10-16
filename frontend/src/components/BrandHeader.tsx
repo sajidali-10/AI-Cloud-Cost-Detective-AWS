@@ -20,12 +20,12 @@ export function BrandHeader({ compact = false }: { compact?: boolean }) {
   return (
     <Link
       to="/"
-      className="flex items-center gap-3 rounded-md focus:outline-none focus-visible:shadow-focus"
+      className="flex shrink-0 items-center gap-3 rounded-md focus:outline-none focus-visible:shadow-focus"
       aria-label="AI Cloud Cost Detective — go to dashboard"
       data-testid="brand-header"
     >
       <HiplinkLogo size="compact" testId="brand-header-logo" />
-      <span className="text-sm font-semibold text-fg-primary">
+      <span className="hidden whitespace-nowrap text-sm font-semibold text-fg-primary sm:inline">
         {compact ? 'AI Cloud Cost Detective' : 'AI Cloud Cost Detective'}
       </span>
     </Link>

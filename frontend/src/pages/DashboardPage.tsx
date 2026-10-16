@@ -29,6 +29,11 @@ import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery } from '../lib/finops/store'
 import { fetchIdentity } from '../lib/finops/identity'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
+import {
+  fetchCloudCostReport,
+  adaptCloudCostReport,
+  buildCloudCostsCacheKey,
+} from '../lib/finops/cloudCosts'
 import { fetchResources, buildResourcesCacheKey } from '../lib/finops/resources'
 import {
   fetchCapabilities,
@@ -38,6 +43,8 @@ import {
 } from '../lib/finops/optimization'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { useProviderContext } from '../lib/providerContext'
+import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
@@ -66,50 +73,80 @@ import {
 export function DashboardPage() {
   const { period, region, currentMonth } = useFinopsPeriod()
   const { selection } = useAccountContext()
+  const { provider, providerSlug, providerVersion } = useProviderContext()
   const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider = providerSlug === 'azure'
+    ? ('azure' as const)
+    : providerSlug === 'rackspace'
+    ? ('rackspace' as const)
+    : ('aws' as const)
 
   // Phase 7B: invalidate stale data when the user switches accounts.
   // The store's cache is keyed on (period, region, account) so this
   // is belt-and-braces — it ensures no stale entry from a previous
   // account survives while the new fetch is in flight.
+  // Phase 7C.1: also invalidate when the provider changes so an
+  // AWS response cannot satisfy an Azure request that flips in
+  // before the new fetch completes.
   const prevSelectionRef = useRef(selection)
+  const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
-    if (prevSelectionRef.current !== selection) {
+    if (
+      prevSelectionRef.current !== selection ||
+      prevProviderRef.current !== cacheProvider
+    ) {
       invalidateFinopsCache()
       prevSelectionRef.current = selection
+      prevProviderRef.current = cacheProvider
     }
-  }, [selection])
+  }, [selection, cacheProvider, providerVersion])
+
+  // Phase 7C.2B — Azure dashboard reuses the same layout as AWS
+  // but routes cost data through the canonical
+  // ``/api/cloud/costs`` endpoint.  Resources and Optimization
+  // remain placeholders until 7C.2C / 7C.2D ship.
+  if (provider === 'AZURE') {
+    return (
+      <AzureDashboard
+        period={period}
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+        currentMonth={currentMonth}
+      />
+    )
+  }
 
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
-    `identity:${selection}`,
+    `${cacheProvider}:identity:${selection}`,
     () => fetchIdentity({ accountId: selection }),
     { ttlMs: 5 * 60_000 },
   )
 
-  // Cost report — keyed on period + region + account.
+  // Cost report — keyed on period + region + account + provider.
   const cost = useFinopsQuery<CostReportResponse>(
-    buildCostsCacheKey(period, effectiveRegion, selection),
+    buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchCostReport(period, { region: effectiveRegion, accountId: selection }),
   )
 
   // Capabilities — drives the Optimization Summary card.
   const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion, selection),
+    buildCapabilitiesCacheKey(effectiveRegion, selection, cacheProvider),
     () => fetchCapabilities(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
-  // Optimization summary — keyed on period + region + account.
+  // Optimization summary — keyed on period + region + account + provider.
   const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion, selection),
+    buildSummaryCacheKey(period, effectiveRegion, selection, cacheProvider),
     () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
 
   // Resources — drives the resource KPI + environment panel.
   const resources = useFinopsQuery<ResourcesResponse>(
-    buildResourcesCacheKey(effectiveRegion, selection),
+    buildResourcesCacheKey(effectiveRegion, selection, cacheProvider),
     () => fetchResources(effectiveRegion, { accountId: selection }),
     { ttlMs: 60_000 },
   )
@@ -682,4 +719,224 @@ function fieldGrid() {
 }
 function summaryByCategory(rows: SummaryByCategory[]) {
   return rows
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7C.2B — Azure Dashboard
+// ---------------------------------------------------------------------------
+
+function AzureDashboard({
+  period,
+  selection,
+  cacheProvider,
+  providerVersion: _providerVersion,
+  currentMonth,
+}: {
+  period: import('../types/finops').BillingPeriod
+  selection: string | null
+  cacheProvider: 'aws' | 'azure' | 'rackspace'
+  providerVersion: number
+  currentMonth: string
+}) {
+  // Cost report — provider-neutral route.
+  const cost = useFinopsQuery<CostReportResponse>(
+    buildCloudCostsCacheKey(period, null, selection, cacheProvider),
+    () =>
+      fetchCloudCostReport(period, {
+        provider: 'AZURE',
+        accountId: selection,
+      }).then(adaptCloudCostReport),
+  )
+  const report = cost.entry.data?.report ?? null
+  const activeMonthLabel = period.kind === 'month' ? monthLabel(period.month) : monthLabel(currentMonth)
+
+  const refreshAll = () => {
+    cost.refresh()
+  }
+
+  return (
+    <div className="space-y-5">
+      <PageHeader
+        eyebrow="AI Cloud Cost Detective"
+        title="Azure Dashboard"
+        subtitle="Azure Cost Management, subscription access and AI-powered FinOps analysis"
+        context={
+          <>
+            <ContextItem
+              label="Subscription"
+              value={
+                report?.account_id
+                  ? maskAccountId(report.account_id)
+                  : selection === 'all' || selection === null
+                    ? 'All Azure Subscriptions'
+                    : maskAccountId(selection)
+              }
+            />
+            <ContextItem label="Month" value={activeMonthLabel} />
+            <ContextItem
+              label="Status"
+              value={
+                <StatusBadge
+                  tone={
+                    cost.entry.status === 'success'
+                      ? 'success'
+                      : cost.entry.status === 'error'
+                        ? 'danger'
+                        : 'info'
+                  }
+                >
+                  {cost.entry.status === 'success'
+                    ? 'Live'
+                    : cost.entry.status === 'loading'
+                      ? 'Loading'
+                      : cost.entry.status === 'refreshing'
+                        ? 'Refreshing'
+                        : cost.entry.status === 'error'
+                          ? 'Unavailable'
+                          : 'Idle'}
+                </StatusBadge>
+              }
+            />
+            <ContextItem label="Last updated" value={formatLocalTime(cost.entry.refreshedAt)} />
+          </>
+        }
+        actions={
+          <div className="flex items-center gap-2">
+            <PeriodSelector />
+            <RefreshButton onClick={refreshAll} />
+          </div>
+        }
+      />
+
+      {cost.entry.error && !cost.entry.data && (
+        <PartialWarning
+          warnings={[
+            {
+              source: 'costs',
+              code: 'error',
+              message: cost.entry.error.message,
+              region: null,
+            },
+          ]}
+          title="Cost data could not be loaded"
+        />
+      )}
+
+      <DashboardHero
+        accountLabel={
+          report?.account_id
+            ? maskAccountId(report.account_id)
+            : selection === 'all' || selection === null
+              ? 'All Azure Subscriptions'
+              : maskAccountId(selection)
+        }
+        regionLabel={null}
+        refreshedLabel={formatLocalTime(cost.entry.refreshedAt)}
+        dataStatus={
+          cost.entry.status === 'success'
+            ? 'live'
+            : cost.entry.status === 'loading'
+              ? 'loading'
+              : cost.entry.status === 'refreshing'
+                ? 'refreshing'
+                : cost.entry.status === 'error'
+                  ? 'unavailable'
+                  : 'idle'
+        }
+      />
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <ResourcesKpiAzure />
+        <OptimizeKpiAzure />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <SectionCard
+          title="Cost Trend"
+          description={`Daily spend · ${activeMonthLabel}`}
+          actions={
+            <StatusBadge tone={cost.entry.data?.cache_status === 'HIT' ? 'neutral' : 'info'}>
+              Cache: {cost.entry.data?.cache_status ?? '—'}
+            </StatusBadge>
+          }
+        >
+          {cost.entry.status === 'loading' && <LoadingSkeleton className="h-[200px] w-full" />}
+          {cost.entry.error && <ErrorState message={cost.entry.error.message} />}
+          {cost.entry.data && (
+            <CostTrendChart
+              points={cost.entry.data.report.daily_trend}
+              currency={cost.entry.data.report.currency}
+              ariaLabel={`Daily cost trend for ${activeMonthLabel}`}
+            />
+          )}
+        </SectionCard>
+        <SectionCard
+          title="Cost by Service"
+          description="Top services by spend"
+          actions={
+            <StatusBadge tone={report?.estimated ? 'warning' : 'success'}>
+              {report?.estimated ? 'Estimated' : 'Final'}
+            </StatusBadge>
+          }
+        >
+          {cost.entry.status === 'loading' && <LoadingSkeletonRows rows={6} />}
+          {cost.entry.error && <ErrorState message={cost.entry.error.message} />}
+          {cost.entry.data && (
+            <HorizontalBarChart
+              rows={serviceRows(cost.entry.data.report.by_service)}
+              currency={cost.entry.data.report.currency}
+              maxRows={10}
+              showShare
+              safeShare
+            />
+          )}
+        </SectionCard>
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <SectionCard
+          title="Optimization"
+          description="Advisor integration"
+        >
+          <ProviderCapabilityNotice
+            provider="AZURE"
+            feature="Optimization"
+            message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
+          />
+        </SectionCard>
+        <SectionCard
+          title="Azure Resources"
+          description="Resource Graph inventory"
+        >
+          <ProviderCapabilityNotice
+            provider="AZURE"
+            feature="Resources"
+            message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
+          />
+        </SectionCard>
+      </div>
+    </div>
+  )
+}
+
+function ResourcesKpiAzure() {
+  return (
+    <MetricCard
+      label="Resources"
+      value="—"
+      description="Coming in Phase 7C.2C"
+    />
+  )
+}
+
+function OptimizeKpiAzure() {
+  return (
+    <MetricCard
+      label="Optimize"
+      value="—"
+      description="Coming in Phase 7C.2D"
+    />
+  )
 }
