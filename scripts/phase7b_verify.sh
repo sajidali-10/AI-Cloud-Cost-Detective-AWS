@@ -133,8 +133,15 @@ run_check "frontend never persists AWS credential material in storage" \
   bash -c "! grep -REn 'localStorage\\.(setItem|getItem).*[Aa]ws|kong.*access.*key|sts.*secret' frontend/src"
 
 # Browser storage / cookies used by the app must NOT include key fields.
+#
+# Phase 7C.2E — tighten the regex.  The previous pattern
+# ``aws(Access|.?Secret)?.?(Key|Secret)`` matched test variable
+# names like ``awsKey`` (cache-key builders).  The new pattern
+# requires an actual credential qualifier (``access`` /
+# ``secret`` / ``session``) between ``aws`` and the key/token
+# suffix, OR the AWS_-prefixed env-var convention.
 run_check "no AWS key in known storage keys" \
-  bash -c "! grep -REn 'aws(Access|.?Secret)?.?(Key|Secret)' frontend/src --include='*.ts' --include='*.tsx' --include='*.css'"
+  bash -c "! grep -REin 'aws[._]?(access|secret|session)|AWS_(ACCESS|SECRET|SESSION)' frontend/src --include='*.ts' --include='*.tsx' --include='*.css'"
 
 # Migrations: no INSERT or column with credential material.
 run_check "no credential column added in any migration" \

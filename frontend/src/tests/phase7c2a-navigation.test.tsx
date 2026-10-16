@@ -40,6 +40,7 @@ import { NavDropdown, isItemActive } from '../components/NavDropdown'
 import { CloudContextBar } from '../components/CloudContextBar'
 import { TopNavigation } from '../components/TopNavigation'
 import { MobileNavigation } from '../components/MobileNavigation'
+import { readSourceFile } from './helpers/sourcePath'
 
 // ---------------------------------------------------------------------------
 // Test harness: AuthProvider isn't strictly required by these units
@@ -693,30 +694,24 @@ describe('Phase 7C.2A — Provider state survives the nav refactor', () => {
 // ---------------------------------------------------------------------------
 
 describe('Phase 7C.2A — layout invariants', () => {
+  // Phase 7C.2E — resolve component paths relative to the test
+  // file so the assertions do not depend on vitest's cwd.
   it('TopNavigation does not embed ProviderSelector / AccountSelector directly', async () => {
-    const source = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/TopNavigation.tsx', 'utf-8'),
-    )
+    const source = await readSourceFile('src/components/TopNavigation.tsx')
     // The legacy inline selectors are now mounted by CloudContextBar.
     expect(source).not.toMatch(/<ProviderSelector\s/)
     expect(source).not.toMatch(/<AccountSelector\s/)
   })
   it('TopNavigation references CloudContextBar', async () => {
-    const source = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/TopNavigation.tsx', 'utf-8'),
-    )
+    const source = await readSourceFile('src/components/TopNavigation.tsx')
     expect(source).toMatch(/CloudContextBar/)
   })
   it('MobileNavigation references CloudContextBar', async () => {
-    const source = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/MobileNavigation.tsx', 'utf-8'),
-    )
+    const source = await readSourceFile('src/components/MobileNavigation.tsx')
     expect(source).toMatch(/CloudContextBar/)
   })
   it('BrandHeader keeps shrink-0 + whitespace-nowrap so product name does not wrap awkwardly', async () => {
-    const source = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/BrandHeader.tsx', 'utf-8'),
-    )
+    const source = await readSourceFile('src/components/BrandHeader.tsx')
     expect(source).toMatch(/shrink-0/)
     expect(source).toMatch(/whitespace-nowrap/)
   })

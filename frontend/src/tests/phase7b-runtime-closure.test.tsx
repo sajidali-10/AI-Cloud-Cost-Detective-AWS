@@ -25,6 +25,7 @@ import userEvent from '@testing-library/user-event'
 import { useEffect } from 'react'
 
 import { navItemsForRole } from '../lib/tokens'
+import { readSourceFile } from './helpers/sourcePath'
 
 // ---------------------------------------------------------------------------
 // 1. TopNavigation / MobileNavigation must reach AccountSelector
@@ -32,12 +33,8 @@ import { navItemsForRole } from '../lib/tokens'
 
 describe('Phase 7B runtime closure — AccountSelector mounting', () => {
   it('TopNavigation mounts AccountSelector (via CloudContextBar)', async () => {
-    const nav = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/TopNavigation.tsx', 'utf-8'),
-    )
-    const cloudBar = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/CloudContextBar.tsx', 'utf-8'),
-    )
+    const nav = await readSourceFile('src/components/TopNavigation.tsx')
+    const cloudBar = await readSourceFile('src/components/CloudContextBar.tsx')
     // TopNavigation must pull CloudContextBar into Row 2.
     expect(nav).toMatch(/CloudContextBar/)
     expect(nav).toMatch(/<CloudContextBar/)
@@ -46,12 +43,8 @@ describe('Phase 7B runtime closure — AccountSelector mounting', () => {
   })
 
   it('MobileNavigation mounts AccountSelector (via CloudContextBar)', async () => {
-    const mobile = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/MobileNavigation.tsx', 'utf-8'),
-    )
-    const cloudBar = await import('fs').then((fs) =>
-      fs.promises.readFile('src/components/CloudContextBar.tsx', 'utf-8'),
-    )
+    const mobile = await readSourceFile('src/components/MobileNavigation.tsx')
+    const cloudBar = await readSourceFile('src/components/CloudContextBar.tsx')
     // MobileNavigation must pull CloudContextBar into Row 2.
     expect(mobile).toMatch(/CloudContextBar/)
     expect(mobile).toMatch(/<CloudContextBar/)
