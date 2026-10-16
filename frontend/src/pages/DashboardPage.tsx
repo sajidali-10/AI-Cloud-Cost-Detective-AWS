@@ -12,6 +12,7 @@
 //     bootstrap via the store's gate; the dashboard cannot fire a
 //     request before the JWT is wired in.
 
+import * as React from 'react'
 import { useEffect, useMemo, useRef } from 'react'
 import { PageHeader, ContextItem } from '../components/PageHeader'
 import { MetricCard } from '../components/MetricCard'
@@ -101,22 +102,94 @@ export function DashboardPage() {
     }
   }, [selection, cacheProvider, providerVersion])
 
-  // Phase 7C.2B — Azure dashboard reuses the same layout as AWS
-  // but routes cost data through the canonical
-  // ``/api/cloud/costs`` endpoint.  Resources and Optimization
-  // remain placeholders until 7C.2C / 7C.2D ship.
+  // Hotfix: dispatch to a provider-specific child component so the
+  // hook count and order stay stable across provider switches.
+  // Returning an Azure child BEFORE the AWS hooks fire causes
+  // React's "Rendered fewer hooks than expected" error and the
+  // entire tree unmounts — that was the source of the blank
+  // dashboard bug.  Each child calls its own hooks.
   if (provider === 'AZURE') {
     return (
-      <AzureDashboard
-        period={period}
-        selection={selection}
-        cacheProvider={cacheProvider}
-        providerVersion={providerVersion}
-        currentMonth={currentMonth}
-      />
+      <DashboardErrorBoundary provider={provider}>
+        <AzureDashboard
+          period={period}
+          selection={selection}
+          cacheProvider={cacheProvider}
+          providerVersion={providerVersion}
+          currentMonth={currentMonth}
+        />
+      </DashboardErrorBoundary>
     )
   }
 
+  return (
+    <DashboardErrorBoundary provider={provider}>
+      <AwsDashboard
+        period={period}
+        region={region}
+        currentMonth={currentMonth}
+        effectiveRegion={effectiveRegion}
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+      />
+    </DashboardErrorBoundary>
+  )
+}
+
+/**
+ * Hotfix: error boundary scoped to the dashboard so an exception
+ * in any provider-specific child cannot permanently blank the
+ * page.  Falls back to a professional error state with a retry
+ * button instead of crashing the whole tree.
+ */
+class DashboardErrorBoundary extends React.Component<
+  { provider: string; children: React.ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null }
+
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error }
+  }
+
+  handleReset = (): void => {
+    this.setState({ error: null })
+  }
+
+  render(): React.ReactNode {
+    if (this.state.error) {
+      return (
+        <div className="space-y-3" data-testid="dashboard-error-boundary">
+          <ErrorState
+            title="Dashboard could not render"
+            message={this.state.error.message || 'An unexpected error occurred.'}
+            onRetry={this.handleReset}
+          />
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+function AwsDashboard({
+  period,
+  region,
+  currentMonth,
+  effectiveRegion,
+  selection,
+  cacheProvider,
+  providerVersion: _providerVersion,
+}: {
+  period: import('../types/finops').BillingPeriod
+  region: string
+  currentMonth: string
+  effectiveRegion: string | null
+  selection: string | null
+  cacheProvider: 'aws' | 'azure' | 'rackspace'
+  providerVersion: number
+}) {
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
     `${cacheProvider}:identity:${selection}`,
