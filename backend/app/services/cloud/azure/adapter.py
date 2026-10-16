@@ -230,17 +230,13 @@ class AzureCloudProvider(CloudProvider):
     ) -> CloudProviderStatus:
         """Return the Azure capability snapshot.
 
-        Phase 7C.2A: supports ``AUTHENTICATION`` and
-        ``SUBSCRIPTIONS``.
-
-        Phase 7C.2B: also supports ``COSTS`` — Cost Management
-        integration is wired and live.
-
-        Phase 7C.2C: also supports ``RESOURCES`` — Resource Graph
-        inventory is wired and live.  ``OPTIMIZATION`` / ``METRICS`` /
-        ``BILLING`` / ``ADVISOR`` / ``AI_EVIDENCE`` remain
-        ``UNSUPPORTED`` until their respective delivery phases
-        (7C.2D).
+        Phase 7C.2A: ``AUTHENTICATION`` + ``SUBSCRIPTIONS``.
+        Phase 7C.2B: ``COSTS`` (Microsoft Cost Management).
+        Phase 7C.2C: ``RESOURCES`` (Resource Graph inventory).
+        Phase 7C.2D: ``OPTIMIZATION`` (Azure Advisor Cost
+        recommendations).  ``ADVISOR`` is reported as ``UNSUPPORTED``
+        until a dedicated Advisor surface ships; ``AI_EVIDENCE`` /
+        ``METRICS`` / ``BILLING`` remain ``UNSUPPORTED``.
         """
         runtime_configured = _credential_mod.is_configured()
         auth_state = (
@@ -263,13 +259,18 @@ class AzureCloudProvider(CloudProvider):
             if runtime_configured
             else CloudCapabilityState.NOT_CONFIGURED
         )
+        optimization_state = (
+            CloudCapabilityState.SUPPORTED
+            if runtime_configured
+            else CloudCapabilityState.NOT_CONFIGURED
+        )
         capabilities: Dict[CloudCapability, CloudCapabilityState] = {
             CloudCapability.AUTHENTICATION: auth_state,
             CloudCapability.SUBSCRIPTIONS: subs_state,
             CloudCapability.COSTS: costs_state,
             CloudCapability.RESOURCES: resources_state,
+            CloudCapability.OPTIMIZATION: optimization_state,
             # Future phases:
-            CloudCapability.OPTIMIZATION: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.METRICS: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.BILLING: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.ADVISOR: CloudCapabilityState.UNSUPPORTED,
@@ -313,11 +314,21 @@ class AzureCloudProvider(CloudProvider):
                     "tags",
                 ],
             },
-            CloudCapability.OPTIMIZATION: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
-            CloudCapability.METRICS: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
-            CloudCapability.BILLING: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
-            CloudCapability.ADVISOR: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
-            CloudCapability.AI_EVIDENCE: {"phase": "7C.2D", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.OPTIMIZATION: {
+                "phase": "7C.2D",
+                "status": "SUPPORTED" if runtime_configured else "NOT_CONFIGURED",
+                "source": "Microsoft Advisor (via Resource Graph advisorresources table)",
+                "resource_graph_api_version": "2024-04-01",
+                "advisor_query": "advisorresources | where type == microsoft.advisor/recommendations | where properties.category == Cost | where properties.recommendationStatus == Active",
+                "scope": "subscription",
+                "savings_field": "extendedProperties.annualSavingsAmount",
+                "savings_currency_field": "extendedProperties.savingsCurrency",
+                "read_only": True,
+            },
+            CloudCapability.METRICS: {"phase": "future", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.BILLING: {"phase": "future", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.ADVISOR: {"phase": "future", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.AI_EVIDENCE: {"phase": "future", "status": "NOT_IMPLEMENTED"},
         }
         return CloudProviderStatus(
             provider=CloudProviderKind.AZURE,
@@ -556,10 +567,34 @@ class AzureCloudProvider(CloudProvider):
     # not implemented.  Keep it as a NotImplementedError so any
     # regression that calls into it is loud.
 
-    async def get_recommendations(self, **_kwargs: Any) -> List[CloudRecommendation]:
-        raise NotImplementedError(
-            "Azure Advisor is scheduled for Phase 7C.2D."
+    async def get_recommendations(
+        self,
+        *,
+        accounts: Sequence[_CloudAccountRow],
+        days: int = 90,
+        region: Optional[str] = None,
+    ) -> List[CloudRecommendation]:
+        """Enumerate active Azure Advisor Cost recommendations.
+
+        ``accounts`` is the set of registry rows the caller wants
+        included; the adapter delegates to the Advisor aggregator
+        which fans out across subscriptions with bounded
+        concurrency.  The ``days`` argument is intentionally
+        ignored: Advisor recommendations carry their own
+        ``lastUpdated`` timestamp; we do not synthesise a time
+        window.  ``region`` is also ignored: Advisor
+        recommendations are subscription-scoped, not
+        region-scoped.
+        """
+        from app.services.cloud.azure.advisor_aggregator import (
+            aggregate_advisor_recommendations_for_subscriptions,
         )
+
+        rows = list(accounts) if accounts else []
+        flat, _rollup, _failures = await aggregate_advisor_recommendations_for_subscriptions(
+            rows=rows
+        )
+        return list(flat)
 
 
 # ---------------------------------------------------------------------------

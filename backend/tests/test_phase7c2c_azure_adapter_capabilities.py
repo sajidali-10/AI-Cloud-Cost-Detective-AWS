@@ -48,12 +48,15 @@ class TestAzureResourcesCapabilities:
         assert "id" in detail["default_columns"]
         assert "tags" in detail["default_columns"]
 
-    def test_optimization_remains_unsupported(
+    def test_optimization_now_supported(
         self, azure_adapter, azure_runtime_configured
     ):
+        """Phase 7C.2D advances OPTIMIZATION to SUPPORTED (Azure
+        Advisor Cost recommendations).  Resources / Costs remain
+        SUPPORTED from the earlier phases."""
         status = azure_adapter.get_capabilities()
         assert status.capabilities[CloudCapability.OPTIMIZATION] == (
-            CloudCapabilityState.UNSUPPORTED
+            CloudCapabilityState.SUPPORTED
         )
 
     def test_advisor_remains_unsupported(
@@ -84,10 +87,14 @@ class TestAzureAdapterResourceMethods:
         source = inspect.getsource(azure_adapter.get_resource_summary)
         assert "NotImplementedError" not in source
 
-    def test_get_recommendations_still_stub(self, azure_adapter):
+    def test_get_recommendations_no_longer_stub(self, azure_adapter):
+        """Phase 7C.2D advances ``get_recommendations`` to a real
+        implementation that delegates to the Azure Advisor
+        aggregator.  The Phase 7C.2C ``NotImplementedError`` stub
+        is gone."""
         import inspect
         source = inspect.getsource(azure_adapter.get_recommendations)
-        assert "NotImplementedError" in source
+        assert "NotImplementedError" not in source
 
 
 class TestAwsRegression:

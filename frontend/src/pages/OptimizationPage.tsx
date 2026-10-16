@@ -33,6 +33,7 @@ import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
 import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
+import { AzureAdvisorView } from './AzureAdvisorView'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   BillingPeriod,
@@ -66,9 +67,17 @@ export function OptimizationPage() {
     ? ('rackspace' as const)
     : ('aws' as const)
 
-  // Phase 7C.2A — Azure Advisor is NOT yet implemented.
+  // Phase 7C.2D — Azure Advisor Cost recommendations are wired
+  // and live.  Render the dedicated AzureAdvisorView when Azure
+  // is selected; the AWS view below is unchanged.
   if (provider === 'AZURE') {
-    return <ProviderCapabilityNotice provider="AZURE" feature="Optimization" />
+    return (
+      <AzureAdvisorView
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+      />
+    )
   }
   const periodText = periodDisplay(period)
 

@@ -49,6 +49,11 @@ from app.api.cloud_costs import router as cloud_costs_router
 # alongside cloud_providers / cloud_costs so the canonical route
 # is ``/api/cloud/resources`` after Nginx strips ``/api/``.
 from app.api.cloud_resources import router as cloud_resources_router
+# Phase 7C.2D: provider-neutral cloud recommendations surface.
+# Mounted alongside cloud_providers / cloud_costs / cloud_resources
+# so the canonical route is ``/api/cloud/recommendations`` after
+# Nginx strips ``/api/``.
+from app.api.cloud_recommendations import router as cloud_recommendations_router
 # Phase 5A: authentication + admin user management routers.  These
 # are mounted with their own prefixes (/auth, /admin/users); nginx
 # strips /api/ as usual.
@@ -114,6 +119,8 @@ app.include_router(cloud_providers_router)
 app.include_router(cloud_costs_router)
 # Phase 7C.2C: provider-neutral cloud resource route mounted under /api/cloud/*.
 app.include_router(cloud_resources_router)
+# Phase 7C.2D: provider-neutral cloud recommendations route mounted under /api/cloud/*.
+app.include_router(cloud_recommendations_router)
 
 
 # ---------------------------------------------------------------------------

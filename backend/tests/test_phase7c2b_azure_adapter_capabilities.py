@@ -61,12 +61,15 @@ class TestAzureCapabilities:
             CloudCapabilityState.SUPPORTED
         )
 
-    def test_optimization_unimplemented(
+    def test_optimization_now_supported(
         self, azure_adapter, azure_runtime_configured
     ):
+        """Phase 7C.2D advances OPTIMIZATION to SUPPORTED (Azure
+        Advisor Cost recommendations).  ADVISOR remains UNSUPPORTED
+        until the dedicated Advisor surface ships."""
         status = azure_adapter.get_capabilities()
         assert status.capabilities[CloudCapability.OPTIMIZATION] == (
-            CloudCapabilityState.UNSUPPORTED
+            CloudCapabilityState.SUPPORTED
         )
 
     def test_advisor_unimplemented(self, azure_adapter, azure_runtime_configured):
@@ -135,10 +138,13 @@ class TestAzureAdapterCostMethods:
         source = inspect.getsource(azure_adapter.get_resources)
         assert "NotImplementedError" not in source
 
-    def test_get_recommendations_is_still_stub(self, azure_adapter):
-        """Phase 7C.2D — recommendations not yet implemented."""
+    def test_get_recommendations_no_longer_stub(self, azure_adapter):
+        """Phase 7C.2D advances ``get_recommendations`` to a real
+        implementation that delegates to the Azure Advisor
+        aggregator.  The Phase 7C.2B ``NotImplementedError`` stub
+        is gone."""
         source = inspect.getsource(azure_adapter.get_recommendations)
-        assert "NotImplementedError" in source
+        assert "NotImplementedError" not in source
 
 
 class TestAwsAdapterUnchanged:
