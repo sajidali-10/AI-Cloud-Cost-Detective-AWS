@@ -36,11 +36,22 @@ echo "Phase 7C.2B live validation"
 echo "=========================================="
 
 # 1. Authentication CONNECTED.
+# The canonical selectable-account route for Azure is
+#   /api/cloud/accounts/selectable/AZURE
+# (path param, not query param).  The legacy
+#   /api/cloud-accounts/selectable?provider=AZURE
+# route no longer exists — it returns 404.  The real route is
+# the Phase 7C.1 multi-cloud selectable surface added when the
+# Azure integration shipped.
 S=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
-    "$API/api/cloud-accounts/selectable?provider=AZURE")
+    "$API/api/cloud/accounts/selectable/AZURE")
 CODE=$(echo "$S" | tail -1)
 BODY=$(echo "$S" | head -n -1)
-[ "$CODE" = "200" ] && report "Azure subscriptions selectable" PASS || report "Azure subscriptions selectable (HTTP $CODE)" FAIL
+if [ "$CODE" = "200" ] && echo "$BODY" | grep -q '"provider":"AZURE"'; then
+    report "Azure subscriptions selectable (canonical /api/cloud/accounts/selectable/AZURE)" PASS
+else
+    report "Azure subscriptions selectable (HTTP $CODE)" FAIL
+fi
 
 # 2. Capability snapshot — COSTS=SUPPORTED.
 S=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $TOKEN" \
