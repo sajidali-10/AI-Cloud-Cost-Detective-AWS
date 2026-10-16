@@ -29,7 +29,17 @@ import {
 import { apiFetch } from './api'
 import { useProviderContext } from './providerContext'
 
-export type AccountSelection = 'all' | `acct:${number}`
+// Hotfix #2 — the Azure selector carries the canonical
+// subscription GUID (e.g. ``sub:<guid>``), NOT the local database
+// row id (``acct:<n>``).  AWS keeps ``acct:<n>`` because the AWS
+// route already maps local row id → role ARN via the legacy
+// Phase 7B resolver.  Azure routes use the GUID directly to look
+// up the subscription through ARM / Cost Management / Resource
+// Graph / Advisor.
+export type AccountSelection =
+  | 'all'
+  | `acct:${number}`
+  | `sub:${string}`
 
 export interface SelectableAccount {
   id: number
@@ -61,6 +71,8 @@ function readStoredSelection(): AccountSelection {
     if (!raw) return 'all'
     if (raw === 'all') return 'all'
     if (/^acct:\d+$/.test(raw)) return raw as AccountSelection
+    // Hotfix #2 — also accept the Azure canonical selector.
+    if (/^sub:[0-9a-fA-F-]{8,}$/.test(raw)) return raw as AccountSelection
     return 'all'
   } catch {
     return 'all'

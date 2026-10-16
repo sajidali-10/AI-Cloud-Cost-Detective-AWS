@@ -11,6 +11,7 @@
 import { apiFetch } from '../api'
 import type { BillingPeriod } from '../../types/finops'
 import { ALLOWED_LOOKBACK_DAYS } from '../../types/finops'
+import { canonicalCacheSegment, canonicalAccountParam } from './subscriptionSelection'
 
 export type CacheProvider = 'aws' | 'azure' | 'rackspace'
 
@@ -65,7 +66,7 @@ export function buildCloudCostsCacheKey(
   accountId: string | null,
   provider: CacheProvider = 'aws',
 ): string {
-  const acct = accountId ?? 'all'
+  const acct = canonicalCacheSegment(accountId, provider)
   const providerSeg = provider
   if (period.kind === 'month') {
     return `${providerSeg}:cloud:costs:month:${period.month}:${region ?? 'all'}:${acct}`
@@ -92,7 +93,8 @@ export async function fetchCloudCostReport(
     params.set('days', String(period.days))
   }
   if (options.region) params.set('region', options.region)
-  if (options.accountId) params.set('account_id', options.accountId)
+  const canonicalAccount = canonicalAccountParam(options.accountId, options.provider)
+  if (canonicalAccount) params.set('account_id', canonicalAccount)
   return apiFetch<CloudCostReportResponse>(`/api/cloud/costs?${params.toString()}`, {
     timeoutMs: 30_000,
   })
@@ -110,6 +112,27 @@ export function adaptCloudCostReport(
   response: CloudCostReportResponse,
 ): import('../../types/finops').CostReportResponse {
   const r = response.report
+  // Hotfix #2 — forward the cost-completeness fields so the UI can
+  // distinguish a genuine successful zero from a transient throttle.
+  // The canonical Azure report surfaces the per-subscription picture
+  // through TOP-LEVEL fields: ``by_account`` (one entry per
+  // subscription, including failed ones whose amount is zero) and
+  // ``account_errors`` (the failed / throttled subscriptions).  A
+  // snapshot is "failed" iff it appears in ``account_errors``.  The
+  // envelope's ``status`` (``SUCCESS`` / ``PARTIAL_SUCCESS`` /
+  // ``ERROR``), ``currency_status`` and the counts are re-exposed at
+  // the CostReport top level so the shared components can render
+  // Unavailable / Partial without reaching into provider internals.
+  const accountErrors = Array.isArray(r.account_errors) ? r.account_errors : []
+  const subscriptionErrors = accountErrors.map((e) => ({
+    subscription_id: e.account_id,
+    display_name: e.display_name,
+    code: e.code,
+    message: e.message,
+  }))
+  const failedAccounts = subscriptionErrors.length
+  const subscribedCount = Array.isArray(r.by_account) ? r.by_account.length : 0
+  const successfulAccounts = Math.max(0, subscribedCount - failedAccounts)
   return {
     report: {
       account_id: r.account_id ?? '',
@@ -131,6 +154,12 @@ export function adaptCloudCostReport(
       source: (r.source === 'AZURE_COST_MANAGEMENT'
         ? 'AZURE_COST_MANAGEMENT'
         : 'AWS_COST_EXPLORER') as 'AWS_COST_EXPLORER',
+      // Hotfix #2 — propagate completeness semantics.
+      status: r.status,
+      currency_status: r.currency_status,
+      successful_accounts: successfulAccounts,
+      failed_accounts: failedAccounts,
+      subscription_errors: subscriptionErrors,
     },
     cache_status: response.cache_status,
     cached_at: response.cached_at,
