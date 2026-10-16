@@ -82,6 +82,17 @@ class TestAdvisorKql:
         q = _build_active_cost_query()
         assert f'properties.recommendationStatus == "{ACTIVE_STATUS}"' in q
 
+    def test_active_status_is_new_not_active(self):
+        """Phase 7C.2D.1 — Microsoft documents
+        ``recommendationStatus == "New"`` for actionable
+        recommendations.  The literal string ``"Active"`` is NOT
+        a documented Resource Graph lifecycle value (it is the
+        Azure Portal's user-facing concept)."""
+        assert ACTIVE_STATUS == "New"
+        q = _build_active_cost_query()
+        assert 'recommendationStatus == "New"' in q
+        assert 'recommendationStatus == "Active"' not in q
+
     def test_no_limit_take_sample(self):
         q = _build_active_cost_query()
         for forbidden in ("| limit ", "| take ", "| sample "):
@@ -730,6 +741,193 @@ class TestAggregatorNoRawPropertiesLeakage:
         # ``properties`` or ``extendedProperties`` blob.
         assert "properties" not in rec.raw
         assert "extendedProperties" not in rec.raw
+
+
+class TestLifecycleExclusion:
+    """Phase 7C.2D.1 — verify the documented lifecycle values.
+
+    The aggregated query filters on
+    ``recommendationStatus == "New"``.  Every other documented
+    lifecycle value (``Completed``, ``Postponed``, ``Dismissed``,
+    ``InProgress``) is excluded at the KQL layer before the
+    aggregator sees it.  These tests pin the contract so future
+    KQL changes cannot accidentally re-include them.
+
+    They also pin that the literal ``"Active"`` string is NOT a
+    documented Resource Graph value.
+    """
+
+    def test_new_is_the_active_value(self):
+        assert ACTIVE_STATUS == "New"
+
+    def test_literal_active_string_not_documented(self):
+        """The Azure Portal uses "Active" as a user-facing concept,
+        but the Resource Graph lifecycle field does not.  Our
+        constant must be the documented value, not the Portal
+        label."""
+        assert ACTIVE_STATUS != "Active"
+
+    def test_completed_excluded_by_query_filter(self, patch_token):
+        """The KQL filters on ``recommendationStatus == "New"``,
+        so a ``Completed`` recommendation never reaches the
+        aggregator.  We assert the KQL contract directly because
+        the client-side transport stub returns whatever the test
+        puts in (filtering happens server-side at Microsoft)."""
+        q = _build_active_cost_query()
+        assert ACTIVE_STATUS == "New"
+        assert 'recommendationStatus == "New"' in q
+        assert "Completed" not in q
+
+    def test_postponed_excluded_by_query_filter(self, patch_token):
+        q = _build_active_cost_query()
+        assert "Postponed" not in q
+
+    def test_dismissed_excluded_by_query_filter(self, patch_token):
+        q = _build_active_cost_query()
+        assert "Dismissed" not in q
+
+    def test_inprogress_documented_but_excluded_by_policy(self, patch_token):
+        """``InProgress`` is a documented ``recommendationStatus``
+        value, but our aggregator excludes it by policy: the
+        project treats Advisor Cost as a "newly generated,
+        action required" snapshot.  Remediation tracking is a
+        separate workflow."""
+        q = _build_active_cost_query()
+        assert "InProgress" not in q
+
+    def test_kql_does_not_reference_other_lifecycle_values(self):
+        """Defence in depth: the KQL must NOT enumerate the other
+        documented lifecycle values anywhere.  This guards
+        against a future refactor that accidentally hardcodes
+        them."""
+        q = _build_active_cost_query()
+        for forbidden in ("Completed", "Dismissed", "Postponed", "InProgress", "Active"):
+            # ``New`` is the active filter itself; allow it as the
+            # only documented lifecycle value the KQL references.
+            if forbidden == ACTIVE_STATUS:
+                continue
+            assert forbidden not in q, (
+                f"KQL must not reference {forbidden!r} as a value"
+            )
+
+
+class TestTopLevelSubscriptionIdMapping:
+    """Phase 7C.2D.1 — Azure Resource Graph surfaces
+    ``subscriptionId`` as a top-level row field on the projected
+    result.  The canonical model's ``subscription_id`` must come
+    from this field, not from a nested property.
+
+    Verify against a realistic Azure Resource Graph row shape.
+    """
+
+    def _realistic_row(self, *, sub_guid: str = "9353d858-27fa-4ce7-bf87-782f3323d297") -> Dict:
+        """Build a realistic Advisor row mirroring the live shape
+        observed during Step 1."""
+        return {
+            "id": (
+                f"/subscriptions/{sub_guid}/resourcegroups/hiplinkqa/providers/"
+                "microsoft.compute/virtualmachines/windows2025-hiplink-qa-9-11-2026/"
+                "providers/Microsoft.Advisor/recommendations/"
+                "8a55e65441b60a79c22a0fd94d6a08fd35edab2a02cdaa1b7eedb61bf336e18e"
+            ),
+            "name": "8a55e65441b60a79c22a0fd94d6a08fd35edab2a02cdaa1b7eedb61bf336e18e",
+            "type": "microsoft.advisor/recommendations",
+            "subscriptionId": sub_guid,
+            "tenantId": "4f88e929-4f24-4f5e-9f32-1c7e8c8c0c0c",
+            "properties": {
+                "category": "Cost",
+                "impact": "High",
+                "recommendationStatus": "New",
+                "recommendationTypeId": "e10b1381-5f0a-47ff-8c7b-37bd13d7c974",
+                "impactedField": "Microsoft.Compute/virtualMachines",
+                "lastUpdated": "2026-09-27T00:21:48.4467372Z",
+                "createdTime": "2026-09-22T00:22:05.9987548Z",
+                "resourceMetadata": {
+                    "resourceId": (
+                        f"/subscriptions/{sub_guid}/resourcegroups/hiplinkqa/"
+                        "providers/microsoft.compute/virtualmachines/"
+                        "windows2025-hiplink-qa-9-11-2026"
+                    )
+                },
+                "shortDescription": {
+                    "problem": "Right-size or shutdown underutilized virtual machines",
+                    "solution": "Stop or downsize the VM",
+                },
+                "extendedProperties": {
+                    "annualSavingsAmount": "1488",
+                    "savingsCurrency": "USD",
+                    "term": "P1Y",
+                    "lookbackPeriod": "P30D",
+                    "savingsAmount": "124",
+                    "recommendationSubCategory": "UsageOptimization",
+                },
+            },
+        }
+
+    def test_top_level_subscription_id_wins(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.subscription_id == "9353d858-27fa-4ce7-bf87-782f3323d297"
+
+    def test_mcpp_top_level_subscription_id(self):
+        rec = normalize_recommendation_row(
+            self._realistic_row(sub_guid="a54d076b-2650-4b4f-a28c-2deed2011f83")
+        )
+        assert rec.subscription_id == "a54d076b-2650-4b4f-a28c-2deed2011f83"
+
+    def test_resource_id_from_resource_metadata(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.resource_id == (
+            "/subscriptions/9353d858-27fa-4ce7-bf87-782f3323d297/"
+            "resourcegroups/hiplinkqa/providers/microsoft.compute/virtualmachines/"
+            "windows2025-hiplink-qa-9-11-2026"
+        )
+
+    def test_resource_group_extracted_from_arm_id(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.resource_group == "hiplinkqa"
+
+    def test_resource_type_from_impacted_field(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.resource_type == "Microsoft.Compute/virtualMachines"
+
+    def test_impact_preserved(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.impact == "High"
+
+    def test_subcategory_from_extended_properties(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.subcategory == "UsageOptimization"
+
+    def test_title_uses_short_description_problem(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.title == (
+            "Right-size or shutdown underutilized virtual machines"
+        )
+
+    def test_annual_savings_only_when_present_and_valid(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.annual_savings == Decimal("1488")
+        assert rec.savings_currency == "USD"
+
+    def test_recommendation_status_preserved(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.recommendation_status == "New"
+
+    def test_term_and_lookback_preserved(self):
+        rec = normalize_recommendation_row(self._realistic_row())
+        assert rec.term == "P1Y"
+        assert rec.lookback_period == "P30D"
+
+    def test_resource_group_surfaces_in_extensions(self):
+        # The provider-neutral CloudRecommendation.extensions
+        # surface also carries the resource_group so the frontend
+        # can render it without re-fetching.
+        rec = normalize_recommendation_row(self._realistic_row())
+        cloud = agg.advisor_recommendations_to_cloud([rec])[0]
+        assert cloud.extensions["resource_group"] == "hiplinkqa"
+        assert cloud.extensions["impact"] == "High"
+        assert cloud.extensions["subcategory"] == "UsageOptimization"
+        assert cloud.extensions["recommendation_status"] == "New"
 
 
 class TestAdvisorRecToCloud:

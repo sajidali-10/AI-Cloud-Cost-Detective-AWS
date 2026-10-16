@@ -110,10 +110,30 @@ PAGE_TOP: int = 1000
 #: Defensive loop guard.
 MAX_PAGES: int = 50
 
-#: Consolidated Advisor lifecycle status.  Only "Active" is
-#: surfaced; "Completed" / "Dismissed" are excluded per the
-#: documented Microsoft Learn sample.
-ACTIVE_STATUS: str = "Active"
+#: Consolidated Advisor lifecycle status — Active state.
+#:
+#: Microsoft Learn documents the consolidated
+#: ``properties.recommendationStatus`` field with the following
+#: values:
+#:
+#:   * ``"New"``         — newly generated, action required.
+#:   * ``"InProgress"``  — remediation is in progress.
+#:   * ``"Completed"``   — remediation has completed.
+#:   * ``"Postponed"``   — user postponed the recommendation.
+#:   * ``"Dismissed"``   — user dismissed the recommendation.
+#:
+#: Microsoft's documented "Active (new) recommendations" query
+#: filters ``recommendationStatus == "New"``.  The literal value
+#: ``"Active"`` is NOT a documented ``recommendationStatus``
+#: value — it is the Azure Portal's user-facing concept that
+#: encompasses ``"New"`` (and sometimes ``"InProgress"``).
+#:
+#: Phase 7C.2D.1 surfaces ``"New"`` only, matching the
+#: documented query.  ``"InProgress"`` is intentionally NOT
+#: surfaced because the project treats the Advisor Cost surface
+#: as a "newly generated, action required" snapshot; remediation
+#: tracking belongs to a separate workflow.
+ACTIVE_STATUS: str = "New"
 
 #: Recommendation category — only "Cost" is in scope for Phase 7C.2D.
 COST_CATEGORY: str = "Cost"
@@ -221,15 +241,17 @@ def _build_active_cost_query() -> str:
     * ``properties.category == "Cost"`` — only Cost recommendations
       (Reliability / Security / Performance / OperationalExcellence
       are out of scope for this phase).
-    * ``properties.recommendationStatus == "Active"`` — only
-      currently-actionable recommendations; Completed /
-      Dismissed are excluded.
+    * ``properties.recommendationStatus == "<ACTIVE_STATUS>"`` —
+      only currently-actionable recommendations.  Phase 7C.2D.1
+      uses Microsoft's documented ``"New"`` lifecycle value
+      (NOT the literal string ``"Active"`` which is the Azure
+      Portal concept, not a Resource Graph value).
     """
     return (
         'advisorresources '
         '| where type == "microsoft.advisor/recommendations" '
         '| where properties.category == "Cost" '
-        '| where properties.recommendationStatus == "Active" '
+        f'| where properties.recommendationStatus == "{ACTIVE_STATUS}" '
         '| project subscriptionId, id, name, type, properties'
     )
 

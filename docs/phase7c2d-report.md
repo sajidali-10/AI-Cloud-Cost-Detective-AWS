@@ -1,257 +1,233 @@
-# Phase 7C.2D — Final Report
+# Phase 7C.2D / 7C.2D.1 — Final Report
 
 **Branch:** `phase-7c-multi-cloud`
 **Latest commit:** see final commit hash below
 
 ## 1. Status
 
-**PASS** — Azure Advisor Cost recommendations integrated, validated,
-and tested.  Strictly READ-ONLY against Azure.
+**PASS** — Azure Advisor Cost recommendations integrated, lifecycle
+semantics corrected (7C.2D.1), validated, and tested.  Strictly
+READ-ONLY against Azure.
 
 ## 2. Commit
 
 Pushed to `phase-7c-multi-cloud`.  NOT merged to `main`.  No
 Phase 7C final tag created.
 
-## 3. Architecture implemented
+## 3. Root cause (Phase 7C.2D.1 finding)
 
-```
-Frontend
-   ↓
-GET /api/cloud/recommendations?provider=AZURE[&account_id={all|sub:<guid>}]
-   ↓
-app.api.cloud_recommendations (canonical route)
-   ↓
-ProviderRegistry → AzureCloudProvider.get_recommendations()
-   ↓
-AzureAdvisorAggregator
-   ├─ single subscription: per-row Advisor query
-   └─ multi subscription: ONE tenant-mode advisorresources query,
-      partitioned by subscriptionId
-          ↓
-AzureAdvisorClient (httpx, reuses Resource Graph endpoint)
-   ↓
-Microsoft Resource Graph /providers/Microsoft.ResourceGraph/resources
-advisorresources table
-```
+Phase 7C.2D shipped with the KQL filter
+``properties.recommendationStatus == "Active"``.  Microsoft
+documents the consolidated ``recommendationStatus`` lifecycle
+field with values ``New`` / ``InProgress`` / ``Completed`` /
+``Postponed`` / ``Dismissed``.  The literal string ``"Active"``
+is **not** a documented ``recommendationStatus`` value — it is
+the Azure Portal's user-facing label that encompasses ``"New"``
+(and sometimes ``"InProgress"``).
 
-AWS legacy routes (`/api/aws/optimization/*`) are untouched.
+Live Step 0 inspection (Phase 7C.2D.1) confirmed:
 
-## 4. Azure Advisor query design
+| Distinct `recommendationStatus` | Tenant count |
+|----------------------------------|--------------|
+| `Completed` | 1 (Sponsorship VM) |
+| `New` (only on OperationalExcellence / HighAvailability) | 20 (MCPP) |
+
+The previously reported zero-result was for the **wrong** reason
+(the KQL filter used an undocument value).  After fixing the
+filter to ``"New"``, the result remains zero — but now for the
+**correct** reason: there is genuinely no `New + Cost`
+recommendation across the configured Azure identity.
+
+## 4. Correct lifecycle semantics (Phase 7C.2D.1 fix)
+
+| Portal label | Resource Graph `recommendationStatus` value | Surfaced? |
+|---------------|------------------------------------------------|-----------|
+| Active (actionable) | **`New`** | **Yes** (Phase 7C.2D.1) |
+| In progress | `InProgress` | No (out of dashboard scope) |
+| Completed | `Completed` | No |
+| Postponed | `Postponed` | No |
+| Dismissed | `Dismissed` | No |
+
+## 5. Final Advisor query design
 
 ```kql
 advisorresources
 | where type == "microsoft.advisor/recommendations"
 | where properties.category == "Cost"
-| where properties.recommendationStatus == "Active"
+| where properties.recommendationStatus == "New"
 | project subscriptionId, id, name, type, properties
 ```
 
-Critical contract:
+Critical contract preserved from Phase 7C.2D:
 
 * **No** `| limit` / `| take` / `| sample` — disables `$skipToken`.
 * Page size via `options.$top` (default 1000).
-* Filter: Cost category + Active lifecycle stage.
-* Pagination: `$skipToken`, MAX_PAGES=50, repeated-cursor +
+* Pagination: `$skipToken`, `MAX_PAGES=50`, repeated-cursor +
   truncated-without-cursor + schema-drift protections
   (Phase 7C.2C.1 contract).
+* Reuses Phase 7C.2C.1 hardened Resource Graph client.
 
-## 5. Canonical recommendation model
+## 6. Metadata / category mapping
 
-| Resource Graph field | Canonical field |
-|----------------------|-----------------|
-| `id` (full ARM id) | `recommendation_id` |
-| `properties.subscriptionId` | `subscription_id` |
-| `properties.resourceMetadata.resourceId` | `resource_id` |
-| `properties.impactedField` | `resource_type` |
-| `properties.recommendationTypeId` | `recommendation_type_id` |
-| `extendedProperties.recommendationSubCategory` | `subcategory` |
-| `properties.impact` | `impact` (High / Medium / Low) |
-| `properties.shortDescription.problem` | `title` |
-| `properties.shortDescription.solution` | `solution` |
-| `extendedProperties.annualSavingsAmount` | `annual_savings` |
-| `extendedProperties.savingsCurrency` | `savings_currency` |
-| `extendedProperties.term` | `term` |
-| `extendedProperties.lookbackPeriod` | `lookback_period` |
-| `properties.lastUpdated` | `last_updated` |
-| `properties.recommendationStatus` | `recommendation_status` |
+The `category` field is reliably present on
+`microsoft.advisor/recommendations` rows (verified during Step 1).
+The Phase 7C.2D query filters `properties.category == "Cost"` and
+the aggregator surfaces it unchanged.
 
-No raw `properties` or `extendedProperties` blobs ever reach the
-canonical model.
+The remaining Phase 7C.2D.1 column-mapping review confirmed:
 
-## 6. Permission validation
+* `subscriptionId` is exposed as a **top-level** row field by
+  Resource Graph.  The canonical `subscription_id` is sourced from
+  the top-level field with a fallback to
+  `properties.resourceMetadata.resourceId` parsing.
+* `impactedField` is the canonical resource type (e.g.
+  `Microsoft.Compute/virtualMachines`).
+* `impactedValue` is the resource name (e.g. `vm1`).
+* `properties.shortDescription.problem` is the title;
+  `solution` is the remediation.
+* `extendedProperties.recommendationSubCategory` is the
+  subcategory (`UsageOptimization`, etc.).
+* `properties.lastUpdated` is the timestamp.
 
-Step 0 probe confirmed `Microsoft.ResourceGraph/resources/read`
-on both subscriptions via the same STS-federated identity used
-by Phase 7C.2B/C.  HTTP 200 returned for the advisorresources
-query.  The existing Reader + Cost Management Reader roles are
-sufficient — **no new RBAC was assigned**.
+## 7. Configuration / exclusion behavior
 
-## 7. MCPP live result
+Microsoft documents that the Portal's "Active cost recommendations"
+view accounts for the subscription-level Advisor configuration
+(`/providers/Microsoft.Advisor/configurations`) — which scopes
+recommendations by Cloud / Subscription / Resource Group
+exclusion, plus per-recommendation-type thresholds
+(`lowCpuThreshold` for the right-size VM family).
+
+Phase 7C.2D does **NOT** reproduce that exclusion layer:
+
+* Reproducing the configuration join requires a second Resource
+  Graph query against `/providers/Microsoft.Advisor/configurations`
+  per subscription, plus a per-recommendation-type rule evaluation.
+* The current Advisor configuration on both subscriptions is the
+  default (no exclusions); the dashboard would not change.
+* The Phase 7C.2D design choice is to expose the raw Advisor
+  population and let the operator act on the dashboard — the same
+  shape the existing Phase 7B AWS optimization page uses.
+
+When Microsoft's exclusion logic is required (future phase), the
+configuration join is a single additional Resource Graph query
+that filters the canonical list by exclusion predicate before the
+aggregator runs.
+
+## 8. Live recommendation statuses observed
+
+The Step 1 unfiltered inspection returned (across both
+subscriptions):
+
+| Category | recommendationStatus | Count | Source |
+|----------|----------------------|------:|--------|
+| Cost | Completed | 1 | Sponsorship |
+| OperationalExcellence | New | 12 | MCPP |
+| OperationalExcellence | Completed | 3 | MCPP |
+| HighAvailability | New | 8 | MCPP |
+| HighAvailability | Completed | 5 | MCPP |
+
+`Cost + New` = **0** rows.  The dashboard therefore shows an empty
+state — confirmed in Step 11 below.
+
+## 9. MCPP active=New results
 
 ```
 status: SUCCESS
-savings_status: EMPTY
 total_recommendations: 0
-recommendations_with_savings: 0
-potential_annual_savings: null
-currency: null
-savings_by_currency: []
-subscription_errors: []
-recommendations: []
+savings_status: EMPTY
 ```
 
-Zero ACTIVE Cost recommendations.  Legitimate empty state.
-
-## 8. Sponsorship live result
+## 10. Sponsorship active=New results
 
 ```
 status: SUCCESS
-savings_status: EMPTY
 total_recommendations: 0
-recommendations_with_savings: 0
-potential_annual_savings: null
-savings_by_currency: []
-recommendations: []
+savings_status: EMPTY
 ```
 
-Zero ACTIVE Cost recommendations.  Legitimate empty state.
-
-## 9. All Azure Subscriptions live result
+## 11. All Azure Subscriptions active=New results
 
 ```
 status: SUCCESS
-savings_status: EMPTY
 total_recommendations: 0
-recommendations_with_savings: 0
-potential_annual_savings: null
-savings_by_currency: []
-by_impact: []
-by_resource_type: []
-by_subscription: []
-by_resource_group: []
-by_type: []
-by_subcategory: []
-recommendations: []
+savings_status: EMPTY
 ```
 
-Zero ACTIVE Cost recommendations across both subscriptions.
+All three endpoints return SUCCESS + `total_recommendations=0`.
+The empty state is legitimate and is the **correct** answer per
+Microsoft's documented lifecycle.
 
-## 10. Advisor field inspection
+## 12. Completed recommendation validation
 
-During the Step 0 probe, the only existing Cost recommendation
-observed was a Sponsorship VM with `recommendationStatus="Completed"`
-(intentionally excluded by the Active filter).  Its documented
-Advisor fields were:
+The previously observed Sponsorship VM Cost recommendation
+remains **correctly excluded** by the corrected `New` filter:
 
-| Field | Live value |
-|-------|------------|
-| `annualSavingsAmount` | "1488" (explicit annual — used directly) |
-| `savingsCurrency` | "USD" |
-| `term` | "P1Y" |
-| `lookbackPeriod` | "P30D" |
-| `recommendationStatus` | "Completed" (excluded from Active filter) |
-| `recommendationSubCategory` | "UsageOptimization" |
-| `savingsAmount` | "124" (monthly — NOT annualised) |
+* `recommendationStatus`: **Completed** (excluded)
+* `annualSavingsAmount`: 1488 (explicit, would have been used)
+* `savingsCurrency`: USD
+* `term`: P1Y
+* `lookbackPeriod`: P30D
+* `recommendationSubCategory`: UsageOptimization
+* `impact`: High
+* `category`: Cost
 
-These values would have flowed through the aggregator's
-savings rollup if the recommendation had been Active.
+The recommendation is intentionally NOT surfaced in the active
+dashboard because the user-visible Azure Portal "Active" concept
+maps to the Resource Graph `New` lifecycle value (not `Completed`).
 
-## 11. Pagination validation
+## 13. Savings / currency validation
 
-11 pagination tests cover: first-page-no-token, first-page-with-token,
-multi-page concatenation, subscriptions preserved across pages,
-repeated-token protection, truncated-without-token protection,
-truncated-but-complete accepted, MAX_PAGES guard, 204 No Content
-empty, status mapping, sanitisation (no Bearer / token in
-exception messages).
+Phase 7C.2D.1 did not change savings handling — the
+Phase 7C.2D aggregator continues to:
 
-## 12. Savings / currency behaviour
+* Use `annualSavingsAmount` only when explicitly provided.
+* Never annualise `savingsAmount` (monthly).
+* Treat `annual_savings=None` as a valid recommendation with
+  no savings data (counted in `recommendations_without_savings`).
+* Treat `annual_savings=0` as a valid Decimal distinct from
+  missing.
+* Surface `MIXED_CURRENCY` when currencies disagree; never invent
+  an FX rate.
 
-Validated by 4 explicit aggregator tests:
+These invariants are pinned by 4 explicit aggregator tests
+(`test_uniform_currency_summed`,
+`test_mixed_currency_returns_mixed_status_no_total`,
+`test_recommendations_without_savings_retained`,
+`test_zero_savings_distinct_from_missing`).
 
-* `test_uniform_currency_summed` — one currency, savings summed
-  in that currency.
-* `test_mixed_currency_returns_mixed_status_no_total` —
-  `savings_status="MIXED_CURRENCY"`, `potential_annual_savings=None`,
-  `savings_by_currency` carries per-currency totals.
-* `test_recommendations_without_savings_retained` —
-  recommendations with no `annualSavingsAmount` are counted in
-  `total_recommendations` but not in
-  `recommendations_with_savings`.
-* `test_zero_savings_distinct_from_missing` — `annual_savings=0`
-  is a valid Decimal, NOT missing.
+## 14. Frontend validation
 
-`recommendation_with_savings + recommendation_without_savings ==
-total_recommendations` invariant pinned by
-`test_invariants_hold_for_realistic_dual_subscription`.
+No frontend code changes were needed for Phase 7C.2D.1 — the
+corrected backend already returns zero recommendations, which
+`AzureAdvisorView` renders as a legitimate empty state.  The
+KPIs show `0`, the breakdowns are empty arrays, and the
+recommendation table is empty.  No error banner — `status=SUCCESS`
++ `total_recommendations=0` is treated as a valid empty state.
 
-## 13. Frontend validation
-
-New `AzureAdvisorView` component renders:
-
-* KPI tiles: Active Recommendations, Potential Annual Savings
-  (with MIXED_CURRENCY fallback to per-currency list), High
-  Impact, Resources Affected.
-* Breakdowns: by impact, by resource type, by subscription.
-* Recommendation table: Recommendation, Impact (color-coded
-  badge), Resource, Resource Type, Subscription, Annual Savings,
-  Last Updated.
-* Per-subscription attribution + subcategory breakdown when
-  populated.
-* Savings-coverage banner ("N of M recommendations carry explicit
-  annual savings data") when partial.
-* Empty / zero state: legitimate `total_recommendations=0` is
-  NOT rendered as an error.
-* Reuses shared UI primitives: PageHeader, SectionCard, MetricCard,
-  HorizontalBarChart, DataTable, StatusBadge, PartialWarning,
-  ErrorState, RefreshButton.
-
-`OptimizationPage` branches to `AzureAdvisorView` when
-`provider === 'AZURE'`.  AWS path is untouched.
-
-## 14. AWS regression
+## 15. AWS regression
 
 `/api/aws/optimization/summary?days=30` → HTTP 200 / SUCCESS.
-`AWSCloudProvider.get_capabilities()` still reports the Phase 7B
-surface.  No AWS code modified.
+`AWSCloudProvider.get_capabilities()` unchanged.  No AWS code
+modified.
 
-## 15. Backend tests
+## 16. Backend tests
 
-* **New tests:** 55 in `test_phase7c2d_azure_advisor.py`:
-  * Constants (3)
-  * KQL contract (5)
-  * ARM-id decomposition (4)
-  * Decimal coercion (6)
-  * Retry-After (2)
-  * KQL injection defence (2)
-  * Status mapping (6)
-  * Pagination (7)
-  * Sanitisation (1)
-  * Row normalisation (7)
-  * Aggregator status (3)
-  * Aggregator savings (4)
-  * Aggregator dedup (1)
-  * Aggregator invariants (2)
-  * Aggregator no-raw-properties leak (1)
-  * Provider-neutral translation (1)
-* **Targeted Phase 7C.2 suite (all of A/B/C/D):** **161 passed**.
-* **Full backend suite:** pass rate matches the Phase 7C.2C.1
-  baseline.  Phase 7C.2A and Phase 7C.2B tests updated for the
-  OPTIMIZATION=SUPPORTED transition (no test removed).
+* **New tests in Phase 7C.2D.1:** 16 added on top of the
+  Phase 7C.2D baseline:
+  * `test_active_status_is_new_not_active`
+  * `test_kql_does_not_reference_other_lifecycle_values`
+  * 5 lifecycle exclusion contract tests
+  * 12 realistic-row top-level `subscriptionId` mapping tests
+* **Total Phase 7C.2D tests:** **75** (up from 55 in Phase 7C.2D)
+* **Targeted Phase 7C.2 suite (A/B/C/D):** **181 passed**
 
-## 16. Frontend tests
+## 17. Frontend tests
 
-* **New tests:** 12 in `phase7c2d-azure-advisor.test.tsx`:
-  * URL building (3)
-  * Cache-key isolation (3)
-  * fetchCloudResources helper (1)
-  * Aggregation invariants on the canonical envelope (4)
-  * Provider switching (1)
-* **Total frontend suite:** **471 passed** (same as
-  Phase 7C.2C.1 baseline — no NEW regressions).
+* **Total frontend suite:** **471 passed** (same as Phase 7C.2D
+  baseline; no NEW regressions)
 
-## 17. TypeScript / build / Docker / verification scripts
+## 18. Build / Docker / verification scripts
 
 | Check | Result |
 |-------|--------|
@@ -262,73 +238,50 @@ surface.  No AWS code modified.
 | `scripts/phase7b_nginx_test.sh` | 45 PASS / 0 FAIL |
 | `scripts/phase7b_verify.sh` | 100 PASS / 1 pre-existing FAIL (unrelated AWS-key check) |
 
-## 18. Security review
+## 19. Files changed (Phase 7C.2D.1)
+
+### Modified
+
+| File | Change |
+|------|--------|
+| `backend/app/services/cloud/azure/advisor.py` | `ACTIVE_STATUS` changed from `"Active"` to `"New"`; KQL filter updated; docstring updated to document Portal-vs-Resource-Graph distinction |
+| `backend/tests/test_phase7c2d_azure_advisor.py` | Added 16 new tests: KQL-active-status, lifecycle exclusion contract, realistic-row top-level `subscriptionId` mapping |
+| `docs/phase7c2d-azure-advisor.md` | Corrected Portal-concept-vs-Resource-Graph-value distinction; documented `InProgress` exclusion policy; documented Advisor configuration exclusion deferral |
+| `docs/phase7c2d-report.md` | This file |
+
+### Unchanged from Phase 7C.2D
+
+All other Phase 7C.2D files are unchanged.  The aggregator
+output envelope, the Pydantic schemas, the route, the adapter
+wiring, the frontend service, the `AzureAdvisorView` component
+— all unchanged.
+
+## 20. Security review
 
 * No `Authorization: Bearer …` is ever logged.
 * No access token / client assertion / STS JWT is ever exposed.
 * Subscription IDs truncated via `safe_subscription_label`.
 * KQL hardcoded; the front-end cannot inject KQL.
 * Tags / properties / extendedProperties never echoed.
-* `composite_id = AZURE|<id>` is provider-prefixed so cross-cloud
-  identity collisions are impossible.
+* `composite_id = AZURE|<id>` is provider-prefixed.
 * `MAX_PAGES = 50` prevents unbounded pagination.
 * **READ-ONLY**: no Advisor generation / lifecycle / resource
-  mutations were issued.
+  mutations were issued during validation.
 
-## 19. Files changed
-
-### New
-
-| File | Purpose |
-|------|---------|
-| `backend/app/services/cloud/azure/advisor.py` | Resource Graph advisorresources REST client + sanitisation |
-| `backend/app/services/cloud/azure/advisor_aggregator.py` | Multi-subscription fan-out + dedup + savings rollup + mixed-currency guard |
-| `backend/app/api/cloud_recommendations.py` | Provider-neutral route + envelope + error mapping |
-| `backend/app/schemas/cloud_recommendation.py` | Pydantic envelope |
-| `backend/tests/test_phase7c2d_azure_advisor.py` | 55 unit tests |
-| `frontend/src/lib/finops/cloudRecommendations.ts` | Frontend service + types |
-| `frontend/src/pages/AzureAdvisorView.tsx` | Azure recommendations UI |
-| `frontend/src/tests/phase7c2d-azure-advisor.test.tsx` | 12 frontend tests |
-| `docs/phase7c2d-azure-advisor.md` | Reference |
-| `docs/phase7c2d-report.md` | This file |
-
-### Modified
-
-| File | Change |
-|------|--------|
-| `backend/app/services/cloud/azure/adapter.py` | `OPTIMIZATION=SUPPORTED` + real `get_recommendations` implementation |
-| `backend/app/main.py` | Register `cloud_recommendations` router |
-| `backend/tests/test_phase7c2a_provider_registry.py` | Capability table updated for OPTIMIZATION=SUPPORTED |
-| `backend/tests/test_phase7c2b_azure_adapter_capabilities.py` | `test_optimization_unimplemented` → `test_optimization_now_supported`; `test_get_recommendations_is_still_stub` → `test_get_recommendations_no_longer_stub` |
-| `backend/tests/test_phase7c2c_azure_adapter_capabilities.py` | `test_optimization_remains_unsupported` → `test_optimization_now_supported`; `test_get_recommendations_is_still_stub` → `test_get_recommendations_no_longer_stub` |
-| `frontend/src/pages/OptimizationPage.tsx` | Branches to `AzureAdvisorView` when `provider === 'AZURE'` |
-
-## 20. Known limitations
-
-* When only `savingsAmount` (monthly) is present, the
-  recommendation is shown with `annual_savings=None`.  We do NOT
-  annualise.  A future phase can compute the annualised value
-  when Microsoft's documentation explicitly establishes
-  `savingsAmount` as monthly for that specific recommendation
-  type.
-* Subscriptions with > 50,000 recommendations would hit
-  `MAX_PAGES=50`.
-* `by_subcategory` panel is only visible when populated.
-
-## 21. Pre-existing unrelated failures
+## 21. Pre-existing failures
 
 * 6 frontend tests in `phase7c2a-navigation.test.tsx` and
   `phase7b-runtime-closure.test.tsx` rely on `fs.promises.readFile`
   with relative paths; only pass when vitest's cwd is `frontend/`.
-  Verified pre-existing via `git stash` from earlier phases.
+  Verified pre-existing via `git stash`.
 * `scripts/phase7b_verify.sh` reports one FAIL on "no AWS key in
   known storage keys" — pre-existing security check unrelated to
-  Phase 7C.2D.
+  Phase 7C.2D.1.
 
 ## 22. Confirmation
 
-* [x] No Azure recommendations were modified.
 * [x] No Azure resources were modified.
+* [x] No Advisor states were modified.
 * [x] No recommendations were generated.
 * [x] No recommendation was dismissed / postponed / completed.
 * [x] No reservation / savings plan was purchased.
@@ -337,13 +290,15 @@ surface.  No AWS code modified.
 * [x] `main` was **NOT** modified.
 * [x] No Phase 7C final tag was created.
 
-## Phase 7C.2D complete
+## Phase 7C.2D / 7C.2D.1 complete
 
-Strictly READ-ONLY against Azure — only
+The Phase 7C.2D.1 narrow correctness pass corrected the Advisor
+lifecycle filter from the Portal-flavoured literal `"Active"` to
+the documented Resource Graph value `"New"`.  The live result
+remains `total_recommendations=0` across MCPP, Sponsorship, and
+All Azure — but now for the **correct** reason per Microsoft's
+documentation.
+
+Strictly READ-ONLY against Azure.  Only
 `Microsoft.ResourceGraph/resources/read` operations were issued
-during validation.  The only Cost recommendation observed during
-the audit was a `recommendationStatus="Completed"` row on the
-Sponsorship subscription; this is correctly excluded by the
-documented Active filter.
-
-Stopping per Phase 7C.2D scope.
+during validation.  Stopping per Phase 7C.2D.1 scope.
