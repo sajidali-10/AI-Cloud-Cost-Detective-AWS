@@ -6,6 +6,7 @@
 // shape.
 
 import { apiFetch } from '../api'
+import { canonicalCacheSegment, canonicalAccountParam } from './subscriptionSelection'
 
 export type CacheProvider = 'aws' | 'azure' | 'rackspace'
 
@@ -76,7 +77,7 @@ export function buildCloudRecommendationsCacheKey(
   accountId: string | null,
   provider: CacheProvider = 'aws',
 ): string {
-  const acct = accountId ?? 'all'
+  const acct = canonicalCacheSegment(accountId, provider)
   const providerSeg = provider
   return `${providerSeg}:cloud:recommendations:${acct}`
 }
@@ -89,7 +90,8 @@ export async function fetchCloudRecommendations(
 ): Promise<CloudRecommendationListResponse> {
   const params = new URLSearchParams()
   params.set('provider', options.provider)
-  if (options.accountId) params.set('account_id', options.accountId)
+  const canonicalAccount = canonicalAccountParam(options.accountId, options.provider)
+  if (canonicalAccount) params.set('account_id', canonicalAccount)
   return apiFetch<CloudRecommendationListResponse>(
     `/api/cloud/recommendations?${params.toString()}`,
     { timeoutMs: 60_000 },

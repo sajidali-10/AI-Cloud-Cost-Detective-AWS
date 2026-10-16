@@ -346,7 +346,7 @@ function AwsDashboard({
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="AWS Spend" />
         <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpi
           resources={resources.entry.data}
@@ -430,25 +430,59 @@ function AwsDashboard({
 // KPI tiles
 // ---------------------------------------------------------------------------
 
-function SpendKpi({
+export function SpendKpi({
   report,
   loading,
   period,
+  providerLabel,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
   period: import('../types/finops').BillingPeriod
+  providerLabel: string
 }) {
   if (loading && !report) {
-    return <MetricCard label="AWS Spend" description="Loading…" value={undefined} />
+    return <MetricCard label={providerLabel} description="Loading…" value={undefined} />
   }
   if (!report) {
-    return <MetricCard label="AWS Spend" description="—" value={undefined} />
+    return <MetricCard label={providerLabel} description="—" value={undefined} />
   }
   const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+
+  // Hotfix #2 — cost completeness: a genuine successful $0.00 renders
+  // as $0.00, but UNKNOWN must never be shown as $0.00.  When every
+  // subscription failed/throttled the canonical envelope reports
+  // ``status`` in {ERROR, PARTIAL_SUCCESS} with ``successful_accounts``
+  // == 0 — render "Unavailable" instead.  When some succeeded and some
+  // failed, show the subtotal with an explicit "Partial" marker.
+  const successful = report.successful_accounts ?? 0
+  const failed = report.failed_accounts ?? 0
+  const allFailed = failed > 0 && successful === 0
+  const partial = successful > 0 && failed > 0
+
+  if (allFailed) {
+    return (
+      <MetricCard
+        label={providerLabel}
+        icon={<SpendIcon />}
+        value="Unavailable"
+        description={`${label} · no subscription data`}
+      />
+    )
+  }
+  if (partial) {
+    return (
+      <MetricCard
+        label={providerLabel}
+        icon={<SpendIcon />}
+        value={formatCurrencyCompact(report.total_cost, report.currency)}
+        description={`${label} · ${report.currency} · Partial (${failed} unavailable)`}
+      />
+    )
+  }
   return (
     <MetricCard
-      label="AWS Spend"
+      label={providerLabel}
       icon={<SpendIcon />}
       value={formatCurrencyCompact(report.total_cost, report.currency)}
       description={`${label} · ${report.currency}`}
@@ -919,7 +953,7 @@ function AzureDashboard({
       />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="Azure Spend" />
         <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpiAzure />
         <OptimizeKpiAzure />
@@ -971,12 +1005,12 @@ function AzureDashboard({
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <SectionCard
           title="Optimization"
-          description="Advisor integration"
+          description="Azure Advisor Cost recommendations"
         >
           <ProviderCapabilityNotice
             provider="AZURE"
             feature="Optimization"
-            message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
+            message="Active Azure Advisor Cost recommendations appear in the dedicated Optimization page."
           />
         </SectionCard>
         <SectionCard
@@ -986,7 +1020,7 @@ function AzureDashboard({
           <ProviderCapabilityNotice
             provider="AZURE"
             feature="Resources"
-            message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
+            message="Full Azure Resource Graph inventory appears in the dedicated Resources page."
           />
         </SectionCard>
       </div>
@@ -999,7 +1033,7 @@ function ResourcesKpiAzure() {
     <MetricCard
       label="Resources"
       value="—"
-      description="Coming in Phase 7C.2C"
+      description="Visit Resources"
     />
   )
 }
@@ -1009,7 +1043,7 @@ function OptimizeKpiAzure() {
     <MetricCard
       label="Optimize"
       value="—"
-      description="Coming in Phase 7C.2D"
+      description="Visit Optimization"
     />
   )
 }

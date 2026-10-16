@@ -62,6 +62,20 @@ export interface CostReport {
   by_service: ServiceCost[]
   by_region: RegionCost[]
   source: 'AWS_COST_EXPLORER'
+  // Phase 7C post-release hotfix #2 — cost completeness semantics.
+  // The canonical envelope carries these fields so the frontend can
+  // distinguish a true zero from a transient failure.  Defaults are
+  // populated for AWS so the AWS legacy UI keeps working.
+  status?: 'SUCCESS' | 'PARTIAL_SUCCESS' | 'NO_DATA' | 'ERROR' | string
+  currency_status?: 'OK' | 'MIXED_CURRENCY' | 'EMPTY' | string
+  successful_accounts?: number
+  failed_accounts?: number
+  subscription_errors?: Array<{
+    subscription_id: string
+    display_name: string
+    code: string
+    message: string
+  }>
 }
 
 export interface CostReportResponse {
