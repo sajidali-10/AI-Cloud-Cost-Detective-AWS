@@ -33,6 +33,10 @@ export interface DashboardHeroProps {
   refreshedLabel?: string | null
   /** Optional data status — used to colour the pill. */
   dataStatus?: 'live' | 'loading' | 'refreshing' | 'unavailable' | 'idle'
+  // Post-Phase 7C cleanup — provider-aware tagline so the Azure
+  // dashboard does not render AWS-specific copy.  Defaults to AWS
+  // for backwards compatibility with older callers.
+  provider?: 'AWS' | 'AZURE' | 'RACKSPACE'
 }
 
 const STATUS_LABEL: Record<NonNullable<DashboardHeroProps['dataStatus']>, string> = {
@@ -53,6 +57,10 @@ const STATUS_TONE: Record<NonNullable<DashboardHeroProps['dataStatus']>, 'succes
 
 export function DashboardHero(props: DashboardHeroProps) {
   const status = props.dataStatus ?? 'idle'
+  const tagline =
+    props.provider === 'AZURE'
+      ? 'Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
+      : 'AWS cost visibility, optimization and AI-powered FinOps analysis.'
   return (
     <section
       data-testid="dashboard-hero"
@@ -73,7 +81,7 @@ export function DashboardHero(props: DashboardHeroProps) {
           className="max-w-2xl text-sm text-fg-secondary sm:text-base"
           data-testid="dashboard-hero-tagline"
         >
-          AWS cost visibility, optimization and AI-powered FinOps analysis.
+          {tagline}
         </p>
       </div>
 

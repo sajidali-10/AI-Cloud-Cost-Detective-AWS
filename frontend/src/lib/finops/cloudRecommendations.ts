@@ -6,6 +6,7 @@
 // shape.
 
 import { apiFetch } from '../api'
+import { canonicalCacheSegment, canonicalAccountParam } from './subscriptionSelection'
 
 export type CacheProvider = 'aws' | 'azure' | 'rackspace'
 
@@ -103,7 +104,7 @@ export function buildCloudRecommendationsCacheKey(
   region: string | null = null,
   days: number | null = null,
 ): string {
-  const acct = accountId ?? 'all'
+  const acct = canonicalCacheSegment(accountId, provider)
   const providerSeg = provider
   // Phase 7D.1 — region + lookback-window are part of the
   // recommendation identity for AWS.  When both are omitted the key
@@ -128,7 +129,8 @@ export async function fetchCloudRecommendations(
 ): Promise<CloudRecommendationListResponse> {
   const params = new URLSearchParams()
   params.set('provider', options.provider)
-  if (options.accountId) params.set('account_id', options.accountId)
+  const canonicalAccount = canonicalAccountParam(options.accountId, options.provider)
+  if (canonicalAccount) params.set('account_id', canonicalAccount)
   if (options.region) params.set('region', options.region)
   if (options.days != null) params.set('days', String(options.days))
   return apiFetch<CloudRecommendationListResponse>(

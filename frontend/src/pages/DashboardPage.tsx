@@ -12,6 +12,7 @@
 //     bootstrap via the store's gate; the dashboard cannot fire a
 //     request before the JWT is wired in.
 
+import * as React from 'react'
 import { useEffect, useMemo, useRef } from 'react'
 import { PageHeader, ContextItem } from '../components/PageHeader'
 import { MetricCard } from '../components/MetricCard'
@@ -44,7 +45,7 @@ import {
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
-import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
+import { Link } from '../lib/router'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   AwsIdentity,
@@ -101,22 +102,94 @@ export function DashboardPage() {
     }
   }, [selection, cacheProvider, providerVersion])
 
-  // Phase 7C.2B — Azure dashboard reuses the same layout as AWS
-  // but routes cost data through the canonical
-  // ``/api/cloud/costs`` endpoint.  Resources and Optimization
-  // remain placeholders until 7C.2C / 7C.2D ship.
+  // Hotfix: dispatch to a provider-specific child component so the
+  // hook count and order stay stable across provider switches.
+  // Returning an Azure child BEFORE the AWS hooks fire causes
+  // React's "Rendered fewer hooks than expected" error and the
+  // entire tree unmounts — that was the source of the blank
+  // dashboard bug.  Each child calls its own hooks.
   if (provider === 'AZURE') {
     return (
-      <AzureDashboard
-        period={period}
-        selection={selection}
-        cacheProvider={cacheProvider}
-        providerVersion={providerVersion}
-        currentMonth={currentMonth}
-      />
+      <DashboardErrorBoundary provider={provider}>
+        <AzureDashboard
+          period={period}
+          selection={selection}
+          cacheProvider={cacheProvider}
+          providerVersion={providerVersion}
+          currentMonth={currentMonth}
+        />
+      </DashboardErrorBoundary>
     )
   }
 
+  return (
+    <DashboardErrorBoundary provider={provider}>
+      <AwsDashboard
+        period={period}
+        region={region}
+        currentMonth={currentMonth}
+        effectiveRegion={effectiveRegion}
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+      />
+    </DashboardErrorBoundary>
+  )
+}
+
+/**
+ * Hotfix: error boundary scoped to the dashboard so an exception
+ * in any provider-specific child cannot permanently blank the
+ * page.  Falls back to a professional error state with a retry
+ * button instead of crashing the whole tree.
+ */
+class DashboardErrorBoundary extends React.Component<
+  { provider: string; children: React.ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null }
+
+  static getDerivedStateFromError(error: Error): { error: Error } {
+    return { error }
+  }
+
+  handleReset = (): void => {
+    this.setState({ error: null })
+  }
+
+  render(): React.ReactNode {
+    if (this.state.error) {
+      return (
+        <div className="space-y-3" data-testid="dashboard-error-boundary">
+          <ErrorState
+            title="Dashboard could not render"
+            message={this.state.error.message || 'An unexpected error occurred.'}
+            onRetry={this.handleReset}
+          />
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+function AwsDashboard({
+  period,
+  region,
+  currentMonth,
+  effectiveRegion,
+  selection,
+  cacheProvider,
+  providerVersion: _providerVersion,
+}: {
+  period: import('../types/finops').BillingPeriod
+  region: string
+  currentMonth: string
+  effectiveRegion: string | null
+  selection: string | null
+  cacheProvider: 'aws' | 'azure' | 'rackspace'
+  providerVersion: number
+}) {
   // Identity — single fetch, drives the page header.
   const identity = useFinopsQuery<AwsIdentity>(
     `${cacheProvider}:identity:${selection}`,
@@ -251,6 +324,7 @@ export function DashboardPage() {
 
       {/* Centred HipLink AI Assistant hero — uses real data only. */}
       <DashboardHero
+        provider="AWS"
         accountLabel={
           identity.entry.data ? maskAccountId(identity.entry.data.account) : null
         }
@@ -273,7 +347,7 @@ export function DashboardPage() {
 
       {/* KPI tiles */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="AWS Spend" />
         <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpi
           resources={resources.entry.data}
@@ -357,25 +431,59 @@ export function DashboardPage() {
 // KPI tiles
 // ---------------------------------------------------------------------------
 
-function SpendKpi({
+export function SpendKpi({
   report,
   loading,
   period,
+  providerLabel,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
   period: import('../types/finops').BillingPeriod
+  providerLabel: string
 }) {
   if (loading && !report) {
-    return <MetricCard label="AWS Spend" description="Loading…" value={undefined} />
+    return <MetricCard label={providerLabel} description="Loading…" value={undefined} />
   }
   if (!report) {
-    return <MetricCard label="AWS Spend" description="—" value={undefined} />
+    return <MetricCard label={providerLabel} description="—" value={undefined} />
   }
   const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+
+  // Hotfix #2 — cost completeness: a genuine successful $0.00 renders
+  // as $0.00, but UNKNOWN must never be shown as $0.00.  When every
+  // subscription failed/throttled the canonical envelope reports
+  // ``status`` in {ERROR, PARTIAL_SUCCESS} with ``successful_accounts``
+  // == 0 — render "Unavailable" instead.  When some succeeded and some
+  // failed, show the subtotal with an explicit "Partial" marker.
+  const successful = report.successful_accounts ?? 0
+  const failed = report.failed_accounts ?? 0
+  const allFailed = failed > 0 && successful === 0
+  const partial = successful > 0 && failed > 0
+
+  if (allFailed) {
+    return (
+      <MetricCard
+        label={providerLabel}
+        icon={<SpendIcon />}
+        value="Unavailable"
+        description={`${label} · no subscription data`}
+      />
+    )
+  }
+  if (partial) {
+    return (
+      <MetricCard
+        label={providerLabel}
+        icon={<SpendIcon />}
+        value={formatCurrencyCompact(report.total_cost, report.currency)}
+        description={`${label} · ${report.currency} · Partial (${failed} unavailable)`}
+      />
+    )
+  }
   return (
     <MetricCard
-      label="AWS Spend"
+      label={providerLabel}
       icon={<SpendIcon />}
       value={formatCurrencyCompact(report.total_cost, report.currency)}
       description={`${label} · ${report.currency}`}
@@ -759,7 +867,7 @@ function AzureDashboard({
       <PageHeader
         eyebrow="AI Cloud Cost Detective"
         title="Azure Dashboard"
-        subtitle="Azure Cost Management, subscription access and AI-powered FinOps analysis"
+        subtitle="Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis"
         context={
           <>
             <ContextItem
@@ -823,6 +931,7 @@ function AzureDashboard({
       )}
 
       <DashboardHero
+        provider="AZURE"
         accountLabel={
           report?.account_id
             ? maskAccountId(report.account_id)
@@ -846,7 +955,7 @@ function AzureDashboard({
       />
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
+        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} providerLabel="Total Spend" />
         <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
         <ResourcesKpiAzure />
         <OptimizeKpiAzure />
@@ -897,24 +1006,48 @@ function AzureDashboard({
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <SectionCard
-          title="Optimization"
-          description="Advisor integration"
+          title="Azure Optimization"
+          description="View active Azure Advisor Cost recommendations."
+          actions={
+            <Link
+              to="/optimization"
+              className="
+                inline-flex items-center rounded-md border border-border
+                bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary
+                hover:bg-surface-hover focus:outline-none focus-visible:shadow-focus
+              "
+              data-testid="azure-dashboard-optimization-link"
+            >
+              Open Optimization
+            </Link>
+          }
         >
-          <ProviderCapabilityNotice
-            provider="AZURE"
-            feature="Optimization"
-            message="Azure Advisor integration will activate in Phase 7C.2D. Subscription access is verified."
-          />
+          <p className="text-xs text-fg-muted">
+            Active Azure Advisor Cost recommendations for the current subscription are
+            available in the Optimization page.
+          </p>
         </SectionCard>
         <SectionCard
           title="Azure Resources"
-          description="Resource Graph inventory"
+          description="View Azure Resource Graph inventory for the selected subscription."
+          actions={
+            <Link
+              to="/resources"
+              className="
+                inline-flex items-center rounded-md border border-border
+                bg-surface px-3 py-1.5 text-sm font-medium text-fg-primary
+                hover:bg-surface-hover focus:outline-none focus-visible:shadow-focus
+              "
+              data-testid="azure-dashboard-resources-link"
+            >
+              Open Resources
+            </Link>
+          }
         >
-          <ProviderCapabilityNotice
-            provider="AZURE"
-            feature="Resources"
-            message="Resource Graph inventory will activate in Phase 7C.2C. Subscription RBAC (Reader + Cost Management Reader) is verified."
-          />
+          <p className="text-xs text-fg-muted">
+            Full Azure Resource Graph inventory for the current subscription is
+            available in the Resources page.
+          </p>
         </SectionCard>
       </div>
     </div>
@@ -926,7 +1059,7 @@ function ResourcesKpiAzure() {
     <MetricCard
       label="Resources"
       value="—"
-      description="Coming in Phase 7C.2C"
+      description="Visit Resources"
     />
   )
 }
@@ -936,7 +1069,7 @@ function OptimizeKpiAzure() {
     <MetricCard
       label="Optimize"
       value="—"
-      description="Coming in Phase 7C.2D"
+      description="Visit Optimization"
     />
   )
 }

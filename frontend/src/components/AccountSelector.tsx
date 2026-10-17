@@ -68,6 +68,16 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
 
   const label = useMemo(() => {
     if (selection === 'all') return aggregateLabel
+    // Hotfix #2 — Azure selections are tagged ``sub:<guid>``.
+    // Find the matching row by its Azure subscription GUID and
+    // fall back to a generic ``Subscription <id>`` label when the
+    // row is no longer in the visible list (e.g. just-disabled).
+    if (isAzure && selection.startsWith('sub:')) {
+      const guid = selection.slice('sub:'.length)
+      const found = visibleAccounts.find((a) => a.account_id === guid)
+      if (found) return `${found.display_name} — ${found.account_id}`
+      return `Subscription ${guid}`
+    }
     const id = selection.replace(/^acct:/, '')
     const found = visibleAccounts.find((a) => String(a.id) === id)
     if (found) return `${found.display_name} — ${found.account_id}`
@@ -140,7 +150,16 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
             <li className="my-1 border-t border-border" />
           )}
           {visibleAccounts.map((acc) => {
-            const value = `acct:${acc.id}` as AccountSelection
+            // Hotfix #2 — Azure selections carry the canonical
+            // ``sub:<subscription-guid>`` selector; AWS keeps the
+            // legacy ``acct:<row-id>`` selector (the AWS route maps
+            // row id → role ARN).  The canonical GUID never collides
+            // with the local database row id so the canonical Azure
+            // APIs (Cost / Resources / Recommendations) resolve the
+            // right subscription.
+            const value = (isAzure
+              ? `sub:${acc.account_id}`
+              : `acct:${acc.id}`) as AccountSelection
             const testId = isAzure
               ? `azure-sub-option-${acc.id}`
               : `account-option-${acc.id}`

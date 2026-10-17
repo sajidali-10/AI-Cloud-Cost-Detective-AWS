@@ -6,6 +6,7 @@
 // branching.
 
 import { apiFetch } from '../api'
+import { canonicalCacheSegment, canonicalAccountParam } from './subscriptionSelection'
 
 export type CacheProvider = 'aws' | 'azure' | 'rackspace'
 
@@ -63,7 +64,7 @@ export function buildCloudResourcesCacheKey(
   accountId: string | null,
   provider: CacheProvider = 'aws',
 ): string {
-  const acct = accountId ?? 'all'
+  const acct = canonicalCacheSegment(accountId, provider)
   const providerSeg = provider
   return `${providerSeg}:cloud:resources:${acct}`
 }
@@ -76,7 +77,8 @@ export async function fetchCloudResources(
 ): Promise<CloudResourceListResponse> {
   const params = new URLSearchParams()
   params.set('provider', options.provider)
-  if (options.accountId) params.set('account_id', options.accountId)
+  const canonicalAccount = canonicalAccountParam(options.accountId, options.provider)
+  if (canonicalAccount) params.set('account_id', canonicalAccount)
   return apiFetch<CloudResourceListResponse>(
     `/api/cloud/resources?${params.toString()}`,
     { timeoutMs: 60_000 },
