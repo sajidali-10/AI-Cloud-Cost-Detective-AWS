@@ -146,15 +146,23 @@ describe('Post-Phase 7C final cleanup — Azure Dashboard wording', () => {
     })
     const { render } = await import('@testing-library/react')
     const { DashboardPage } = await import('../pages/DashboardPage')
-    render(authDisabledElement(<DashboardPage />))
+    const view = render(authDisabledElement(<DashboardPage />))
 
+    // Phase 7D.3 unified the dashboard into a single component
+    // tree with no per-provider heading split.  The active
+    // provider is exposed via the data-provider attribute so
+    // tests (and downstream consumers) can distinguish AWS from
+    // Azure without depending on stale per-provider copy.
     await waitFor(() => {
-      expect(screen.getAllByText(/Azure Dashboard/).length).toBeGreaterThan(0)
+      const root = view.container.querySelector('[data-testid="unified-dashboard"]')
+      expect(root?.getAttribute('data-provider')).toBe('AZURE')
     })
-    // Subtitle is provider-neutral and references the three pillars
-    // (cost, resource inventory, optimization).  Both the PageHeader
-    // subtitle and the DashboardHero tagline now carry the same
-    // provider-aware copy — assert at least one occurrence.
+    // The page header still carries the canonical "Dashboard"
+    // heading — there is no longer a per-provider "Azure
+    // Dashboard" heading because the layout is provider-neutral.
+    expect(screen.getAllByText(/^Dashboard$/).length).toBeGreaterThan(0)
+    // Subtitle references the three pillars (cost, resource
+    // inventory, optimization) for the active provider.
     expect(
       screen.getAllByText(/Azure cost visibility, resource inventory, optimization/i).length,
     ).toBeGreaterThan(0)
@@ -173,7 +181,9 @@ describe('Post-Phase 7C final cleanup — Azure Dashboard wording', () => {
     const { container } = render(authDisabledElement(<DashboardPage />))
 
     await waitFor(() => {
-      expect(screen.getAllByText(/Azure Dashboard/).length).toBeGreaterThan(0)
+      expect(
+        container.querySelector('[data-testid="unified-dashboard"]')?.getAttribute('data-provider'),
+      ).toBe('AZURE')
     })
     // "AWS Spend" must not appear in the Azure dashboard.
     expect(container.textContent).not.toMatch(/AWS Spend/i)
@@ -197,7 +207,9 @@ describe('Post-Phase 7C final cleanup — Azure Dashboard wording', () => {
     const { container } = render(authDisabledElement(<DashboardPage />))
 
     await waitFor(() => {
-      expect(screen.getAllByText(/Azure Dashboard/).length).toBeGreaterThan(0)
+      expect(
+        container.querySelector('[data-testid="unified-dashboard"]')?.getAttribute('data-provider'),
+      ).toBe('AZURE')
     })
     expect(container.textContent).not.toMatch(/Coming in Phase 7C\.2C/i)
     expect(container.textContent).not.toMatch(/Coming in Phase 7C\.2D/i)
@@ -217,11 +229,15 @@ describe('Post-Phase 7C final cleanup — Azure Dashboard wording', () => {
     const { DashboardPage } = await import('../pages/DashboardPage')
     render(authDisabledElement(<DashboardPage />))
 
+    // Phase 7D.3 renamed the per-provider link testids to
+    // provider-neutral ones (the dashboard is shared between
+    // AWS and Azure).  The href and "View Resources" copy are
+    // unchanged from the Phase 7C cleanup.
     const link = await waitFor(() =>
-      screen.getByTestId('azure-dashboard-resources-link'),
+      screen.getByTestId('dashboard-resources-link'),
     )
     expect(link.getAttribute('href')).toBe('/resources')
-    expect(link.textContent).toMatch(/Open Resources/i)
+    expect(link.textContent).toMatch(/View Resources/i)
   })
 
   it('Azure Dashboard exposes a real navigation link to /optimization', async () => {
@@ -237,10 +253,10 @@ describe('Post-Phase 7C final cleanup — Azure Dashboard wording', () => {
     render(authDisabledElement(<DashboardPage />))
 
     const link = await waitFor(() =>
-      screen.getByTestId('azure-dashboard-optimization-link'),
+      screen.getByTestId('dashboard-optimization-link'),
     )
     expect(link.getAttribute('href')).toBe('/optimization')
-    expect(link.textContent).toMatch(/Open Optimization/i)
+    expect(link.textContent).toMatch(/View Optimization/i)
   })
 
   it('Azure Dashboard renders the partial-data marker when one subscription succeeded and one failed', async () => {

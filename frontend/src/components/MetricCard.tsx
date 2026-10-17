@@ -18,6 +18,8 @@ export interface MetricCardProps {
   icon?: ReactNode
   /** Status tone for the value text. */
   tone?: 'neutral' | 'success' | 'warning' | 'danger' | 'info' | 'ai'
+  /** Optional override for the wrapping div's data-testid. */
+  testId?: string
 }
 
 export function MetricCard({
@@ -26,6 +28,7 @@ export function MetricCard({
   description,
   icon,
   tone = 'neutral',
+  testId,
 }: MetricCardProps) {
   const valueText = value === undefined || value === null || value === '' ? '—' : value
   const isEmpty = value === undefined || value === null || value === ''
@@ -35,7 +38,7 @@ export function MetricCard({
         flex h-full flex-col gap-2 rounded-lg border border-border
         bg-surface p-4 shadow-card-sm
       "
-      data-testid="metric-card"
+      data-testid={testId ?? 'metric-card'}
       data-empty={isEmpty ? 'true' : 'false'}
     >
       <div className="flex items-start justify-between gap-2">
