@@ -1,10 +1,21 @@
-// Phase 7A — Optimization page wired to BillingPeriod.
+// Phase 7D.2 — Unified AWS + Azure Optimization page.
 //
-// Phase 7A invariants:
-//   * Recommendation fetches honor the calendar-month selector.
-//   * Capability state is rendered with operator-facing guidance.
-//   * Deterministic engine recommendations remain visible even when
-//     AWS-native sources time out or fail.
+// One provider-aware Optimization experience for both clouds:
+//
+//   /api/cloud/recommendations?provider=AWS|AZURE&account_id=...
+//
+// The page reacts to the existing Cloud Context (ProviderContext +
+// AccountContext) — there is no second provider/account selector
+// inside Optimization.  Switching AWS → Azure → AWS or QA-Dev →
+// Production → All → QA-Dev never blanks the page: the page reads
+// from the canonical cache key, which already isolates
+// (provider, account, region, days), and from the Cloud Context,
+// which is the single source of truth for the active scope.
+//
+// Legacy AWS route `/api/aws/optimization/*` is preserved on the
+// backend for compatibility but the Optimization UI no longer
+// reads from it as its primary source — see
+// `docs/phase7d2-unified-optimization-ui.md` for the rationale.
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
@@ -15,74 +26,141 @@ import { StatusBadge } from '../components/StatusBadge'
 import { EmptyState } from '../components/EmptyState'
 import { LoadingSkeleton, LoadingSkeletonRows } from '../components/LoadingSkeleton'
 import { ErrorState } from '../components/ErrorState'
-import { PeriodSelector } from '../components/PeriodSelector'
 import { RefreshButton } from '../components/RefreshButton'
-import { CapabilityStatusRow } from '../components/CapabilityStatusRow'
-import { RecommendationSourceBadge, ConfidenceBadge } from '../components/RecommendationSourceBadge'
 import { PartialWarning } from '../components/PartialWarning'
+import { FilterBar, FilterSelect } from '../components/FilterBar'
+import { HorizontalBarChart, type HorizontalBarRow } from '../components/HorizontalBarChart'
 import { useFinopsQuery } from '../lib/finops/store'
-import {
-  fetchCapabilities,
-  fetchRecommendations,
-  fetchOptimizationSummary,
-  buildCapabilitiesCacheKey,
-  buildRecommendationsCacheKey,
-  buildSummaryCacheKey,
-} from '../lib/finops/optimization'
+import { invalidateFinopsCache } from '../lib/finops/store'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
-import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
-import { AzureAdvisorView } from './AzureAdvisorView'
-import { invalidateFinopsCache } from '../lib/finops/store'
-import type {
-  BillingPeriod,
-  CapabilitiesResponse,
-  OptimizationSummaryResponse,
-  Recommendation,
-  RecommendationsResponse,
-  SavingsSource,
-} from '../types/finops'
-import { monthLabel } from '../types/finops'
+import {
+  buildCloudRecommendationsCacheKey,
+  fetchCloudRecommendations,
+  type CloudRecommendationListResponse,
+} from '../lib/finops/cloudRecommendations'
+import {
+  applyFilters,
+  buildFacets,
+  buildUnifiedEnvelope,
+  DEFAULT_FILTERS,
+  DEFAULT_SORT,
+  friendlyAttribution,
+  impactToneFor,
+  sortRows,
+  type AccountMapEntry,
+  type FilterState,
+  type SortKey,
+  type UnifiedRecommendationRow,
+} from '../lib/finops/unifiedRecommendations'
 import {
   formatCurrencyCompact,
   formatCurrencyDecimal,
   formatLocalTime,
   parseDecimal,
-  savingsSourceLabel,
 } from '../lib/format'
 
-function periodDisplay(period: BillingPeriod): string {
-  return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+const HEADLINE_KPI = {
+  active: 'Active Recommendations',
+  savings: 'Potential Monthly Savings',
+  resources: 'Resources Affected',
+  sources: 'Recommendation Sources',
 }
 
-export function OptimizationPage() {
-  const { period, region } = useFinopsPeriod()
-  const { selection } = useAccountContext()
-  const { provider, providerSlug, providerVersion } = useProviderContext()
-  const effectiveRegion = region === 'all' ? null : region
-  const cacheProvider = providerSlug === 'azure'
-    ? ('azure' as const)
-    : providerSlug === 'rackspace'
-    ? ('rackspace' as const)
-    : ('aws' as const)
+const PAGE_TEST_IDS = {
+  root: 'optimization-page',
+  kpiActive: 'kpi-active-recommendations',
+  kpiSavings: 'kpi-potential-monthly-savings',
+  kpiResources: 'kpi-resources-affected',
+  kpiSources: 'kpi-recommendation-sources',
+  partialWarning: 'optimization-partial-warning',
+  emptyState: 'optimization-empty-state',
+  table: 'optimization-table',
+  filterImpact: 'filter-impact',
+  filterSource: 'filter-source',
+  filterResourceType: 'filter-resource-type',
+  filterRegion: 'filter-region',
+  filterSearch: 'filter-search',
+  sortSelect: 'sort-select',
+  scopeLabel: 'optimization-scope-label',
+  statusBadge: 'optimization-status-badge',
+  noData: 'optimization-no-data',
+  mixedCurrency: 'optimization-mixed-currency',
+  detailPanel: 'optimization-detail-panel',
+}
 
-  // Phase 7C.2D — Azure Advisor Cost recommendations are wired
-  // and live.  Render the dedicated AzureAdvisorView when Azure
-  // is selected; the AWS view below is unchanged.
+// ---------------------------------------------------------------------------
+// Subtitle / page copy is provider-aware but identical in shape for both.
+// ---------------------------------------------------------------------------
+
+function pageSubtitle(provider: 'AWS' | 'AZURE' | string): string {
   if (provider === 'AZURE') {
-    return (
-      <AzureAdvisorView
-        selection={selection}
-        cacheProvider={cacheProvider}
-        providerVersion={providerVersion}
-      />
-    )
+    return 'Identify cost-saving opportunities across your selected Azure scope'
   }
-  const periodText = periodDisplay(period)
+  if (provider === 'AWS') {
+    return 'Identify cost-saving opportunities across your selected AWS scope'
+  }
+  return 'Identify cost-saving opportunities across your selected cloud scope'
+}
 
-  // Phase 7B: invalidate stale data on account switch.
-  // Phase 7C.1: also invalidate on provider change.
+function scopeDisplayLabel(
+  provider: 'AWS' | 'AZURE' | string,
+  selection: string | null,
+  accountMap: ReadonlyArray<AccountMapEntry>,
+): string {
+  return friendlyAttribution(selection, accountMap, provider).label
+}
+
+// ---------------------------------------------------------------------------
+// Top-level page component.
+// ---------------------------------------------------------------------------
+
+export function OptimizationPage() {
+  const { region, days } = useFinopsPeriod()
+  const { selection, accounts } = useAccountContext()
+  const { provider, providerVersion } = useProviderContext()
+
+  // Effective region (null = no filter).  Azure ignores this but the
+  // cache key still includes it for symmetry with Phase 7D.1.
+  const effectiveRegion = region === 'all' ? null : region
+
+  // Provider version is already part of the cache key through the
+  // accountContext dependency chain.  We do not add a manual
+  // providerVersion dep — the key builder reads the active
+  // providerSlug implicitly via the bucket prefix and the
+  // selection + provider slug themselves invalidate via
+  // `invalidateFinopsCache()` below.
+
+  const cacheProvider =
+    provider === 'AZURE' ? 'azure' : provider === 'RACKSPACE' ? 'rackspace' : 'aws'
+
+  // Build the accountMap for friendly attribution only (not sent
+  // to the backend).  Each entry is the provider's *canonical*
+  // selector string, mirroring what the AccountSelector emits:
+  //   * AWS  → acct:<local-row-id>
+  //   * Azure → sub:<guid>
+  // We also store the raw account / subscription id so the lookup
+  // can resolve the recommendation row's `account_id` field, which
+  // carries the raw id (e.g. AWS account id `974053642038` or
+  // Azure subscription GUID) — not the canonical selector.
+  const accountMap: AccountMapEntry[] = useMemo(
+    () =>
+      accounts.map((a) => ({
+        selector:
+          provider === 'AZURE' ? `sub:${a.account_id}` : `acct:${a.id}`,
+        rawAccountId: a.account_id,
+        displayName: a.display_name,
+        provider: provider,
+      })),
+    [accounts, provider],
+  )
+
+  // Provider / scope safety net: on a real provider or selection
+  // change, drop the previous response so a stale AWS row can
+  // never satisfy an Azure request (and vice versa).  Mirrors the
+  // bea38fd provider-switch fix; expanded to also fire on the
+  // selection change so a stale account's row cannot leak across.
   const prevSelectionRef = useRef(selection)
   const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
@@ -96,385 +174,651 @@ export function OptimizationPage() {
     }
   }, [selection, cacheProvider, providerVersion])
 
-  const caps = useFinopsQuery<CapabilitiesResponse>(
-    buildCapabilitiesCacheKey(effectiveRegion, selection, cacheProvider),
-    () => fetchCapabilities(effectiveRegion, { accountId: selection }),
-    { ttlMs: 60_000 },
+  const cacheKey = buildCloudRecommendationsCacheKey(
+    selection,
+    cacheProvider,
+    effectiveRegion,
+    days,
   )
-  const recs = useFinopsQuery<RecommendationsResponse>(
-    buildRecommendationsCacheKey(period, effectiveRegion, selection, cacheProvider),
-    () => fetchRecommendations(period, effectiveRegion, { accountId: selection }),
-  )
-  const summary = useFinopsQuery<OptimizationSummaryResponse>(
-    buildSummaryCacheKey(period, effectiveRegion, selection, cacheProvider),
-    () => fetchOptimizationSummary(period, effectiveRegion, { accountId: selection }),
+
+  const query = useFinopsQuery<CloudRecommendationListResponse>(
+    cacheKey,
+    () =>
+      fetchCloudRecommendations({
+        provider: provider,
+        accountId: selection,
+        region: effectiveRegion,
+        days,
+      }),
     { ttlMs: 60_000 },
   )
 
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const selected = useMemo(
-    () => recs.entry.data?.recommendations.find((r) => r.recommendation_id === selectedId) ?? null,
-    [recs.entry.data, selectedId],
+  const response = query.entry.data
+  const loading = query.entry.status === 'loading'
+  const error = query.entry.error
+
+  const envelope = useMemo(() => {
+    if (!response) return null
+    return buildUnifiedEnvelope({
+      response,
+      provider,
+      selection,
+      accountMap,
+      savingsPeriod: response.summary?.savings_period ?? null,
+    })
+  }, [response, provider, selection, accountMap])
+
+  // ------------------------------------------------------------------
+  // Filter / sort state — client-side, deterministic, no Date.now.
+  // ------------------------------------------------------------------
+
+  const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS)
+  const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT)
+
+  // Reset filters whenever the envelope shape changes (provider /
+  // scope switch).  This prevents an Azure-only filter selection
+  // (e.g. resource type "Microsoft.Compute/virtualMachines") from
+  // lingering after switching to AWS where it would hide every
+  // row.
+  const envelopeIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!envelope) return
+    const id = `${envelope.provider}:${envelope.scope}:${envelope.rows.length}`
+    if (envelopeIdRef.current !== id) {
+      envelopeIdRef.current = id
+      setFilters(DEFAULT_FILTERS)
+      setSortKey(DEFAULT_SORT)
+    }
+  }, [envelope])
+
+  const facets = useMemo(
+    () => buildFacets(envelope?.rows ?? []),
+    [envelope?.rows],
+  )
+  const filteredRows = useMemo(
+    () => (envelope ? sortRows(applyFilters(envelope.rows, filters), sortKey) : []),
+    [envelope, filters, sortKey],
   )
 
-  const refresh = () => {
-    caps.refresh()
-    recs.refresh()
-    summary.refresh()
-  }
+  const selectedScopeLabel = scopeDisplayLabel(provider, selection, accountMap)
+  const summary = envelope?.kpis
+
+  const refresh = () => query.refresh()
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5" data-testid={PAGE_TEST_IDS.root}>
       <PageHeader
         eyebrow="AI Cloud Cost Detective"
         title="Optimization"
-        subtitle="Recommendations grouped by impact and confidence"
+        subtitle={pageSubtitle(provider)}
         context={
           <>
-            <span className="text-fg-muted">Period</span>
-            <span className="text-fg-secondary">{periodText}</span>
+            <span className="text-fg-muted">{provider === 'AZURE' ? 'Subscription' : 'Account'}</span>
+            <span className="text-fg-secondary" data-testid={PAGE_TEST_IDS.scopeLabel}>
+              {selectedScopeLabel}
+            </span>
             <span className="text-fg-muted">Status</span>
             <StatusBadge
-              tone={
-                recs.entry.data?.status === 'SUCCESS'
-                  ? 'success'
-                  : recs.entry.data?.status === 'PARTIAL_SUCCESS'
-                    ? 'warning'
-                    : recs.entry.data?.status === 'FAILED'
-                      ? 'danger'
-                      : 'neutral'
-              }
+              tone={statusTone(envelope?.status ?? (loading ? 'LOADING' : 'IDLE'))}
+              data-testid={PAGE_TEST_IDS.statusBadge}
             >
-              {recs.entry.data?.status ?? (recs.entry.status === 'loading' ? 'Loading' : 'Idle')}
+              {envelope?.status ?? (loading ? 'Loading' : 'Idle')}
             </StatusBadge>
             <span className="text-fg-muted">Updated</span>
-            <span className="text-fg-secondary">{formatLocalTime(recs.entry.refreshedAt)}</span>
+            <span className="text-fg-secondary">
+              {formatLocalTime(query.entry.refreshedAt)}
+            </span>
           </>
         }
         actions={
           <div className="flex items-center gap-2">
-            <PeriodSelector />
             <RefreshButton onClick={refresh} />
           </div>
         }
       />
 
-      {recs.entry.error && !recs.entry.data && (
+      {error && !envelope && (
         <ErrorState
-          title="Could not load recommendations"
-          message={recs.entry.error.message}
-          onRetry={recs.refresh}
+          title="Could not load optimization recommendations"
+          message={error.message}
+          onRetry={refresh}
         />
       )}
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <TotalKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
-        <HighConfidenceKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
-        <AwsNativeKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
-        <DeterministicKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
-        <SavingsKpi summary={summary.entry.data} loading={summary.entry.status === 'loading' && !summary.entry.data} />
-      </div>
+      {envelope && envelope.status === 'PARTIAL_SUCCESS' && envelope.partialErrors.length > 0 && (
+        <div data-testid={PAGE_TEST_IDS.partialWarning}>
+          <PartialWarning
+            title="Partial data — some scopes were unavailable"
+            warnings={envelope.partialErrors.map((e) => ({
+              source: provider === 'AZURE' ? 'azure-advisor' : 'aws-optimization',
+              code: e.code,
+              message: `${e.display_name}: ${e.message}`,
+              region: null,
+            }))}
+          />
+        </div>
+      )}
 
-      <SectionCard
-        title="Capability status"
-        description="AWS-native source enrollment and deterministic engine availability"
-      >
-        {caps.entry.status === 'loading' && !caps.entry.data ? (
-          <LoadingSkeletonRows rows={3} />
-        ) : caps.entry.data ? (
-          <div className="space-y-1" data-testid="capability-rows">
-            <CapabilityStatusRow
-              label="Compute Optimizer"
-              capability={caps.entry.data.compute_optimizer}
-              kind="compute_optimizer"
-            />
-            <CapabilityStatusRow
-              label="Cost Optimization Hub"
-              capability={caps.entry.data.cost_optimization_hub}
-              kind="cost_optimization_hub"
-            />
-            <CapabilityStatusRow
-              label="Deterministic Engine"
-              capability={caps.entry.data.deterministic_engine}
-              kind="deterministic_engine"
-            />
-            {caps.entry.data.warnings.length > 0 && (
-              <PartialWarning warnings={caps.entry.data.warnings} title="Capability warnings" />
-            )}
-          </div>
-        ) : (
-          <EmptyState title="No capability data" />
-        )}
-      </SectionCard>
-
-      <SectionCard
-        title="Recommendations"
-        description={`${(recs.entry.data?.count ?? 0).toLocaleString('en-US')} recommendations · ${periodText}`}
-      >
-        {recs.entry.status === 'loading' && !recs.entry.data ? (
-          <LoadingSkeletonRows rows={6} />
-        ) : recs.entry.data && recs.entry.data.recommendations.length === 0 ? (
-          <EmptyState
-            title="No recommendations"
+      {/* KPI grid — provider-neutral copy; never uses `acct:`/`sub:` */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <div data-testid={PAGE_TEST_IDS.kpiActive}>
+          <MetricCard
+            label={HEADLINE_KPI.active}
+            value={(summary?.activeRecommendations ?? 0).toLocaleString('en-US')}
             description={
-              recs.entry.data.warnings.length > 0
-                ? 'All sources returned warnings. See above.'
-                : 'No optimization opportunities were identified for this period.'
+              envelope
+                ? `Status: ${envelope.status}`
+                : loading
+                  ? 'Loading…'
+                  : '—'
             }
           />
-        ) : (
-          recs.entry.data && (
-            <DataTable
-              columns={columns}
-              rows={recs.entry.data.recommendations}
-              rowKey={(r) => r.recommendation_id}
-              onRowClick={(r) => setSelectedId(r.recommendation_id)}
-              isRowClickable={() => true}
-              emptyState={<EmptyState title="No recommendations" />}
-              caption="AWS optimization recommendations"
-            />
-          )
-        )}
-        {recs.entry.data && recs.entry.data.warnings.length > 0 && (
-          <div className="mt-3">
-            <PartialWarning warnings={recs.entry.data.warnings} title="Optimization warnings" />
+        </div>
+        <div data-testid={PAGE_TEST_IDS.kpiSavings}>
+          <MetricCard
+            label={HEADLINE_KPI.savings}
+            value={renderHeadlineSavings(summary, loading)}
+            description={savingsDescription(summary)}
+          />
+        </div>
+        <div data-testid={PAGE_TEST_IDS.kpiResources}>
+          <MetricCard
+            label={HEADLINE_KPI.resources}
+            value={(summary?.resourcesAffected ?? 0).toLocaleString('en-US')}
+            description={
+              envelope ? 'Distinct resources in scope' : loading ? 'Loading…' : '—'
+            }
+          />
+        </div>
+        <div data-testid={PAGE_TEST_IDS.kpiSources}>
+          <MetricCard
+            label={HEADLINE_KPI.sources}
+            value={
+              summary && summary.recommendationSources.length > 0
+                ? summary.recommendationSources.length.toLocaleString('en-US')
+                : '0'
+            }
+            description={
+              summary && summary.recommendationSources.length > 0
+                ? summary.recommendationSources.map((s) => s.label).join(' · ')
+                : 'No source reported'
+            }
+          />
+        </div>
+      </div>
+
+      {/* Mixed-currency disclosure — never fabricate a single total */}
+      {summary?.savingsStatus === 'MIXED_CURRENCY' && (
+        <div
+          className="rounded-md border border-border bg-surface-2 px-3 py-2 text-xs text-fg-secondary"
+          data-testid={PAGE_TEST_IDS.mixedCurrency}
+        >
+          <div className="font-medium text-fg-primary">Mixed currencies</div>
+          <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
+            {summary.savingsByCurrency.map((entry) => (
+              <div key={entry.currency} className="flex items-center justify-between gap-2">
+                <span className="text-fg-muted">{entry.currency}</span>
+                <span className="tabular-nums text-fg-primary">
+                  {entry.currency} {entry.amount.toLocaleString('en-US', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}
+                </span>
+              </div>
+            ))}
           </div>
+          <div className="mt-1 text-[10px] text-fg-muted">
+            We did not invent an FX rate — totals are shown per currency.
+          </div>
+        </div>
+      )}
+
+      {/* Breakdown chart row */}
+      {envelope && envelope.rows.length > 0 && (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <SectionCard
+            title={provider === 'AZURE' ? 'By subscription' : 'By account'}
+            description={
+              provider === 'AZURE'
+                ? 'Per Azure subscription attribution'
+                : 'Per AWS account attribution'
+            }
+          >
+            <BreakdownRows rows={accountBreakdown(envelope, accountMap)} />
+          </SectionCard>
+          <SectionCard title="By impact" description="Severity distribution">
+            <BreakdownRows rows={impactBreakdown(summary)} />
+          </SectionCard>
+          <SectionCard title="By resource type" description="Most-affected resource types">
+            <BreakdownRows rows={resourceTypeBreakdown(envelope.rows)} />
+          </SectionCard>
+        </div>
+      )}
+
+      {/* Filters */}
+      <SectionCard
+        title="Filters"
+        description="Refine by impact, source, resource type, region, or search"
+      >
+        <FilterBar>
+          <FilterSelect
+            label="Impact"
+            value={filters.impact}
+            onChange={(v) =>
+              setFilters((s) => ({ ...s, impact: v as FilterState['impact'] }))
+            }
+            options={[
+              { value: 'all', label: 'All' },
+              ...facets.impacts.map((entry) => ({
+                value: entry.value,
+                label: `${entry.label} (${entry.count})`,
+              })),
+            ]}
+            testId={PAGE_TEST_IDS.filterImpact}
+          />
+          <FilterSelect
+            label="Source"
+            value={filters.source}
+            onChange={(v) => setFilters((s) => ({ ...s, source: v }))}
+            options={[
+              { value: 'all', label: 'All' },
+              ...facets.sources.map((entry) => ({
+                value: entry.value,
+                label: `${entry.label} (${entry.count})`,
+              })),
+            ]}
+            testId={PAGE_TEST_IDS.filterSource}
+          />
+          <FilterSelect
+            label="Resource type"
+            value={filters.resourceType}
+            onChange={(v) => setFilters((s) => ({ ...s, resourceType: v }))}
+            options={[
+              { value: 'all', label: 'All' },
+              ...facets.resourceTypes.map((entry) => ({
+                value: entry.value,
+                label: `${entry.label} (${entry.count})`,
+              })),
+            ]}
+            testId={PAGE_TEST_IDS.filterResourceType}
+          />
+          <FilterSelect
+            label="Region"
+            value={filters.region}
+            onChange={(v) => setFilters((s) => ({ ...s, region: v }))}
+            options={[
+              { value: 'all', label: 'All' },
+              ...facets.regions.map((entry) => ({
+                value: entry.value,
+                label: `${entry.label} (${entry.count})`,
+              })),
+            ]}
+            testId={PAGE_TEST_IDS.filterRegion}
+          />
+          <SortSelect value={sortKey} onChange={setSortKey} testId={PAGE_TEST_IDS.sortSelect} />
+          <label className="inline-flex items-center gap-2 text-xs text-fg-muted">
+            <span>Search</span>
+            <input
+              type="search"
+              placeholder="Resource, action, description"
+              value={filters.search}
+              onChange={(e) => setFilters((s) => ({ ...s, search: e.target.value }))}
+              data-testid={PAGE_TEST_IDS.filterSearch}
+              className="w-56 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg-primary focus:outline-none focus-visible:shadow-focus"
+            />
+          </label>
+        </FilterBar>
+      </SectionCard>
+
+      {/* Recommendations table */}
+      <SectionCard
+        title="Recommendations"
+        description={
+          envelope
+            ? `${filteredRows.length.toLocaleString('en-US')} of ${envelope.rows.length.toLocaleString('en-US')} shown`
+            : loading
+              ? 'Loading…'
+              : 'No data'
+        }
+      >
+        {loading && !envelope ? (
+          <LoadingSkeletonRows rows={6} />
+        ) : envelope && envelope.rows.length === 0 ? (
+          <div data-testid={PAGE_TEST_IDS.noData}>
+            <EmptyState
+              title="No active optimization recommendations were returned for this scope."
+              description="This is a valid empty state — the upstream returned zero rows for the active provider and scope."
+            />
+          </div>
+        ) : envelope && filteredRows.length === 0 ? (
+          <EmptyState
+            title="No recommendations match these filters"
+            description="Adjust or clear the active filters to see more results."
+          />
+        ) : (
+          envelope && (
+            <div data-testid={PAGE_TEST_IDS.table}>
+              <DataTable<UnifiedRecommendationRow>
+                columns={tableColumns}
+                rows={filteredRows}
+                rowKey={(r) => r.id}
+                caption={`${provider} optimization recommendations`}
+              />
+            </div>
+          )
         )}
       </SectionCard>
 
-      {selected && (
-        <SectionCard
-          title="Recommendation detail"
-          description={`${selected.resource_type.replace('_', ' ')} · ${selected.region}`}
-          actions={
-            <button
-              type="button"
-              className="text-xs text-fg-muted hover:text-fg-primary"
-              onClick={() => setSelectedId(null)}
-            >
-              Close
-            </button>
-          }
-        >
-          <DetailPanel recommendation={selected} />
-        </SectionCard>
+      {/* Detail panel — read-only, no remediation actions */}
+      {envelope && filteredRows.length === 1 && (
+        <DetailPanel row={filteredRows[0]} provider={provider} />
       )}
     </div>
   )
 }
 
 // ---------------------------------------------------------------------------
-// KPI tiles
+// Detail panel
 // ---------------------------------------------------------------------------
 
-function TotalKpi({ summary, loading }: { summary: OptimizationSummaryResponse | null; loading: boolean }) {
-  if (loading) return <MetricCard label="Recommendations" value={undefined} description="Loading…" />
-  if (!summary) return <MetricCard label="Recommendations" value={undefined} description="—" />
+function DetailPanel({
+  row,
+  provider,
+}: {
+  row: UnifiedRecommendationRow
+  provider: 'AWS' | 'AZURE' | string
+}) {
   return (
-    <MetricCard
-      label="Recommendations"
-      value={summary.total_recommendations.toLocaleString('en-US')}
-      description={`${summary.status.toLowerCase()}`}
-    />
+    <div data-testid={PAGE_TEST_IDS.detailPanel}>
+    <SectionCard
+      title="Recommendation detail"
+      description={`${row.resourceTypeShort} · ${row.region ?? '—'} · ${row.attribution.label}`}
+    >
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div>
+          <h3 className="text-sm font-semibold text-fg-primary">Finding</h3>
+          <p className="mt-1 text-xs text-fg-secondary">
+            {row.description || row.title}
+          </p>
+          <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
+            Impact
+          </p>
+          <p className="mt-0.5 text-xs text-fg-primary">
+            <StatusBadge tone={impactToneFor(row.impact)}>{row.impact}</StatusBadge>
+          </p>
+          <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
+            Source
+          </p>
+          <p className="mt-0.5 text-xs text-fg-primary">{row.sourceLabel}</p>
+          <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
+            Provider
+          </p>
+          <p className="mt-0.5 text-xs text-fg-primary">{provider}</p>
+        </div>
+        <div>
+          <h3 className="text-sm font-semibold text-fg-primary">Savings</h3>
+          <p className="mt-1 text-xs text-fg-secondary">
+            {row.estimatedMonthlySavings === null
+              ? 'Not available'
+              : `${formatCurrencyDecimal(row.estimatedMonthlySavings, row.currency ?? 'USD')} / mo`}
+            {row.monthlyNormalized && row.estimatedAnnualSavings !== null
+              ? ` (annual: ${formatCurrencyDecimal(row.estimatedAnnualSavings, row.currency ?? 'USD')})`
+              : ''}
+          </p>
+          <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
+            Resource
+          </p>
+          <p className="mt-0.5 break-all text-xs font-mono text-fg-primary">
+            {row.resourceId}
+          </p>
+          <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
+            Action
+          </p>
+          <p className="mt-0.5 text-xs text-fg-primary">{row.action}</p>
+        </div>
+      </div>
+      <p className="mt-4 text-[10px] uppercase tracking-wider text-fg-muted">
+        Read-only — Phase 7D.2 does not surface remediation actions.
+      </p>
+    </SectionCard>
+    </div>
   )
 }
 
-function HighConfidenceKpi({ summary, loading }: { summary: OptimizationSummaryResponse | null; loading: boolean }) {
-  if (loading) return <MetricCard label="High confidence" value={undefined} description="Loading…" />
-  if (!summary) return <MetricCard label="High confidence" value={undefined} description="—" />
-  const high = summary.by_confidence.find((c) => c.key === 'HIGH')?.count ?? 0
-  return <MetricCard label="High confidence" value={high.toLocaleString('en-US')} description="HIGH bucket" />
-}
+// ---------------------------------------------------------------------------
+// Subcomponents / helpers
+// ---------------------------------------------------------------------------
 
-function AwsNativeKpi({ summary, loading }: { summary: OptimizationSummaryResponse | null; loading: boolean }) {
-  if (loading) return <MetricCard label="AWS-native" value={undefined} description="Loading…" />
-  if (!summary) return <MetricCard label="AWS-native" value={undefined} description="—" />
-  const awsNative = summary.by_source
-    .filter((s) => s.key === 'AWS_COST_OPTIMIZATION_HUB' || s.key === 'AWS_COMPUTE_OPTIMIZER')
-    .reduce((sum, s) => sum + s.count, 0)
+function SortSelect({
+  value,
+  onChange,
+  testId,
+}: {
+  value: SortKey
+  onChange: (next: SortKey) => void
+  testId?: string
+}) {
   return (
-    <MetricCard
-      label="AWS-native"
-      value={awsNative.toLocaleString('en-US')}
-      description={
-        awsNative === 0
-          ? 'No AWS-native source reported'
-          : 'From Compute Optimizer or Cost Optimization Hub'
-      }
-      tone={awsNative === 0 ? 'warning' : 'info'}
-    />
+    <label className="inline-flex items-center gap-2 text-xs text-fg-muted">
+      <span>Sort</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as SortKey)}
+        data-testid={testId}
+        className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg-primary focus:outline-none focus-visible:shadow-focus"
+      >
+        <option value="savings-desc">Highest savings</option>
+        <option value="impact-desc">Highest impact</option>
+        <option value="source-asc">Source</option>
+        <option value="resource-asc">Resource</option>
+      </select>
+    </label>
   )
 }
 
-function DeterministicKpi({ summary, loading }: { summary: OptimizationSummaryResponse | null; loading: boolean }) {
-  if (loading) return <MetricCard label="Deterministic" value={undefined} description="Loading…" />
-  if (!summary) return <MetricCard label="Deterministic" value={undefined} description="—" />
-  const det = summary.by_source.find((s) => s.key === 'UNKNOWN')?.count ?? 0
-  return (
-    <MetricCard
-      label="Deterministic"
-      value={det.toLocaleString('en-US')}
-      description="From the in-house engine"
-    />
-  )
+function statusTone(status: string): 'success' | 'warning' | 'danger' | 'neutral' | 'info' {
+  if (status === 'SUCCESS') return 'success'
+  if (status === 'PARTIAL_SUCCESS') return 'warning'
+  if (status === 'NO_DATA') return 'neutral'
+  if (status === 'ERROR') return 'danger'
+  if (status === 'THROTTLED') return 'warning'
+  if (status === 'ACCESS_DENIED') return 'danger'
+  if (status === 'LOADING') return 'info'
+  return 'neutral'
 }
 
-function SavingsKpi({ summary, loading }: { summary: OptimizationSummaryResponse | null; loading: boolean }) {
-  if (loading) return <MetricCard label="Known savings" value={undefined} description="Loading…" />
-  if (!summary) return <MetricCard label="Known savings" value={undefined} description="—" />
-  const savings = parseDecimal(summary.total_estimated_monthly_savings)
-  if (savings === null) {
-    return (
-      <MetricCard
-        label="Known savings"
-        value={undefined}
-        description={
-          summary.recommendations_without_savings > 0
-            ? `${summary.recommendations_without_savings} without savings`
-            : 'No authoritative figure'
-        }
-      />
-    )
+function renderHeadlineSavings(
+  summary: ReturnType<typeof buildUnifiedEnvelope>['kpis'] | undefined,
+  loading: boolean,
+): React.ReactNode {
+  if (loading && !summary) return '—'
+  if (!summary) return '—'
+  if (summary.potentialMonthlySavings === null) {
+    if (summary.savingsStatus === 'MIXED_CURRENCY') return 'Mixed currencies'
+    return 'Not available'
   }
-  return (
-    <MetricCard
-      label="Known savings"
-      value={formatCurrencyCompact(savings, summary.currency)}
-      description="Authoritative · USD/mo"
-      tone="success"
-    />
-  )
+  return formatCurrencyCompact(summary.potentialMonthlySavings, summary.currency ?? 'USD')
 }
 
-const columns: DataTableColumn<Recommendation>[] = [
-  {
-    key: 'resource_id',
-    header: 'Resource',
-    cell: (r) => (
-      <span className="truncate font-mono text-[11px] text-fg-primary" title={r.resource_id}>
-        {r.resource_id}
-      </span>
-    ),
-  },
-  {
-    key: 'resource_type',
-    header: 'Type',
-    cell: (r) => (
-      <span className="inline-flex items-center rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-fg-secondary">
-        {r.resource_type.replace('_', ' ')}
-      </span>
-    ),
-    width: 'w-32',
-  },
-  { key: 'region', header: 'Region', cell: (r) => r.region, width: 'w-32' },
+function savingsDescription(
+  summary: ReturnType<typeof buildUnifiedEnvelope>['kpis'] | undefined,
+): string {
+  if (!summary) return '—'
+  if (summary.savingsStatus === 'MIXED_CURRENCY') {
+    return 'Per-currency totals — no FX conversion'
+  }
+  if (summary.savingsStatus === 'EMPTY' || summary.savingsUnavailable) {
+    return 'No authoritative savings figure'
+  }
+  if (summary.authoritativeZero) {
+    return 'Authoritative zero'
+  }
+  return `Currency: ${summary.currency ?? '—'} · monthly`
+}
+
+function accountBreakdown(
+  envelope: NonNullable<ReturnType<typeof buildUnifiedEnvelope>>,
+  accountMap: ReadonlyArray<AccountMapEntry>,
+): HorizontalBarRow[] {
+  const buckets = new Map<string, { label: string; count: number }>()
+  for (const row of envelope.rows) {
+    const label = row.attribution.label
+    const prev = buckets.get(label) ?? { label, count: 0 }
+    prev.count += 1
+    buckets.set(label, prev)
+  }
+  // Ensure the "All" aggregate label shows even when there are zero rows
+  if (buckets.size === 0) {
+    const label =
+      envelope.provider === 'AZURE' ? 'All Azure Subscriptions' : 'All AWS Accounts'
+    return [{ key: label, label, title: label, value: '0' }]
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([key, entry]) => ({ key, label: entry.label, title: entry.label, value: String(entry.count) }))
+  // accountMap reserved for tests / future lookup; safe to keep ref
+  // here without removing it because the linter otherwise flags it.
+  void accountMap
+}
+
+function impactBreakdown(
+  summary: ReturnType<typeof buildUnifiedEnvelope>['kpis'] | undefined,
+): HorizontalBarRow[] {
+  if (!summary) return []
+  const entries = [
+    { label: 'High', count: summary.highImpact },
+    { label: 'Medium', count: summary.mediumImpact },
+    { label: 'Low', count: summary.lowImpact },
+  ]
+  return entries.map((e) => ({
+    key: e.label,
+    label: e.label,
+    title: e.label,
+    value: String(e.count),
+  }))
+}
+
+function resourceTypeBreakdown(
+  rows: ReturnType<typeof buildUnifiedEnvelope>['rows'],
+): HorizontalBarRow[] {
+  const buckets = new Map<string, number>()
+  for (const row of rows) {
+    buckets.set(row.resourceTypeShort, (buckets.get(row.resourceTypeShort) ?? 0) + 1)
+  }
+  return Array.from(buckets.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([label, count]) => ({
+      key: label,
+      label,
+      title: label,
+      value: String(count),
+    }))
+}
+
+function BreakdownRows({ rows }: { rows: HorizontalBarRow[] }) {
+  if (rows.length === 0) {
+    return <EmptyState title="No breakdown" />
+  }
+  return <HorizontalBarChart rows={rows} currency="" maxRows={6} showShare safeShare />
+}
+
+const tableColumns: DataTableColumn<UnifiedRecommendationRow>[] = [
   {
     key: 'title',
     header: 'Finding / Action',
     cell: (r) => (
       <div className="space-y-0.5">
-        <div className="text-fg-primary">{r.title}</div>
-        <div className="text-[10px] text-fg-muted">{r.action.replace('_', ' ')}</div>
+        <div className="truncate text-fg-primary" title={r.title}>
+          {r.title}
+        </div>
+        <div className="text-[10px] text-fg-muted">{r.action}</div>
       </div>
     ),
   },
   {
-    key: 'confidence',
-    header: 'Confidence',
-    cell: (r) => <ConfidenceBadge confidence={r.confidence} />,
+    key: 'impact',
+    header: 'Impact',
+    cell: (r) => (
+      <StatusBadge tone={impactToneFor(r.impact)}>{r.impact}</StatusBadge>
+    ),
+    width: 'w-24',
+  },
+  {
+    key: 'resource',
+    header: 'Resource',
+    cell: (r) => (
+      <span className="truncate font-mono text-[11px] text-fg-primary" title={r.resourceId}>
+        {r.resource}
+      </span>
+    ),
+  },
+  {
+    key: 'resourceType',
+    header: 'Type',
+    cell: (r) => (
+      <span className="inline-flex items-center rounded-md border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-fg-secondary">
+        {r.resourceTypeShort}
+      </span>
+    ),
     width: 'w-32',
   },
   {
-    key: 'savings_source',
+    key: 'region',
+    header: 'Region',
+    cell: (r) => r.region ?? '—',
+    width: 'w-32',
+  },
+  {
+    key: 'attribution',
+    header: 'Scope',
+    cell: (r) => (
+      <span className="truncate text-fg-secondary" title={r.attribution.label}>
+        {r.attribution.label}
+      </span>
+    ),
+  },
+  {
+    key: 'source',
     header: 'Source',
-    cell: (r) => <RecommendationSourceBadge source={r.primary_source} />,
+    cell: (r) => (
+      <span className="text-xs text-fg-secondary">{r.sourceLabel}</span>
+    ),
     width: 'w-40',
   },
   {
     key: 'savings',
-    header: 'Est. savings',
+    header: 'Est. monthly',
     numeric: true,
     cell: (r) => savingsCell(r),
-    width: 'w-40',
-  },
-  {
-    key: 'data_quality',
-    header: 'Quality',
-    cell: (r) => (
-      <span className="text-[10px] uppercase tracking-wider text-fg-muted">{r.data_quality}</span>
-    ),
-    width: 'w-24',
+    width: 'w-36',
   },
 ]
 
-function savingsCell(r: Recommendation): React.ReactNode {
-  const amount = parseDecimal(r.estimated_monthly_savings)
-  if (amount === null) {
+function savingsCell(r: UnifiedRecommendationRow): React.ReactNode {
+  if (r.estimatedMonthlySavings === null) {
     return (
       <span className="text-xs text-fg-muted" data-testid="savings-not-available">
         Not available
       </span>
     )
   }
-  if (amount === 0) {
+  if (r.estimatedMonthlySavings === 0) {
     return <span className="text-xs text-fg-secondary">$0.00</span>
   }
   return (
-    <span className="text-xs text-fg-primary">
-      {formatCurrencyDecimal(amount, r.currency)}
+    <span className="text-xs text-fg-primary" title={r.monthlyNormalized ? 'Normalised from annual figure' : undefined}>
+      {formatCurrencyDecimal(r.estimatedMonthlySavings, r.currency ?? 'USD')}
       <span className="ml-1 text-fg-muted">/ mo</span>
     </span>
   )
 }
 
-function DetailPanel({ recommendation: r }: { recommendation: Recommendation }) {
-  return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2" data-testid="recommendation-detail">
-      <div>
-        <h3 className="text-sm font-semibold text-fg-primary">Finding</h3>
-        <p className="mt-1 text-xs text-fg-secondary">{r.finding}</p>
-        <p className="mt-2 text-[10px] uppercase tracking-wider text-fg-muted">Reason codes</p>
-        <ul className="mt-1 flex flex-wrap gap-1">
-          {r.reason_codes.length === 0 ? (
-            <li className="text-xs text-fg-muted">—</li>
-          ) : (
-            r.reason_codes.map((c) => (
-              <li
-                key={c}
-                className="rounded border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-secondary"
-              >
-                {c}
-              </li>
-            ))
-          )}
-        </ul>
-        <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">Confidence</p>
-        <p className="mt-0.5 text-xs text-fg-primary">
-          <ConfidenceBadge confidence={r.confidence} /> · data_quality: {r.data_quality}
-        </p>
-        <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">Source</p>
-        <p className="mt-0.5 text-xs text-fg-primary">
-          <RecommendationSourceBadge source={r.primary_source} /> ·{' '}
-          {r.sources.map((s: SavingsSource) => savingsSourceLabel(s)).join(', ')}
-        </p>
-      </div>
-      <div>
-        <h3 className="text-sm font-semibold text-fg-primary">Current configuration</h3>
-        <pre className="mt-1 overflow-x-auto rounded-md border border-border bg-surface-2 p-2 text-[11px] text-fg-secondary">
-          {JSON.stringify(r.current_configuration, null, 2)}
-        </pre>
-        <h3 className="mt-3 text-sm font-semibold text-fg-primary">Recommended configuration</h3>
-        <pre className="mt-1 overflow-x-auto rounded-md border border-border bg-surface-2 p-2 text-[11px] text-fg-secondary">
-          {JSON.stringify(r.recommended_configuration, null, 2)}
-        </pre>
-        <h3 className="mt-3 text-sm font-semibold text-fg-primary">Savings</h3>
-        <p className="mt-1 text-xs text-fg-secondary">
-          {parseDecimal(r.estimated_monthly_savings) === null
-            ? 'Not available'
-            : `${formatCurrencyDecimal(r.estimated_monthly_savings, r.currency)} / mo`}
-          {r.rollback_possible === true ? ' · rollback possible' : ''}
-          {r.restart_needed === true ? ' · restart needed' : ''}
-        </p>
-      </div>
-    </div>
-  )
+// Internal helper used by tests to assert that the page consumes the
+// canonical envelope shape (and not the legacy AWS-only types).
+export const __phase7d2 = {
+  pageTestIds: PAGE_TEST_IDS,
+  parseDecimal,
 }
+
+export default OptimizationPage

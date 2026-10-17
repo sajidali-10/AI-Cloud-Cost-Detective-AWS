@@ -46,9 +46,16 @@ describe('Phase 7C.1 — pages wire provider into cache keys', () => {
     const p = src('pages/OptimizationPage.tsx')
     expect(p).toMatch(/useProviderContext/)
     expect(p).toMatch(/cacheProvider/)
-    expect(p).toMatch(/buildCapabilitiesCacheKey\([^)]*cacheProvider/)
-    expect(p).toMatch(/buildRecommendationsCacheKey\([^)]*cacheProvider/)
-    expect(p).toMatch(/buildSummaryCacheKey\([^)]*cacheProvider/)
+    // Phase 7D.2 — unified AWS + Azure Optimization reads from
+    // the single canonical `/api/cloud/recommendations` cache
+    // key, which itself folds the provider segment in.
+    expect(p).toMatch(/buildCloudRecommendationsCacheKey\([^)]*cacheProvider/)
+    // The legacy AWS capability / recs / summary cache key
+    // builders MUST NOT be the primary source for the unified
+    // page (those endpoints remain backend compatibility only).
+    expect(p).not.toMatch(/buildCapabilitiesCacheKey\([^)]*cacheProvider/)
+    expect(p).not.toMatch(/buildRecommendationsCacheKey\([^)]*cacheProvider/)
+    expect(p).not.toMatch(/buildSummaryCacheKey\([^)]*cacheProvider/)
   })
 })
 

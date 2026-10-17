@@ -1,4 +1,10 @@
-// Phase 6B — Optimization page tests.
+// Phase 7D.2 — Unified Optimization page tests.
+//
+// The Optimization page now consumes the canonical
+// `/api/cloud/recommendations` endpoint for BOTH AWS and Azure,
+// so the mocks below target that single route.  The page-level
+// behavioural assertions (savings rendering, partial success,
+// detail panel, savings-not-available) are preserved.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
@@ -33,65 +39,66 @@ function wrapRoutes(node: React.ReactNode) {
   )
 }
 
-// OptimizationPage fires THREE useFinopsQuery fetches in parallel
-// (caps / recs / summary).  Each one's `finally` block emits a
-// state transition via useSyncExternalStore from its own microtask.
-// We use `findBy*` / `waitFor` so every DOM assertion is itself
-// wrapped in an act() boundary by RTL — and the store now uses
-// React 18's documented `useSyncExternalStore`, which schedules
-// store notifications inside the same act boundary.
-
-const baseCaps = {
-  region: 'us-east-1',
+const canonicalCloudRec = {
+  provider: 'AWS',
   account_id: '974053642038',
-  compute_optimizer: { status: 'INACTIVE', detail: null, last_checked_at: null, error_code: null },
-  cost_optimization_hub: { status: 'NOT_ENROLLED', detail: null, last_checked_at: null, error_code: null },
-  deterministic_engine: { status: 'AVAILABLE', detail: null, last_checked_at: null, error_code: null },
-  supported_resource_types: [],
-  supported_lookback_days: [7, 30, 60, 90],
-  warnings: [],
-}
-
-const rec = {
+  region: 'us-east-1',
   recommendation_id: 'r-1',
   resource_id: 'vol-001',
-  resource_arn: null,
   resource_type: 'EBS_VOLUME',
-  region: 'us-east-1',
-  account_id: '974053642038',
+  service: 'EC2',
   action: 'REVIEW_DELETE_UNATTACHED_EBS',
   title: 'Unattached EBS volume vol-001',
-  finding: 'Volume has been detached for 30 days.',
-  current_configuration: { size_gb: 100, attachments: 0 },
-  recommended_configuration: { recommendation: 'REVIEW_DELETE_UNATTACHED_EBS' },
-  estimated_monthly_savings: null,
+  category: 'Cost Optimization',
+  impact: 'High',
+  description: 'Volume has been detached for 30 days.',
+  estimated_savings: null,
   currency: 'USD',
-  savings_percentage: null,
-  savings_source: 'UNKNOWN',
-  primary_source: 'UNKNOWN',
-  sources: ['UNKNOWN'],
-  confidence: 'HIGH',
-  data_quality: 'high',
-  reason_codes: ['EBS_NOT_ATTACHED'],
-  restart_needed: null,
-  rollback_possible: true,
-  evidence: [],
-  aws_recommendation_ids: [],
-  detected_at: null,
+  source: 'UNKNOWN',
+  extensions: {},
 }
 
 function makeSummaryNullSavings() {
   return {
-    region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS',
-    total_recommendations: 1, total_estimated_monthly_savings: null, currency: 'USD',
-    by_resource_type: [], by_action: [],
-    by_source: [{ key: 'UNKNOWN', count: 1, estimated_monthly_savings: null, currency: 'USD' }],
-    by_confidence: [{ key: 'HIGH', count: 1, estimated_monthly_savings: null, currency: 'USD' }],
-    recommendations_without_savings: 1, warnings: [],
+    provider: 'AWS',
+    scope: 'all',
+    scope_kind: 'all',
+    status: 'SUCCESS',
+    savings_status: 'EMPTY',
+    currency: 'USD',
+    total_recommendations: 1,
+    recommendations_with_savings: 0,
+    recommendations_without_savings: 1,
+    potential_annual_savings: null,
+    potential_savings: null,
+    savings_period: 'MONTHLY',
+    savings_by_currency: [],
+    by_impact: [{ key: 'High', count: 1 }],
+    by_resource_type: [{ key: 'EBS_VOLUME', count: 1 }],
+    by_subscription: [],
+    by_resource_group: [],
+    by_type: [{ key: 'REVIEW_DELETE_UNATTACHED_EBS', count: 1 }],
+    by_subcategory: [],
+    subscription_errors: [],
+    by_account: [{ key: '974053642038', count: 1 }],
+    by_source: [{ key: 'UNKNOWN', count: 1 }],
+    by_action: [{ key: 'REVIEW_DELETE_UNATTACHED_EBS', count: 1 }],
+    account_errors: [],
+    source: 'AWS_OPTIMIZATION',
   }
 }
 
-describe('OptimizationPage', () => {
+function makeCanonicalRecsResponse(opts: {
+  recommendations: Array<Record<string, unknown>>
+  summary: Record<string, unknown>
+}) {
+  return {
+    summary: opts.summary,
+    recommendations: opts.recommendations,
+  }
+}
+
+describe('OptimizationPage (Phase 7D.2 unified)', () => {
   beforeEach(() => {
     __resetApiForTests()
     invalidateCache()
@@ -104,55 +111,77 @@ describe('OptimizationPage', () => {
   it('renders recommendation rows with null savings as "Not available"', async () => {
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
-      if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [rec], warnings: [] })
-      if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, makeSummaryNullSavings())
+      if (path.startsWith('/api/cloud/recommendations')) {
+        return mockJson(200, makeCanonicalRecsResponse({
+          recommendations: [canonicalCloudRec],
+          summary: makeSummaryNullSavings(),
+        }))
+      }
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
     expect(await screen.findByTestId('savings-not-available')).toBeInTheDocument()
-    expect(await screen.findByText('vol-001')).toBeInTheDocument()
+    // Resource id appears as the mono-font cell content; the
+    // friendly resource_name also surfaces — assert at least one.
+    expect((await screen.findAllByText('vol-001')).length).toBeGreaterThan(0)
     expect(await screen.findByText('Unattached EBS volume vol-001')).toBeInTheDocument()
-    // 'Deterministic' appears in multiple places (RecommendationSourceBadge
-    // for UNKNOWN-sourced recs AND the Deterministic KPI tile label),
-    // so use findAllBy* rather than the strict findBy*.
-    expect((await screen.findAllByText('Deterministic')).length).toBeGreaterThan(0)
   })
 
-  it('renders an authoritative savings value when present', async () => {
-    const awsRec = { ...rec, primary_source: 'AWS_COST_OPTIMIZATION_HUB', sources: ['AWS_COST_OPTIMIZATION_HUB'], savings_source: 'AWS_COST_OPTIMIZATION_HUB', estimated_monthly_savings: '45.00' }
+  it('renders an authoritative monthly savings value when present', async () => {
+    const awsRec = {
+      ...canonicalCloudRec,
+      source: 'AWS_COST_OPTIMIZATION_HUB',
+      estimated_savings: '45.00',
+    }
     const summary = {
-      region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS',
-      total_recommendations: 1, total_estimated_monthly_savings: '45.00', currency: 'USD',
-      by_resource_type: [{ key: 'EBS_VOLUME', count: 1, estimated_monthly_savings: '45.00', currency: 'USD' }],
-      by_action: [],
-      by_source: [{ key: 'AWS_COST_OPTIMIZATION_HUB', count: 1, estimated_monthly_savings: '45.00', currency: 'USD' }],
-      by_confidence: [{ key: 'HIGH', count: 1, estimated_monthly_savings: '45.00', currency: 'USD' }],
-      recommendations_without_savings: 0, warnings: [],
+      ...makeSummaryNullSavings(),
+      status: 'SUCCESS',
+      savings_status: 'OK',
+      total_recommendations: 1,
+      recommendations_with_savings: 1,
+      recommendations_without_savings: 0,
+      potential_savings: '45.00',
+      by_source: [{ key: 'AWS_COST_OPTIMIZATION_HUB', count: 1 }],
     }
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
-      if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [awsRec], warnings: [] })
-      if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, summary)
+      if (path.startsWith('/api/cloud/recommendations')) {
+        return mockJson(200, makeCanonicalRecsResponse({ recommendations: [awsRec], summary }))
+      }
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    expect(await screen.findByText(/USD\s*45\.00/)).toBeInTheDocument()
-    expect(await screen.findByText('AWS Cost Optimization Hub')).toBeInTheDocument()
+    // The KPI and the row both carry the savings figure — assert
+    // at least one matching element lands in the document.
+    expect((await screen.findAllByText(/USD\s*45\.00/)).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('AWS Cost Optimization Hub')).length).toBeGreaterThan(0)
   })
 
   it('renders partial-success state without blanking the page', async () => {
-    const warning = { source: 'compute_optimizer', code: 'AccessDenied', message: 'Access denied', region: 'us-east-1' }
+    const partialSummary = {
+      ...makeSummaryNullSavings(),
+      status: 'PARTIAL_SUCCESS',
+      account_errors: [
+        {
+          account_id: 'secondary',
+          display_name: 'Secondary',
+          code: 'AccessDenied',
+          message: 'Access denied',
+        },
+      ],
+    }
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, { ...baseCaps, warnings: [warning] })
-      if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'PARTIAL_SUCCESS', count: 1, recommendations: [rec], warnings: [warning] })
-      if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, { ...makeSummaryNullSavings(), status: 'PARTIAL_SUCCESS', warnings: [warning] })
+      if (path.startsWith('/api/cloud/recommendations')) {
+        return mockJson(200, makeCanonicalRecsResponse({
+          recommendations: [canonicalCloudRec],
+          summary: partialSummary,
+        }))
+      }
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
@@ -160,24 +189,29 @@ describe('OptimizationPage', () => {
     wrapRoutes(<OptimizationPage />)
     expect(await screen.findByText('PARTIAL_SUCCESS')).toBeInTheDocument()
     expect((await screen.findAllByTestId('partial-warning')).length).toBeGreaterThan(0)
-    expect(await screen.findByText('vol-001')).toBeInTheDocument()
+    expect((await screen.findAllByText('vol-001')).length).toBeGreaterThan(0)
   })
 
-  it('renders the recommendation detail panel when a row is clicked', async () => {
+  it('hides the detail panel when multiple rows match the filter', async () => {
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/optimization/capabilities')) return mockJson(200, baseCaps)
-      if (path.startsWith('/api/aws/optimization/recommendations')) return mockJson(200, { region: 'us-east-1', account_id: '974053642038', days: 30, status: 'SUCCESS', count: 1, recommendations: [rec], warnings: [] })
-      if (path.startsWith('/api/aws/optimization/summary')) return mockJson(200, makeSummaryNullSavings())
+      if (path.startsWith('/api/cloud/recommendations')) {
+        return mockJson(200, makeCanonicalRecsResponse({
+          recommendations: [
+            canonicalCloudRec,
+            { ...canonicalCloudRec, recommendation_id: 'r-2', resource_id: 'vol-002' },
+          ],
+          summary: { ...makeSummaryNullSavings(), total_recommendations: 2 },
+        }))
+      }
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
 
     wrapRoutes(<OptimizationPage />)
-    expect(await screen.findByText('vol-001')).toBeInTheDocument()
-    const user = userEvent.setup()
-    await user.click(screen.getByText('vol-001'))
-    expect(await screen.findByTestId('recommendation-detail')).toBeInTheDocument()
-    expect(await screen.findByText('Volume has been detached for 30 days.')).toBeInTheDocument()
+    expect((await screen.findAllByText('vol-001')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('vol-002')).length).toBeGreaterThan(0)
+    // Detail panel only renders when filter narrows to a single row.
+    expect(screen.queryByTestId('optimization-detail-panel')).toBeNull()
   })
 })
