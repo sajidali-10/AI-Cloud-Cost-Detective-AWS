@@ -514,54 +514,26 @@ class AWSCloudProvider(CloudProvider):
         days: int,
         region: Optional[str] = None,
     ) -> List[CloudRecommendation]:
-        from app.services.aws.optimization_aggregator import (
-            aggregate_recommendations_for_context,
+        """Return the deduplicated, provider-neutral recommendation list.
+
+        Phase 7D.1: the AWS → canonical mapping and the rollup live in
+        :mod:`app.services.cloud.aws.recommendation_aggregator` so the
+        adapter and the canonical route share a single implementation
+        of the Phase 7B aggregation (bounded concurrency, account
+        ContextVar routing, dedup-merge, partial-failure isolation).
+        The adapter exposes only the flat list the
+        :class:`CloudProvider` contract requires; the route also asks
+        the same module for the summary rollup.
+        """
+        from app.services.cloud.aws.recommendation_aggregator import (
+            aggregate_aws_recommendations_for_accounts,
         )
 
         rows = list(accounts) if accounts else []
-        report = await aggregate_recommendations_for_context(
+        flat, _rollup, _errors = await aggregate_aws_recommendations_for_accounts(
             rows=rows, region=region, days=days
         )
-        out: List[CloudRecommendation] = []
-        for rec in report.recommendations:
-            savings = rec.estimated_monthly_savings
-            out.append(
-                CloudRecommendation(
-                    provider=CloudProviderKind.AWS,
-                    account_id=rec.account_id,
-                    region=rec.region,
-                    recommendation_id=rec.recommendation_id,
-                    resource_id=rec.resource_id,
-                    resource_type=rec.resource_type.value
-                    if hasattr(rec.resource_type, "value")
-                    else str(rec.resource_type),
-                    service=rec.resource_type.value
-                    if hasattr(rec.resource_type, "value")
-                    else str(rec.resource_type),
-                    action=rec.action.value if hasattr(rec.action, "value") else str(rec.action),
-                    title=rec.title,
-                    estimated_savings=_decimal(savings) if savings is not None else None,
-                    currency=rec.currency or "USD",
-                    source=rec.primary_source.value
-                    if hasattr(rec.primary_source, "value")
-                    else str(rec.primary_source),
-                    extensions={
-                        "account_display_name": rec.account_display_name,
-                        "confidence": rec.confidence.value
-                        if hasattr(rec.confidence, "value")
-                        else str(rec.confidence),
-                        "data_quality": rec.data_quality,
-                        "savings_percentage": float(rec.savings_percentage)
-                        if rec.savings_percentage is not None
-                        else None,
-                        "restart_needed": rec.restart_needed,
-                        "rollback_possible": rec.rollback_possible,
-                        "reason_codes": list(rec.reason_codes),
-                        "finding": rec.finding,
-                    },
-                )
-            )
-        return out
+        return list(flat)
 
 
 # ---------------------------------------------------------------------------

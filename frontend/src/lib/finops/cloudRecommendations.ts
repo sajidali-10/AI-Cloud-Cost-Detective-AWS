@@ -20,6 +20,11 @@ export interface CloudRecommendationItem {
   service: string
   action: string
   title: string
+  // Phase 7D.1 — generic columns promoted from extensions so the
+  // same fields render for AWS and Azure without provider checks.
+  category?: string | null
+  impact?: string | null
+  description?: string | null
   estimated_savings: string | null
   currency: string | null
   source: string
@@ -46,6 +51,15 @@ export interface CloudRecommendationSubscriptionError {
   message: string
 }
 
+// Phase 7D.1 — provider-neutral failure shape (AWS account or
+// Azure subscription).
+export interface CloudRecommendationAccountError {
+  account_id: string
+  display_name: string
+  code: string
+  message: string
+}
+
 export interface CloudRecommendationSummaryEnvelope {
   provider: 'AWS' | 'AZURE' | 'RACKSPACE'
   scope: string
@@ -57,6 +71,11 @@ export interface CloudRecommendationSummaryEnvelope {
   recommendations_with_savings: number
   recommendations_without_savings: number
   potential_annual_savings: string | null
+  // Phase 7D.1 — provider-neutral savings pair.  AWS populates a
+  // MONTHLY figure here (its annual field stays null); Azure keeps
+  // both populated.
+  potential_savings?: string | null
+  savings_period?: 'MONTHLY' | 'ANNUAL' | null
   savings_by_currency: CloudRecommendationCurrencyTotal[]
   by_impact: CloudRecommendationGroupCount[]
   by_resource_type: CloudRecommendationGroupCount[]
@@ -65,6 +84,12 @@ export interface CloudRecommendationSummaryEnvelope {
   by_type: CloudRecommendationGroupCount[]
   by_subcategory: CloudRecommendationGroupCount[]
   subscription_errors: CloudRecommendationSubscriptionError[]
+  // Phase 7D.1 — provider-neutral aliases (AWS accounts / Azure
+  // subscriptions) plus generic source / action breakdowns.
+  by_account?: CloudRecommendationGroupCount[]
+  by_source?: CloudRecommendationGroupCount[]
+  by_action?: CloudRecommendationGroupCount[]
+  account_errors?: CloudRecommendationAccountError[]
   source: string
 }
 
@@ -76,22 +101,38 @@ export interface CloudRecommendationListResponse {
 export function buildCloudRecommendationsCacheKey(
   accountId: string | null,
   provider: CacheProvider = 'aws',
+  region: string | null = null,
+  days: number | null = null,
 ): string {
   const acct = canonicalCacheSegment(accountId, provider)
   const providerSeg = provider
-  return `${providerSeg}:cloud:recommendations:${acct}`
+  // Phase 7D.1 — region + lookback-window are part of the
+  // recommendation identity for AWS.  When both are omitted the key
+  // is byte-for-byte the pre-7D.1 string so existing Azure callers
+  // and tests are unaffected.
+  const base = `${providerSeg}:cloud:recommendations:${acct}`
+  if (region === null && days === null) return base
+  return `${base}:${region ?? 'all'}:${days === null ? 'default' : String(days)}`
+}
+
+export interface FetchCloudRecommendationsOptions {
+  provider: 'AWS' | 'AZURE' | 'RACKSPACE'
+  accountId?: string | null
+  /** Optional region scope (AWS). Azure ignores it. */
+  region?: string | null
+  /** Optional lookback window in days (AWS). Azure ignores it. */
+  days?: number | null
 }
 
 export async function fetchCloudRecommendations(
-  options: {
-    provider: 'AWS' | 'AZURE' | 'RACKSPACE'
-    accountId?: string | null
-  },
+  options: FetchCloudRecommendationsOptions,
 ): Promise<CloudRecommendationListResponse> {
   const params = new URLSearchParams()
   params.set('provider', options.provider)
   const canonicalAccount = canonicalAccountParam(options.accountId, options.provider)
   if (canonicalAccount) params.set('account_id', canonicalAccount)
+  if (options.region) params.set('region', options.region)
+  if (options.days != null) params.set('days', String(options.days))
   return apiFetch<CloudRecommendationListResponse>(
     `/api/cloud/recommendations?${params.toString()}`,
     { timeoutMs: 60_000 },

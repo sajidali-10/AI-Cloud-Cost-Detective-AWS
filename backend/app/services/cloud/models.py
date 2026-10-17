@@ -220,6 +220,23 @@ class CloudRecommendation:
     it correctly.  ``estimated_savings`` is the provider-reported
     estimate; ``None`` means the provider did not return one (we
     NEVER fabricate one).
+
+    Phase 7D.1 promotes three previously extension-only fields onto
+    the shared contract so both providers expose the same generic
+    columns without provider-specific branching:
+
+    * ``category`` — a coarse grouping (AWS action slug such as
+      ``RIGHTSIZE``; Azure Advisor category such as ``Cost``).
+    * ``impact`` — the provider-native severity/confidence bucket
+      (AWS ``HIGH``/``MEDIUM``/``LOW``; Azure ``High``/``Medium``/
+      ``Low``).
+    * ``description`` — the long-form explanation
+      (AWS ``finding``; Azure Advisor ``problem``/description).
+
+    These are additive and default to ``None`` so existing AWS and
+    Azure call sites that do not populate them keep working.
+    Provider metadata that cannot be normalised cleanly still lives
+    under ``extensions``.
     """
 
     provider: CloudProviderKind
@@ -234,6 +251,9 @@ class CloudRecommendation:
     estimated_savings: Optional[Decimal]
     currency: str
     source: str
+    category: Optional[str] = None
+    impact: Optional[str] = None
+    description: Optional[str] = None
     extensions: Mapping[str, Any] = field(default_factory=dict)
 
 
