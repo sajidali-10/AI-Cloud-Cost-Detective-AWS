@@ -49,6 +49,7 @@ provider-specific envelope so the front-end can distinguish
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
@@ -400,6 +401,7 @@ def _build_aws_envelope(
     *,
     rows: list,
     scope: str,
+    daily_trend=None,
 ) -> CloudCostReport:
     """Translate AWS adapter output into the provider-neutral envelope."""
     account_id = _account_id_value(rows, scope)
@@ -441,15 +443,26 @@ def _build_aws_envelope(
         )
         for item in raw_errors
     ]
+    # Phase 7D.3.1 — surface the real per-day Cost Explorer points
+    # returned by ``get_cost_trend``.  Falls back to an empty list
+    # when the upstream has no daily data so the envelope stays
+    # well-formed (the Dashboard renders the documented empty state
+    # instead of fabricating values).
     daily: list[DailyCostPoint] = []
-    # The CloudCostSummary returned by the AWS adapter does not
-    # carry a ``daily`` field — daily trend is fetched separately
-    # via ``get_cost_trend``.  The canonical AWS envelope surfaces
-    # an empty daily_trend for now; the legacy /api/aws/costs
-    # route continues to provide a populated trend via the legacy
-    # cost_cache.  This avoids a 502 for AWS consumers without
-    # fabricating trend data.
-    _ = _daily_date_for_aws
+    for item in daily_trend or []:
+        try:
+            daily.append(
+                DailyCostPoint(
+                    date=_daily_date_for_aws(item),
+                    amount=item.amount,
+                    unit=item.currency,
+                )
+            )
+        except Exception:
+            # A single malformed point must NEVER 502 the envelope.
+            # Drop it and continue; the partial-data banner surfaces
+            # the gap at the page level.
+            continue
     return CloudCostReport(
         provider="AWS",
         scope=scope,
@@ -677,7 +690,51 @@ async def get_cloud_costs(
             region=effective_region or None,
         )
         if kind == CloudProviderKind.AWS:
-            return _build_aws_envelope(summary, rows=rows, scope=scope)
+            # Mirror the Azure pattern — fetch the daily trend via
+            # the dedicated ``get_cost_trend`` call so the canonical
+            # envelope carries real per-day data sourced from the
+            # existing Cost Explorer daily query.  The aggregator
+            # already returns this; the canonical AWS path simply
+            # never plumbed it through.  No fabricated data.
+            #
+            # A trend fetch failure MUST NOT 502 the whole envelope —
+            # the summary still has value.  Fall back to an empty
+            # trend and surface the failure in ``account_errors`` so
+            # the dashboard-level partial banner picks it up.
+            daily_trend: list = []
+            try:
+                trend = await adapter.get_cost_trend(
+                    accounts=rows,
+                    period_start=period.start,
+                    period_end=period.end,
+                    region=effective_region or None,
+                )
+                daily_trend = list(trend.daily or [])
+            except Exception as trend_exc:  # noqa: BLE001 - sanitised
+                logger.warning(
+                    "cloud.costs.daily_trend_failed provider=AWS code=%s",
+                    type(trend_exc).__name__,
+                )
+                # Augment the summary's account_errors so the
+                # partial-data banner surfaces the gap.
+                extensions = dict(summary.extensions or {})
+                raw_errors = list(extensions.get("account_errors", []) or [])
+                raw_errors.append(
+                    {
+                        "account_id": "aggregate",
+                        "display_name": "All AWS Accounts",
+                        "code": "DailyTrendUnavailable",
+                        "message": f"daily trend unavailable: {type(trend_exc).__name__}",
+                    }
+                )
+                extensions["account_errors"] = raw_errors
+                summary = replace(summary, extensions=extensions)
+            return _build_aws_envelope(
+                summary,
+                rows=rows,
+                scope=scope,
+                daily_trend=daily_trend,
+            )
         # AZURE: also fetch the daily trend so the envelope is
         # complete.
         from app.services.cloud.azure.cost_aggregator import (

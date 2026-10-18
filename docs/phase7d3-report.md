@@ -177,3 +177,37 @@ No new ERROR / FATAL / traceback / React crash in container logs. Azure throttli
 * ✅ `phase-7c-complete` tag unchanged (still at 77fef2b on the merge commit).
 * ✅ Single feature commit on the working branch.
 * ✅ Push to branch only (no `main` push, no force-push, no history rewrite).
+
+
+---
+
+## PHASE 7D.3.1 — AWS Canonical Analytics Completeness
+
+A narrow backend completeness pass closed two gaps in the AWS canonical envelopes without fabricating data:
+
+* **AWS `daily_trend`** — was always empty. Now populated from `adapter.get_cost_trend(...)` which delegates to `aggregate_cost_report_for_context` (real Cost Explorer daily points). Mirrors the Azure pattern. Trend fetch failures surface as `account_errors` with `code="DailyTrendUnavailable"`; the envelope never 502s.
+* **AWS `by_type` / `by_location` / `by_subscription`** — was empty despite `resources[]` having hundreds of items. Now derived server-side from the canonical resources list. Aggregator-supplied breakdowns merge on top so we never regress. Resources without a `resource_type` land in an explicit `Unassigned` bucket. Invariant `sum(by_type) == total_resources` always holds.
+
+Verified live (October 2026):
+
+```
+/api/cloud/costs?provider=AWS&account_id=all&month=2026-10
+  status=SUCCESS  total_cost=3252.54  daily_trend=18 entries  by_service=18  by_region=1
+
+/api/cloud/resources?provider=AWS&account_id=all
+  total_resources=401
+  by_type: ebs=130, lambda=96, ec2=95, s3=47, eip=25, nat=4, rds=4 (sum=401)
+  by_location: us-east-1=400, us-west-1=1
+  by_subscription: 852428675923=79, 974053642038=322
+  resources=401
+```
+
+* **Frontend:** zero changes — the existing Spend Trend chart and Resource Summary section consume the new data automatically.
+* **Azure:** zero changes — `aggregate_cost_trend_for_subscriptions` and `aggregate_resources_for_subscriptions` paths are untouched.
+* **AWS legacy:** zero changes — `/api/aws/costs`, `/api/aws/identity`, `/api/aws/resources/all` all return 200.
+
+13 new backend tests cover: real per-day points, no fabrication, multi-account aggregation by date, PARTIAL_SUCCESS preservation, empty-source passthrough, trend-failure non-502, by_type/location/subscription derivation, `Unassigned` bucket, invariant preservation, zero-source envelope shape, Azure path unchanged.
+
+See `docs/phase7d3-analytics-completeness.md` for the full audit, implementation, and live results.
+
+**STOP after Phase 7D.3.1.**
