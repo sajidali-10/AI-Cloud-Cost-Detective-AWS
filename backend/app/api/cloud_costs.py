@@ -441,10 +441,15 @@ def _build_aws_envelope(
         )
         for item in raw_errors
     ]
-    daily = [
-        DailyCostPoint(date=_daily_date_for_aws(item), amount=item.amount, unit=item.currency)
-        for item in summary.daily
-    ]
+    daily: list[DailyCostPoint] = []
+    # The CloudCostSummary returned by the AWS adapter does not
+    # carry a ``daily`` field — daily trend is fetched separately
+    # via ``get_cost_trend``.  The canonical AWS envelope surfaces
+    # an empty daily_trend for now; the legacy /api/aws/costs
+    # route continues to provide a populated trend via the legacy
+    # cost_cache.  This avoids a 502 for AWS consumers without
+    # fabricating trend data.
+    _ = _daily_date_for_aws
     return CloudCostReport(
         provider="AWS",
         scope=scope,
