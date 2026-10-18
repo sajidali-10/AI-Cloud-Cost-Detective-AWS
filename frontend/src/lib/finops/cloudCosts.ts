@@ -50,6 +50,12 @@ export interface CloudCostReport {
   by_region: Array<{ region: string; amount: string; unit: string }>
   by_account: CloudAccountShare[]
   account_errors: CloudAccountError[]
+  /** Phase 7D.3.2 — when the backend (or a test fixture) populates
+   *  these explicitly, the frontend MUST trust them.  The
+   *  ``by_account``-based derivation below is only a fallback so
+   *  older test fixtures that omit the counts continue to work. */
+  successful_accounts?: number | null
+  failed_accounts?: number | null
   source: string
 }
 
@@ -130,9 +136,28 @@ export function adaptCloudCostReport(
     code: e.code,
     message: e.message,
   }))
-  const failedAccounts = subscriptionErrors.length
+  // Phase 7D.3.2 — prefer the backend-emitted counts (they are
+  // authoritative).  Only fall back to the by_account-derived
+  // counts when the backend has not populated the field (older
+  // fixtures, providers that don't surface per-subscription
+  // counts).  ``r`` is typed loosely here because the canonical
+  // ``CloudCostReport`` schema doesn't yet declare the fields,
+  // but the production envelope already carries them.
+  const explicitFailed =
+    typeof (r as { failed_accounts?: unknown }).failed_accounts === 'number'
+      ? ((r as { failed_accounts: number }).failed_accounts)
+      : null
+  const explicitSuccessful =
+    typeof (r as { successful_accounts?: unknown }).successful_accounts === 'number'
+      ? ((r as { successful_accounts: number }).successful_accounts)
+      : null
+  const failedAccounts =
+    explicitFailed !== null ? explicitFailed : subscriptionErrors.length
   const subscribedCount = Array.isArray(r.by_account) ? r.by_account.length : 0
-  const successfulAccounts = Math.max(0, subscribedCount - failedAccounts)
+  const successfulAccounts =
+    explicitSuccessful !== null
+      ? explicitSuccessful
+      : Math.max(0, subscribedCount - failedAccounts)
   return {
     report: {
       account_id: r.account_id ?? '',

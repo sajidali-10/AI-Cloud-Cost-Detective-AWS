@@ -1,6 +1,32 @@
-// Phase 7A — Costs page wired to calendar-month billing.
+// Phase 7D.3.2 — Costs page wired to calendar-month billing with
+// shared cost-completeness semantics.
+//
+// This page consumes the SAME canonical envelope as the unified
+// Dashboard and applies the SAME completeness derivation.  Before
+// Phase 7D.3.2 the page rendered raw ``report.total_cost`` even
+// when the canonical response was ``status='PARTIAL_SUCCESS'`` /
+// ``successful_accounts=0`` (every Azure subscription throttled),
+// which produced a fake "$0.00" as authoritative spend.
+//
+// Phase 7D.3.2 changes:
+//
+//   * The cost KPI tiles go through ``deriveCostCompleteness`` —
+//     a PARTIAL_SUCCESS with zero successful scopes renders
+//     "Unavailable", not "$0.00".
+//   * The page tracks a ``generation`` token (same pattern as the
+//     Dashboard) so a stale request can't overwrite fresh state.
+//     Stale responses raise ``StaleGenerationError``, which the
+//     store now silently discards (no user-facing error).
+//   * The last-known-good snapshot survives a failed refresh; the
+//     KPI tiles and charts render the LKG value with a "Stale"
+//     caption instead of blanking the page.
+//   * Charts distinguish "data unavailable" (upstream failure) from
+//     "no data" (authoritative empty dataset) per spec step 11.
+//   * Refresh invalidates with ``invalidateFinopsCacheKeepLastGood``
+//     so a manual refresh that fails cannot wipe the prior good
+//     snapshot.
 
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { SectionCard } from '../components/SectionCard'
 import { MetricCard } from '../components/MetricCard'
@@ -13,17 +39,23 @@ import { CostTrendChart } from '../components/CostTrendChart'
 import { HorizontalBarChart, type HorizontalBarRow } from '../components/HorizontalBarChart'
 import { LoadingSkeleton, LoadingSkeletonRows } from '../components/LoadingSkeleton'
 import { ErrorState } from '../components/ErrorState'
-import { useFinopsQuery } from '../lib/finops/store'
+import { useFinopsQuery, invalidateFinopsCacheKeepLastGood } from '../lib/finops/store'
 import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
 import {
   fetchCloudCostReport,
   adaptCloudCostReport,
   buildCloudCostsCacheKey,
 } from '../lib/finops/cloudCosts'
+import {
+  costDomainSnapshot,
+  dataReadinessLabel,
+  deriveCostCompleteness,
+  deriveDashboardReadiness,
+  type DataReadinessKind,
+} from '../lib/finops/costCompleteness'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
-import { invalidateFinopsCache } from '../lib/finops/store'
 import type { CostReportResponse, ServiceCost, BillingPeriod } from '../types/finops'
 import { monthLabel } from '../types/finops'
 import {
@@ -74,6 +106,9 @@ export function CostsPage() {
 
   // Phase 7B: invalidate stale data when the account switches.
   // Phase 7C.1: also invalidate on provider change.
+  // Phase 7D.3.2: use the keep-last-good variant so a provider /
+  // scope / period switch preserves the prior authoritative
+  // snapshot across the transient refresh window.
   const prevSelectionRef = useRef(selection)
   const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
@@ -81,7 +116,7 @@ export function CostsPage() {
       prevSelectionRef.current !== selection ||
       prevProviderRef.current !== cacheProvider
     ) {
-      invalidateFinopsCache()
+      invalidateFinopsCacheKeepLastGood()
       prevSelectionRef.current = selection
       prevProviderRef.current = cacheProvider
     }
@@ -110,6 +145,26 @@ export function CostsPage() {
     [cost.entry.data],
   )
 
+  // Phase 7D.3.2 — single readiness derivation shared with the
+  // Dashboard.  The page header status badge uses the same label
+  // derivation as the rest of the app, so the standalone Costs
+  // page can never disagree with the Dashboard.
+  const costSnapshot = costDomainSnapshot(cost.entry.data, cost.entry.status, cost.entry.error)
+  const readiness: DataReadinessKind = deriveDashboardReadiness([costSnapshot])
+  const readinessText = dataReadinessLabel(readiness)
+  const readinessTone = readinessToneFor(readiness)
+  const completeness = deriveCostCompleteness(report)
+  const hasLastGood = !!cost.entry.lastGood && deriveCostCompleteness(cost.entry.lastGood.report).kind !== 'unavailable'
+  const showStale = !!cost.entry.error && hasLastGood
+
+  // The chart / KPI rendering branches on the same completeness
+  // view-model the Dashboard uses, so the two pages cannot drift.
+  const renderableReport = (() => {
+    if (completeness.kind !== 'unavailable') return report
+    if (hasLastGood) return cost.entry.lastGood?.report ?? null
+    return null
+  })()
+
   return (
     <div className="space-y-5">
       <PageHeader
@@ -121,33 +176,52 @@ export function CostsPage() {
             <span className="text-fg-muted">Period</span>
             <span className="text-fg-secondary">{periodText}</span>
             <span className="text-fg-muted">Currency</span>
-            <span className="text-fg-secondary">{report?.currency ?? '—'}</span>
+            <span className="text-fg-secondary">{report?.currency ?? cost.entry.lastGood?.report.currency ?? '—'}</span>
             <span className="text-fg-muted">Cache</span>
             <span className="text-fg-secondary">{cost.entry.data?.cache_status ?? '—'}</span>
             <span className="text-fg-muted">Updated</span>
             <span className="text-fg-secondary">{formatLocalTime(cost.entry.refreshedAt)}</span>
+            <span className="text-fg-muted">Status</span>
+            <span data-testid="costs-status-badge">
+              <StatusBadge tone={readinessTone}>{readinessText}</StatusBadge>
+            </span>
           </>
         }
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <PeriodSelector />
             <RegionFilter options={regionOptions} />
-            <RefreshButton onClick={cost.refresh} />
+            <RefreshButton onClick={cost.refresh} disabled={isInFlight(cost.entry.status)} />
           </div>
         }
       />
 
-      {cost.entry.error && !cost.entry.data && (
-        <ErrorState title="Could not load costs" message={cost.entry.error.message} onRetry={cost.refresh} />
+      {cost.entry.error && !cost.entry.data && !hasLastGood && (
+        <ErrorState
+          title="Could not load costs"
+          message={sanitiseUserMessage(cost.entry.error.message)}
+          onRetry={cost.refresh}
+        />
       )}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <SpendKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
-        <ChangeKpi report={report} loading={cost.entry.status === 'loading'} period={period} />
-        <TopServiceKpi
+        <SpendKpi
           report={report}
+          lastGood={cost.entry.lastGood?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          currency={report?.currency ?? 'USD'}
+          period={period}
+          stale={showStale}
+        />
+        <ChangeKpi
+          report={renderableReport}
+          loading={cost.entry.status === 'loading'}
+          period={period}
+        />
+        <TopServiceKpi
+          report={renderableReport}
+          loading={cost.entry.status === 'loading'}
+          currency={renderableReport?.currency ?? 'USD'}
+          stale={showStale}
         />
       </div>
 
@@ -162,14 +236,19 @@ export function CostsPage() {
       >
         {cost.entry.status === 'loading' && !cost.entry.data ? (
           <LoadingSkeleton className="h-[220px] w-full" />
+        ) : cost.entry.error && !cost.entry.data && !hasLastGood ? (
+          <ErrorState
+            title="Cost trend unavailable"
+            message={`${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} request failed.`}
+          />
+        ) : renderableReport ? (
+          <CostTrendChart
+            points={renderableReport.daily_trend}
+            currency={renderableReport.currency}
+            ariaLabel={`Daily cost trend for ${periodText}`}
+          />
         ) : (
-          cost.entry.data && (
-            <CostTrendChart
-              points={cost.entry.data.report.daily_trend}
-              currency={cost.entry.data.report.currency}
-              ariaLabel={`Daily cost trend for ${periodText}`}
-            />
-          )
+          <p className="text-xs text-fg-muted">No spend data</p>
         )}
       </SectionCard>
 
@@ -179,22 +258,27 @@ export function CostsPage() {
           description="Top services by spend"
           actions={
             <StatusBadge tone="neutral">
-              {report?.by_service.length ?? 0} services
+              {renderableReport?.by_service.length ?? 0} services
             </StatusBadge>
           }
         >
           {cost.entry.status === 'loading' && !cost.entry.data ? (
             <LoadingSkeletonRows rows={6} />
+          ) : cost.entry.error && !cost.entry.data && !hasLastGood ? (
+            <ErrorState
+              title="Service breakdown unavailable"
+              message="Service breakdown request failed."
+            />
+          ) : renderableReport ? (
+            <HorizontalBarChart
+              rows={serviceRows(renderableReport.by_service)}
+              currency={renderableReport.currency}
+              maxRows={10}
+              showShare
+              safeShare
+            />
           ) : (
-            cost.entry.data && (
-              <HorizontalBarChart
-                rows={serviceRows(cost.entry.data.report.by_service)}
-                currency={cost.entry.data.report.currency}
-                maxRows={10}
-                showShare
-                safeShare
-              />
-            )
+            <p className="text-xs text-fg-muted">No service breakdown</p>
           )}
         </SectionCard>
         <SectionCard
@@ -206,22 +290,27 @@ export function CostsPage() {
           }
           actions={
             <StatusBadge tone="neutral">
-              {report?.by_region.length ?? 0} regions
+              {renderableReport?.by_region.length ?? 0} regions
             </StatusBadge>
           }
         >
           {cost.entry.status === 'loading' && !cost.entry.data ? (
             <LoadingSkeletonRows rows={6} />
+          ) : cost.entry.error && !cost.entry.data && !hasLastGood ? (
+            <ErrorState
+              title="Region breakdown unavailable"
+              message="Region breakdown request failed."
+            />
+          ) : renderableReport ? (
+            <HorizontalBarChart
+              rows={regionRows(renderableReport.by_region)}
+              currency={renderableReport.currency}
+              maxRows={8}
+              showShare
+              safeShare
+            />
           ) : (
-            cost.entry.data && (
-              <HorizontalBarChart
-                rows={regionRows(cost.entry.data.report.by_region)}
-                currency={cost.entry.data.report.currency}
-                maxRows={8}
-                showShare
-                safeShare
-              />
-            )
+            <p className="text-xs text-fg-muted">No region breakdown</p>
           )}
         </SectionCard>
       </div>
@@ -232,14 +321,19 @@ export function CostsPage() {
       >
         {cost.entry.status === 'loading' && !cost.entry.data ? (
           <LoadingSkeletonRows rows={6} />
+        ) : renderableReport ? (
+          <ServiceBreakdownTable
+            services={renderableReport.by_service}
+            currency={renderableReport.currency}
+            total={renderableReport.total_cost}
+          />
+        ) : cost.entry.error && !hasLastGood ? (
+          <ErrorState
+            title="Service breakdown unavailable"
+            message="Service breakdown request failed."
+          />
         ) : (
-          cost.entry.data && (
-            <ServiceBreakdownTable
-              services={cost.entry.data.report.by_service}
-              currency={cost.entry.data.report.currency}
-              total={cost.entry.data.report.total_cost}
-            />
-          )
+          <p className="text-xs text-fg-muted">No service breakdown</p>
         )}
       </SectionCard>
     </div>
@@ -248,20 +342,61 @@ export function CostsPage() {
 
 function SpendKpi({
   report,
+  lastGood,
   loading,
   period,
+  stale,
 }: {
   report: CostReportResponse['report'] | null
+  lastGood: CostReportResponse['report'] | null
   loading: boolean
   period: BillingPeriod
+  stale: boolean
 }) {
+  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+  const completeness = deriveCostCompleteness(report)
   if (loading && !report) return <MetricCard label="Total spend" value={undefined} description="Loading…" />
-  if (!report) return <MetricCard label="Total spend" value={undefined} description="—" />
+  if (completeness.kind === 'unavailable') {
+    if (lastGood && deriveCostCompleteness(lastGood).kind !== 'unavailable') {
+      return (
+        <MetricCard
+          label="Total spend"
+          value={formatCurrencyCompact(lastGood.total_cost, lastGood.currency)}
+          description={`${label} · ${lastGood.currency} · Stale · refresh unavailable`}
+          tone="warning"
+
+        />
+      )
+    }
+    return (
+      <MetricCard
+        label="Total spend"
+        value="Unavailable"
+        description={stale ? `${label} · no data · Stale` : `${label} · no data`}
+        tone="warning"
+
+      />
+    )
+  }
+  if (completeness.kind === 'partial') {
+    const live = report as NonNullable<CostReportResponse['report']>
+    return (
+      <MetricCard
+        label="Total spend"
+        value={formatCurrencyCompact(live.total_cost, live.currency)}
+        description={`${label} · ${live.currency} · Partial (${completeness.failedAccounts} unavailable)`}
+        tone="warning"
+
+      />
+    )
+  }
+  const live = report as NonNullable<CostReportResponse['report']>
   return (
     <MetricCard
       label="Total spend"
-      value={formatCurrencyCompact(report.total_cost, report.currency)}
-      description={`${periodDisplay(period)} · ${report.currency}`}
+      value={formatCurrencyCompact(live.total_cost, live.currency)}
+      description={`${label} · ${live.currency}`}
+
     />
   )
 }
@@ -305,14 +440,22 @@ function TopServiceKpi({
   report,
   loading,
   currency,
+  stale,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
   currency: string
+  stale: boolean
 }) {
   if (loading && !report) return <MetricCard label="Top service" value={undefined} description="Loading…" />
   if (!report || report.by_service.length === 0) {
-    return <MetricCard label="Top service" value={undefined} description="—" />
+    return (
+      <MetricCard
+        label="Top service"
+        value={undefined}
+        description={stale ? '— · Stale' : '—'}
+      />
+    )
   }
   const top = report.by_service.slice().sort((a, b) => (parseDecimal(b.amount) ?? 0) - (parseDecimal(a.amount) ?? 0))[0]!
   return (
@@ -378,4 +521,81 @@ function ServiceBreakdownTable({
   return (
     <DataTable columns={columns} rows={rows} rowKey={(r) => r.key} caption="Service breakdown" />
   )
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers (local)
+// ---------------------------------------------------------------------------
+
+function isInFlight(status: string): boolean {
+  return status === 'loading' || status === 'refreshing'
+}
+
+/**
+ * Sanitise an error message before it lands in the visible UI.
+ * Internal control-flow signals (e.g. ``stale-generation:0->1``)
+ * MUST NOT reach the end user; if such a token slips through the
+ * defensive layer we replace the message with a friendly default
+ * instead of leaking implementation detail.
+ */
+function sanitiseUserMessage(message: string | undefined): string {
+  if (!message) return 'Cost request failed.'
+  if (/stale-generation/i.test(message)) return 'Cost request superseded by a fresher one.'
+  return message
+}
+
+function readinessToneFor(
+  readiness: DataReadinessKind,
+): 'success' | 'info' | 'warning' | 'danger' | 'neutral' {
+  switch (readiness) {
+    case 'live':
+      return 'success'
+    case 'loading':
+    case 'refreshing':
+      return 'info'
+    case 'partial':
+      return 'warning'
+    case 'unavailable':
+      return 'danger'
+    case 'idle':
+    default:
+      return 'neutral'
+  }
+}
+
+/**
+ * Phase 7D.3.2 — generation token bumped on every change that
+ * should invalidate a stale in-flight cost request.  Captured at
+ * fetch-start; the store discards the response if the captured
+ * generation differs from the live one.
+ */
+function useCostPageGeneration(
+  provider: string,
+  selection: string | null,
+  period: BillingPeriod,
+  region: string | null,
+  providerVersion: number,
+): number {
+  const periodKey = period.kind === 'month' ? `month:${period.month}` : `days:${period.days}`
+  const [gen, setGen] = useState(0)
+  const prev = useRef({
+    provider,
+    selection,
+    period: periodKey,
+    region,
+    providerVersion,
+  })
+  useEffect(() => {
+    if (
+      prev.current.provider !== provider ||
+      prev.current.selection !== selection ||
+      prev.current.period !== periodKey ||
+      prev.current.region !== region ||
+      prev.current.providerVersion !== providerVersion
+    ) {
+      setGen((g) => g + 1)
+      prev.current = { provider, selection, period: periodKey, region, providerVersion }
+    }
+  }, [provider, selection, periodKey, region, providerVersion])
+  return gen
 }

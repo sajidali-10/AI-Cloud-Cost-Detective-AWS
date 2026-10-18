@@ -39,6 +39,7 @@ export function MetricCard({
         bg-surface p-4 shadow-card-sm
       "
       data-testid={testId ?? 'metric-card'}
+      data-metric-id={testId ?? 'metric-card'}
       data-empty={isEmpty ? 'true' : 'false'}
     >
       <div className="flex items-start justify-between gap-2">

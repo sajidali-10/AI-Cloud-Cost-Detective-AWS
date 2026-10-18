@@ -54,7 +54,12 @@ import { PartialWarning } from '../components/PartialWarning'
 import { LoadingSkeleton, LoadingSkeletonRows } from '../components/LoadingSkeleton'
 import { ErrorState } from '../components/ErrorState'
 import { Link } from '../lib/router'
-import { useFinopsQuery, invalidateFinopsCache } from '../lib/finops/store'
+import {
+  useFinopsQuery,
+  invalidateFinopsCache,
+  invalidateFinopsCacheKeepLastGood,
+  StaleGenerationError,
+} from '../lib/finops/store'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext, type SelectableAccount } from '../lib/accountContext'
 import { useProviderContext, type ProviderKind } from '../lib/providerContext'
@@ -82,6 +87,14 @@ import {
   type CloudRecommendationListResponse,
 } from '../lib/finops/cloudRecommendations'
 import { buildUnifiedEnvelope } from '../lib/finops/unifiedRecommendations'
+import {
+  costDomainSnapshot,
+  dataReadinessLabel,
+  deriveCostCompleteness,
+  deriveDashboardReadiness,
+  type DataReadinessKind,
+  type DomainSnapshot,
+} from '../lib/finops/costCompleteness'
 import {
   changeTone,
   formatChangePercent,
@@ -202,6 +215,14 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
   // change so a stale AWS response can never satisfy an Azure
   // request (and vice versa).  Belt-and-braces with the
   // generation guard above.
+  //
+  // Phase 7D.3.2 — switch from ``invalidateFinopsCache()`` (full
+  // wipe, used by auth flows) to ``invalidateFinopsCacheKeepLastGood()``
+  // so a provider / scope switch preserves the previous
+  // authoritative snapshot.  If the subsequent fetch for the new
+  // provider/scope fails, the UI can fall back to the previous
+  // value with a "Stale" caption instead of rendering a blank /
+  // $0.00 page during the transient failure window.
   const prevSelectionRef = useRef(selection)
   const prevProviderRef = useRef(cacheProvider)
   useEffect(() => {
@@ -209,7 +230,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
       prevSelectionRef.current !== selection ||
       prevProviderRef.current !== cacheProvider
     ) {
-      invalidateFinopsCache()
+      invalidateFinopsCacheKeepLastGood()
       prevSelectionRef.current = selection
       prevProviderRef.current = cacheProvider
     }
@@ -324,6 +345,26 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
     recommendationEnvelope,
   )
 
+  // Phase 7D.3.2 — single readiness derivation shared by the page
+  // header status badge AND the DashboardHero dataStatus.  Replaces
+  // the per-domain OR-chain that produced contradictory labels
+  // ("Unavailable" in the header, "Live" in the hero) when cost
+  // failed but resources succeeded.  All three call-sites now go
+  // through ``deriveDashboardReadiness`` so they cannot disagree.
+  const costSnapshot = costDomainSnapshot(
+    cost.entry.data,
+    cost.entry.status,
+    cost.entry.error,
+  )
+  const domains: ReadonlyArray<DomainSnapshot> = [
+    costSnapshot,
+    { status: resources.entry.status, error: resources.entry.error, hasData: !!resources.entry.data },
+    { status: recommendations.entry.status, error: recommendations.entry.error, hasData: !!recommendations.entry.data },
+  ]
+  const readiness = deriveDashboardReadiness(domains)
+  const readinessLabel = dataReadinessLabel(readiness)
+  const readinessTone = readinessToneFor(readiness)
+
   return (
     <div className="space-y-5" data-testid="unified-dashboard" data-provider={provider}>
       <PageHeader
@@ -340,13 +381,11 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
             <ContextItem
               label="Status"
               value={
-                <StatusBadge
-                  tone={
-                    statusTone(cost.entry.status, cost.entry.error)
-                  }
-                >
-                  {statusLabel(cost.entry.status, cost.entry.error)}
-                </StatusBadge>
+                <span data-testid="dashboard-status-badge">
+                  <StatusBadge tone={readinessTone}>
+                    {readinessLabel}
+                  </StatusBadge>
+                </span>
               }
             />
             <ContextItem
@@ -362,7 +401,10 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
         actions={
           <div className="flex items-center gap-2">
             <PeriodSelector />
-            <RefreshButton onClick={refreshAll} />
+            <RefreshButton
+              onClick={refreshAll}
+              disabled={readiness === 'loading' || readiness === 'refreshing'}
+            />
           </div>
         }
       />
@@ -383,17 +425,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
             resources.entry.refreshedAt ??
             recommendations.entry.refreshedAt,
         )}
-        dataStatus={
-          cost.entry.status === 'success' || resources.entry.status === 'success' || recommendations.entry.status === 'success'
-            ? 'live'
-            : cost.entry.status === 'loading' || resources.entry.status === 'loading' || recommendations.entry.status === 'loading'
-              ? 'loading'
-              : cost.entry.status === 'refreshing' || resources.entry.status === 'refreshing' || recommendations.entry.status === 'refreshing'
-                ? 'refreshing'
-                : cost.entry.error || resources.entry.error || recommendations.entry.error
-                  ? 'unavailable'
-                  : 'idle'
-        }
+        dataStatus={readiness}
       />
 
       {/* KPI row — 5 provider-neutral cards.  Wraps cleanly down
@@ -404,6 +436,8 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           loading={cost.entry.status === 'loading'}
           period={period}
           providerLabel={provider === 'AZURE' ? 'Total Spend' : 'Total Spend'}
+          lastGood={cost.entry.lastGood?.report ?? null}
+          stale={!!cost.entry.error && !!cost.entry.lastGood}
         />
         <ChangeKpi
           report={cost.entry.data?.report ?? null}
@@ -437,12 +471,33 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
         {cost.entry.status === 'loading' && !cost.entry.data ? (
           <LoadingSkeleton className="h-[200px] w-full" />
         ) : cost.entry.error && !cost.entry.data ? (
-          <ErrorState message={cost.entry.error.message} />
-        ) : cost.entry.data ? (
+          // Phase 7D.3.2 — when the most-recent fetch failed AND
+          // we have a safe last-known-good snapshot, render the
+          // chart from lastGood with a "Stale" caption.  Otherwise
+          // surface a generic "Unavailable" so the message text
+          // never leaks internal control-flow signals.
+          <ErrorState
+            title={cost.entry.lastGood ? 'Refresh temporarily unavailable' : 'Cost data unavailable'}
+            message={
+              cost.entry.lastGood
+                ? 'Showing last known good data while the upstream recovers.'
+                : `${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} request failed.`
+            }
+          />
+        ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
           <CostTrendChart
             points={cost.entry.data.report.daily_trend}
             currency={cost.entry.data.report.currency}
             ariaLabel={`Daily cost trend for ${activeMonthLabel}`}
+          />
+        ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind === 'unavailable' ? (
+          // Phase 7D.3.2 — the response was technically successful
+          // but every subscription / account failed (THROTTLED,
+          // AUTH, etc.).  Distinguish this from an authoritative
+          // empty dataset.
+          <ErrorState
+            title="Cost data unavailable"
+            message={`${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} returned no successful data.`}
           />
         ) : (
           <EmptyChartState label="No spend data" />
@@ -463,14 +518,22 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           {cost.entry.status === 'loading' && !cost.entry.data ? (
             <LoadingSkeletonRows rows={6} />
           ) : cost.entry.error && !cost.entry.data ? (
-            <ErrorState message={cost.entry.error.message} />
-          ) : cost.entry.data ? (
+            <ErrorState
+              title="Service breakdown unavailable"
+              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Service breakdown request failed.'}
+            />
+          ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             <HorizontalBarChart
               rows={serviceRows(cost.entry.data.report.by_service)}
               currency={cost.entry.data.report.currency}
               maxRows={10}
               showShare
               safeShare
+            />
+          ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind === 'unavailable' ? (
+            <ErrorState
+              title="Service breakdown unavailable"
+              message="All upstream requests failed."
             />
           ) : (
             <EmptyChartState label="No service breakdown" />
@@ -483,14 +546,22 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           {cost.entry.status === 'loading' && !cost.entry.data ? (
             <LoadingSkeletonRows rows={6} />
           ) : cost.entry.error && !cost.entry.data ? (
-            <ErrorState message={cost.entry.error.message} />
-          ) : cost.entry.data ? (
+            <ErrorState
+              title="Region breakdown unavailable"
+              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Region breakdown request failed.'}
+            />
+          ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             <HorizontalBarChart
               rows={regionRows(cost.entry.data.report.by_region)}
               currency={cost.entry.data.report.currency}
               maxRows={10}
               showShare
               safeShare
+            />
+          ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind === 'unavailable' ? (
+            <ErrorState
+              title="Region breakdown unavailable"
+              message="All upstream requests failed."
             />
           ) : (
             <EmptyChartState label="No region breakdown" />
@@ -541,21 +612,10 @@ function useGeneration(
 }
 
 /**
- * Thrown by dashboard queries when a response arrives for a
- * previous generation.  The store treats it like any other error
- * (the entry lands in `error` state), but the message is stable
- * for tests and never surfaces to the UI as a "real" failure.
+ * `StaleGenerationError` is imported from `../lib/finops/store` so
+ * the store can detect it and discard the result silently.  It is
+ * NOT a user-facing error and must never reach the ErrorState UI.
  */
-class StaleGenerationError extends Error {
-  readonly startGen: number
-  readonly currentGen: number
-  constructor(startGen: number, currentGen: number) {
-    super(`stale-generation:${startGen}->${currentGen}`)
-    this.name = 'StaleGenerationError'
-    this.startGen = startGen
-    this.currentGen = currentGen
-  }
-}
 
 // ===========================================================================
 //  KPI tiles
@@ -566,47 +626,71 @@ export function SpendKpi({
   loading,
   period,
   providerLabel,
+  lastGood,
+  stale,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
   period: import('../types/finops').BillingPeriod
   providerLabel: string
+  /** Optional last-known-good snapshot, used as a safe fallback
+   *  when the most recent fetch was throttled / failed and the
+   *  current ``report`` is unavailable. */
+  lastGood?: CostReportResponse['report'] | null
+  /** Whether ``lastGood`` is being rendered because the current
+   *  fetch failed.  Drives a "Stale" caption. */
+  stale?: boolean
 }) {
+  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+  const completeness = deriveCostCompleteness(report)
   if (loading && !report) {
     return <MetricCard label={providerLabel} description="Loading…" value={undefined} />
   }
-  if (!report) {
-    return <MetricCard label={providerLabel} description="—" value={undefined} />
-  }
-  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+  // Phase 7D.3.2 — single source of truth for completeness.  Use
+  // the canonical view-model (Status / successful / failed counts)
+  // instead of the inline duplicate the previous version carried.
+  // When the current report is unavailable AND we have a safe
+  // last-known-good snapshot, render that with a "Stale" caption
+  // rather than blanking the KPI.
+  if (completeness.kind === 'unavailable') {
+    if (lastGood && deriveCostCompleteness(lastGood).kind !== 'unavailable') {
+      const lg = lastGood
+      return (
+        <MetricCard
+          label={providerLabel}
+          icon={<SpendIcon />}
+          value={formatCurrencyCompact(lg.total_cost, lg.currency)}
+          description={`${label} · ${lg.currency} · Stale · refresh unavailable`}
+          tone="warning"
 
-  // Phase 7C hotfix #2 / Phase 7D.3 — cost completeness:
-  //   * all failed → "Unavailable" (never "$0.00")
-  //   * some failed → valid subtotal + "Partial (N unavailable)"
-  //   * all succeeded → normal value (incl. genuine $0.00)
-  // Spec step 5 + step 21 — release-critical.
-  const successful = report.successful_accounts ?? 0
-  const failed = report.failed_accounts ?? 0
-  const allFailed = failed > 0 && successful === 0
-  const partial = successful > 0 && failed > 0
-
-  if (allFailed) {
+        />
+      )
+    }
     return (
       <MetricCard
         label={providerLabel}
         icon={<SpendIcon />}
         value="Unavailable"
-        description={`${label} · no subscription data`}
+        description={stale ? `${label} · no subscription data · Stale` : `${label} · no subscription data`}
+        tone="warning"
+
       />
     )
   }
-  if (partial) {
+  // ``report`` MUST be non-null when completeness is not 'unavailable'
+  // because deriveCostCompleteness returns 'unavailable' for a null
+  // input.  Narrow with a local variable so TS doesn't complain
+  // about the report. fields below.
+  const live = report as NonNullable<CostReportResponse['report']>
+  if (completeness.kind === 'partial') {
     return (
       <MetricCard
         label={providerLabel}
         icon={<SpendIcon />}
-        value={formatCurrencyCompact(report.total_cost, report.currency)}
-        description={`${label} · ${report.currency} · Partial (${failed} unavailable)`}
+        value={formatCurrencyCompact(live.total_cost, live.currency)}
+        description={`${label} · ${live.currency} · Partial (${completeness.failedAccounts} unavailable)`}
+        tone="warning"
+
       />
     )
   }
@@ -614,8 +698,9 @@ export function SpendKpi({
     <MetricCard
       label={providerLabel}
       icon={<SpendIcon />}
-      value={formatCurrencyCompact(report.total_cost, report.currency)}
-      description={`${label} · ${report.currency}`}
+      value={formatCurrencyCompact(live.total_cost, live.currency)}
+      description={`${label} · ${live.currency}`}
+
     />
   )
 }
@@ -1005,35 +1090,26 @@ function periodToKey(period: import('../types/finops').BillingPeriod): string {
   return period.kind === 'month' ? `month:${period.month}` : `days:${period.days}`
 }
 
-function statusLabel(status: string, error: Error | null): string {
-  if (error) return 'Unavailable'
-  switch (status) {
-    case 'success':
-      return 'Live'
-    case 'loading':
-      return 'Loading'
-    case 'refreshing':
-      return 'Refreshing'
-    case 'error':
-      return 'Unavailable'
-    default:
-      return 'Idle'
-  }
-}
-
-function statusTone(
-  status: string,
-  error: Error | null,
+/**
+ * Phase 7D.3.2 — single readiness-to-tone mapping used by BOTH
+ * the page-header status badge and the DashboardHero.  Replaces
+ * the cost-only ``statusTone`` that was used before so the two
+ * surface areas cannot disagree.
+ */
+function readinessToneFor(
+  readiness: DataReadinessKind,
 ): 'success' | 'info' | 'warning' | 'danger' | 'neutral' {
-  if (error) return 'danger'
-  switch (status) {
-    case 'success':
+  switch (readiness) {
+    case 'live':
       return 'success'
     case 'loading':
     case 'refreshing':
       return 'info'
-    case 'error':
+    case 'partial':
+      return 'warning'
+    case 'unavailable':
       return 'danger'
+    case 'idle':
     default:
       return 'neutral'
   }

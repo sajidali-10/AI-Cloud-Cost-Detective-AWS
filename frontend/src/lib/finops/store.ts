@@ -26,6 +26,32 @@
 // Phase 7A: cache primitives live in `./cache` so this module can
 // safely import `useAuth` for the auth-bootstrap gate without
 // creating an import cycle with `../auth`.
+//
+// Phase 7D.3.2: three release-critical invariants live here now:
+//
+//   1. **Last-known-good preservation.**  A successful fetch
+//      snapshots ``data`` into ``lastGood``; a failed refresh
+//      keeps ``lastGood`` intact so the UI can fall back to the
+//      previous authoritative value rather than rendering a fake
+//      zero.  ``invalidateCache`` resets ``data`` but leaves
+//      ``lastGood`` alone (preserved across the refresh attempt)
+//      unless the caller passes ``{ preserveLastGood: false }``.
+//
+//   2. **In-flight coalescing.**  ``runFetch`` checks
+//      ``entry.inflight``; if a fetch is already in flight for the
+//      same cache key (same provider / scope / period / region /
+//      domain), the second caller AWAITS the existing promise
+//      instead of starting a duplicate HTTP request.  Different
+//      cache keys remain independent (Costs, Resources,
+//      Recommendations, provider / scope / month / region).
+//
+//   3. **Silent stale-generation.**  A ``StaleGenerationError`` is
+//      a control-flow cancellation, not a user-facing failure.
+//      The store treats it like a no-op: it does NOT set
+//      ``entry.error``, does NOT overwrite ``entry.data``, and
+//      does NOT clear ``lastGood``.  The race-guard itself is
+//      preserved (the guard still fires and discards the stale
+//      response) — we only stop leaking the message to the UI.
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react'
 import { useAuth } from '../auth'
@@ -40,11 +66,46 @@ import {
 
 // Re-exports for backward-compatibility with the original Phase 6B
 // public API: tests and tools import these names from `./store`.
-export { invalidateCache, invalidateFinopsCache, _storeSize } from './cache'
+export {
+  invalidateCache,
+  invalidateFinopsCache,
+  invalidateFinopsCacheKeepLastGood,
+  _storeSize,
+} from './cache'
 export type { CachedEntry, LoadStatus } from './cache'
 export type FinopsSubscription<T> = {
   entry: CachedEntry<T>
   refresh: () => void
+}
+
+/**
+ * Phase 7D.3.2 — marker class for stale-response control-flow
+ * cancellations.  The DashboardPage race-guard throws this when a
+ * response arrives for a previous generation.  The store detects
+ * it (by name) and discards the result silently — no error state,
+ * no overwrite of last-good data, no error UI.
+ *
+ * The class lives here (next to the store that consumes it) so
+ * both the page-level race guard and the store share one symbol
+ * without creating a circular import.
+ */
+export class StaleGenerationError extends Error {
+  readonly startGen: number
+  readonly currentGen: number
+  constructor(startGen: number, currentGen: number) {
+    super(`stale-generation:${startGen}->${currentGen}`)
+    this.name = 'StaleGenerationError'
+    this.startGen = startGen
+    this.currentGen = currentGen
+  }
+}
+
+function isStaleGenerationError(err: unknown): boolean {
+  if (err instanceof StaleGenerationError) return true
+  if (err && typeof err === 'object' && (err as { name?: string }).name === 'StaleGenerationError') {
+    return true
+  }
+  return false
 }
 
 /**
@@ -68,50 +129,117 @@ async function runFetch<T>(
   entry: InternalEntry<T>,
   fetcher: () => Promise<T>,
 ): Promise<void> {
+  // Phase 7D.3.2 — coalesce identical concurrent requests.  If
+  // another fetch for the same cache key is already in flight,
+  // share its promise instead of issuing a duplicate HTTP call.
+  // This is the smallest safe mechanism that satisfies the spec
+  // step 4 ("same key concurrent calls → one upstream logical
+  // request") without globally serialising unrelated calls.
+  if (entry.inflight) {
+    return entry.inflight
+  }
+
   entry.status = entry.data ? 'refreshing' : 'loading'
   entry.error = null
-  entry.snapshot = { status: entry.status, data: entry.data, error: null, refreshedAt: entry.refreshedAt }
-  try {
-    const data = await fetcher()
-    entry.data = data
-    entry.status = 'success'
-    entry.refreshedAt = nowIso()
-    entry.error = null
-    entry.snapshot = {
-      status: 'success',
-      data,
-      error: null,
-      refreshedAt: entry.refreshedAt,
-    }
-  } catch (err) {
-    // Phase 7A: 401/403 errors must not stick around as "stale
-    // successful" entries — wipe both data and refreshedAt so the
-    // next mount re-fetches once a valid token is available.
-    if (isAuthFailure(err)) {
-      entry.data = null
-      entry.status = 'error'
-      entry.refreshedAt = null
-      entry.error = err instanceof Error ? err : new Error(String(err))
-      entry.snapshot = {
-        status: 'error',
-        data: null,
-        error: entry.error,
-        refreshedAt: null,
-      }
-    } else {
-      entry.status = 'error'
-      entry.error = err instanceof Error ? err : new Error(String(err))
-      entry.snapshot = {
-        status: 'error',
-        data: entry.data,
-        error: entry.error,
-        refreshedAt: entry.refreshedAt,
-      }
-    }
-  } finally {
-    entry.inflight = null
-    emit(entry)
+  entry.snapshot = {
+    status: entry.status,
+    data: entry.data,
+    error: null,
+    refreshedAt: entry.refreshedAt,
+    lastGood: entry.lastGood,
+    lastGoodRefreshedAt: entry.lastGoodRefreshedAt,
   }
+
+  const promise = (async () => {
+    try {
+      const data = await fetcher()
+      entry.data = data
+      entry.status = 'success'
+      entry.refreshedAt = nowIso()
+      entry.error = null
+      // Phase 7D.3.2 — snapshot the successful response as the
+      // new last-known-good.  This is what a future failed
+      // refresh will fall back to.
+      entry.lastGood = data
+      entry.lastGoodRefreshedAt = entry.refreshedAt
+      entry.snapshot = {
+        status: 'success',
+        data,
+        error: null,
+        refreshedAt: entry.refreshedAt,
+        lastGood: entry.lastGood,
+        lastGoodRefreshedAt: entry.lastGoodRefreshedAt,
+      }
+    } catch (err) {
+      // Phase 7D.3.2 — silent stale-generation.  A late response
+      // for a previous generation is an expected cancellation
+      // event, not a user-facing failure.  Preserve the existing
+      // data + lastGood snapshot, do NOT set entry.error, do NOT
+      // emit as a failure.  The guard itself (generation check in
+      // the page) still fires — we just stop leaking the message.
+      if (isStaleGenerationError(err)) {
+        // If the entry has data, restore 'success' status.  If it
+        // doesn't (first load was stale-cancelled), flip to 'idle'
+        // so the page renders its existing loading skeleton instead
+        // of pretending there was a real error.
+        entry.status = entry.data ? 'success' : 'idle'
+        entry.snapshot = {
+          status: entry.status,
+          data: entry.data,
+          error: null,
+          refreshedAt: entry.refreshedAt,
+          lastGood: entry.lastGood,
+          lastGoodRefreshedAt: entry.lastGoodRefreshedAt,
+        }
+        return
+      }
+      // Phase 7A: 401/403 errors must not stick around as "stale
+      // successful" entries — wipe both data and refreshedAt so
+      // the next mount re-fetches once a valid token is available.
+      if (isAuthFailure(err)) {
+        entry.data = null
+        entry.status = 'error'
+        entry.refreshedAt = null
+        entry.error = err instanceof Error ? err : new Error(String(err))
+        entry.snapshot = {
+          status: 'error',
+          data: null,
+          error: entry.error,
+          refreshedAt: null,
+          lastGood: entry.lastGood,
+          lastGoodRefreshedAt: entry.lastGoodRefreshedAt,
+        }
+      } else {
+        // Phase 7D.3.2 — generic non-auth error: keep both
+        // ``data`` (most recent fetch attempt) and ``lastGood``
+        // (previous authoritative snapshot) intact.  Only
+        // ``status`` flips to 'error' so the page-level banner
+        // can show "Refresh temporarily unavailable" while the
+        // KPI tiles / chart continue to render the lastGood
+        // value with a "Stale" caption.
+        entry.status = entry.data ? 'refreshing' : 'error'
+        entry.error = err instanceof Error ? err : new Error(String(err))
+        entry.snapshot = {
+          status: entry.status,
+          data: entry.data,
+          error: entry.error,
+          refreshedAt: entry.refreshedAt,
+          lastGood: entry.lastGood,
+          lastGoodRefreshedAt: entry.lastGoodRefreshedAt,
+        }
+      }
+    } finally {
+      entry.inflight = null
+      emit(entry)
+    }
+  })()
+
+  entry.inflight = promise
+  // Re-emit on every transition so consumers see the 'loading' /
+  // 'refreshing' status immediately.  The finally block re-emits
+  // again when the fetch settles.
+  emit(entry)
+  return promise
 }
 
 function nowIso(): string {
