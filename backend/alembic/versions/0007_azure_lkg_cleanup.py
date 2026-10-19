@@ -49,7 +49,7 @@ from alembic import op
 
 
 # revision identifiers, used by Alembic.
-revision = "0007_azure_invalidate_invalid_lkg"
+revision = "0007_azure_lkg_cleanup"
 down_revision = "0006_azure_cost_cache_resilience"
 branch_labels = None
 depends_on = None
