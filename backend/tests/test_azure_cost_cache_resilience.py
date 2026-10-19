@@ -389,7 +389,7 @@ async def test_successful_zero_cached_as_authoritative_lkg(session_factory):
 
 @pytest.mark.asyncio
 async def test_throttled_zero_not_cached_as_lkg(session_factory):
-    """all subs THROTTLED → NOT cached as LKG, raises."""
+    """all subs THROTTLED → NOT cached as LKG, NO row written."""
     # PARTIAL_SUCCESS with successful=0 is NOT authoritative (Phase 7D.3.2)
     loader = StubLoader(returns=_azure_envelope(
         total_cost="0.00",
@@ -398,10 +398,11 @@ async def test_throttled_zero_not_cached_as_lkg(session_factory):
         failed=2,
     ))
     with session_factory() as session:
-        # Should still raise because _is_authoritative_success returns False
-        # and the loader returns a "throttled-zero" envelope.
-        # Actually the loader returned successfully (it didn't raise),
-        # so the cache layer will REFRESH it but NOT promote to stale_payload.
+        # Phase 7D.3.3 (closure fix) — the loader returned successfully
+        # but the envelope is NOT authoritative, so the cache layer
+        # returns the live payload WITHOUT writing to the DB.  A
+        # subsequent request MUST NOT HIT-serve this throttled-zero
+        # as authoritative LKG.
         entry = await get_or_refresh_azure_canonical(
             scope="all",
             region="",
@@ -413,11 +414,10 @@ async def test_throttled_zero_not_cached_as_lkg(session_factory):
     assert entry.cache_status == AzureCacheStatus.REFRESHED
     with session_factory() as session:
         row = session.execute(text(
-            "SELECT stale_payload FROM cost_cache WHERE cache_namespace='azure'"
+            "SELECT count(*) AS n FROM cost_cache WHERE cache_namespace='azure'"
         )).first()
         assert row is not None
-        # stale_payload is NULL because the response was not authoritative
-        assert row.stale_payload is None, "throttled-zero MUST NOT advance stale_payload"
+        assert int(row.n) == 0, "throttled-zero MUST NOT write any row to cost_cache"
 
 
 @pytest.mark.asyncio
@@ -536,6 +536,84 @@ async def test_corrupt_cache_row_safe_miss(session_factory):
     # Behaviour: the cache layer calls the loader and refreshes.
     # It does NOT crash on the corrupt row.
     assert entry is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_throttled_zero_payload_rejected_on_read(session_factory):
+    """Phase 7D.3.3 (closure fix) — a legacy row with a
+    throttled-zero payload MUST NOT be served as a cache HIT.
+    The read path re-validates against ``_is_authoritative_success``
+    and falls through to the loader when the cached payload is
+    non-authoritative.
+    """
+    # Insert a "legacy" row whose payload is a throttled-zero —
+    # the kind of row the buggy predicate wrote before the closure
+    # fix.  It is still within the fresh window so the read path
+    # would normally HIT it.
+    legacy_ck = build_azure_cache_key(
+        provider="AZURE", scope="all", region="", kind="month", signature="2026-10|31"
+    )
+    legacy_payload = {
+        "provider": "AZURE", "scope": "all", "scope_kind": "all",
+        "status": "PARTIAL_SUCCESS", "currency_status": "OK",
+        "account_id": None, "account_display_name": None,
+        "period": {"start": "2026-10-01", "end": "2026-11-01", "days": 31},
+        "previous_period": {"start": "2026-09-01", "end": "2026-10-01", "days": 30},
+        "currency": "USD",
+        "total_cost": "0.00", "previous_period_cost": None,
+        "change_amount": None, "change_percent": None,
+        "estimated": False, "daily_trend": [],
+        "by_service": [], "by_region": [],
+        "by_account": [],
+        "account_errors": [
+            {"subscription_id": "sub:a", "display_name": "A", "code": "THROTTLED", "message": "THROTTLED"},
+            {"subscription_id": "sub:b", "display_name": "B", "code": "THROTTLED", "message": "THROTTLED"},
+        ],
+        "source": "AZURE_COST_MANAGEMENT",
+        "successful_accounts": 0, "failed_accounts": 2,
+    }
+    with session_factory() as session:
+        session.execute(text(
+            "INSERT INTO cost_cache (cache_namespace, account_id, cache_key, "
+            "query_type, period_start, period_end, payload, expires_at, "
+            "azure_post_count) "
+            "VALUES ('azure', 'azure:all', :ck, 'AZURE', :ps, :pe, "
+            ":payload, :exp, 0)"
+        ), {
+            "ck": legacy_ck,
+            "ps": datetime(2026, 10, 1),
+            "pe": datetime(2026, 11, 1),
+            "payload": json.dumps(legacy_payload),
+            "exp": datetime.now(timezone.utc) + timedelta(seconds=300),
+        })
+        session.commit()
+    # The cache layer MUST treat this row as a MISS even though
+    # ``expires_at > now`` — the payload is non-authoritative.
+    loader = StubLoader(returns=_azure_envelope(
+        total_cost="99.99", status="SUCCESS", successful=2, failed=0
+    ))
+    with session_factory() as session:
+        entry = await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=loader,
+            db=session,
+        )
+    assert entry.cache_status == AzureCacheStatus.REFRESHED
+    assert entry.payload["total_cost"] == "99.99", (
+        "loader MUST be called and the fresh authoritative payload returned"
+    )
+    # The bad legacy row must have been overwritten with the
+    # authoritative payload.
+    with session_factory() as session:
+        row = session.execute(text(
+            "SELECT payload FROM cost_cache WHERE cache_namespace='azure' "
+            "AND cache_key = :ck"
+        ), {"ck": legacy_ck}).first()
+        assert row is not None
+        assert _row_payload(row.payload)["total_cost"] == "99.99"
 
 
 @pytest.mark.asyncio

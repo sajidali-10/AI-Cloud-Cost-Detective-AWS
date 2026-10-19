@@ -268,6 +268,20 @@ def _is_authoritative_success(payload: dict) -> bool:
     * ``status='PARTIAL_SUCCESS'`` AND ``successful_accounts > 0`` → LKG
     * ``status='NO_DATA'`` with no account errors AND ``successful > 0`` → LKG
     * everything else (throttled, all-failed, ERROR) → NOT LKG
+
+    The payload is the serialised canonical Azure envelope
+    (``CloudCostReport.model_dump(mode='json')``), which is a flat
+    dict with ``status``, ``successful_accounts``, ``failed_accounts``,
+    ``account_errors`` at the top level — NOT nested under
+    ``payload['report']``.  Phase 7D.3.3 (closure fix) had a bug
+    here: the predicate read ``payload.get('status')`` which always
+    returned ``None`` (the field is at ``payload['status']`` on the
+    flat envelope), so EVERY response was classified as non-LKG
+    and the stale-LKG fallback was never promoted.  That made the
+    `stale_payload` column never advance for invalid throttled-zero
+    responses either — but the bad response was still written to
+    the ``payload`` column as a fresh entry, so the next call HIT
+    it.  This fix restores the contract.
     """
     status = str(payload.get("status", "")).upper()
     successful = payload.get("successful_accounts")
@@ -540,8 +554,23 @@ async def get_or_refresh_azure_canonical(
 
             now = datetime.now(timezone.utc)
 
-            # FRESH — ``expires_at > now`` → no upstream call
-            if row is not None and row["expires_at"] is not None and _ts(row["expires_at"]) > now:
+            # FRESH — ``expires_at > now`` → no upstream call.
+            #
+            # Phase 7D.3.3 (closure fix) — a legacy row (written by
+            # a buggy predicate in the previous phase, or surviving
+            # from before the authority check) may carry a
+            # throttled-zero payload.  We MUST NOT serve that as an
+            # authoritative LKG.  Re-validate the cached payload
+            # against ``_is_authoritative_success`` here; treat a
+            # non-authoritative row as a cache MISS so the next
+            # upstream call can replace it with a real success.
+            if (
+                row is not None
+                and row["payload"] is not None
+                and row["expires_at"] is not None
+                and _ts(row["expires_at"]) > now
+                and _is_authoritative_success(row["payload"])
+            ):
                 logger.info(
                     "azure.cost.cache HIT key=%s namespace=%s",
                     cache_key, CACHE_NAMESPACE,
@@ -554,6 +583,13 @@ async def get_or_refresh_azure_canonical(
                     azure_post_count=int(row["azure_post_count"] or 0),
                     cache_key=cache_key,
                     storage_account_id=storage_account_id,
+                )
+            elif row is not None and row["payload"] is not None:
+                # Legacy / invalid row present.  Fall through to
+                # the loader so the next call can refresh it.
+                logger.warning(
+                    "azure.cost.cache legacy_invalid_payload key=%s — treating as MISS",
+                    cache_key,
                 )
 
             # MISS / STALE — call the loader
@@ -587,7 +623,38 @@ async def get_or_refresh_azure_canonical(
                 raise
 
             # REFRESHED — persist the payload + LKG copy
+            #
+            # Phase 7D.3.3 (closure fix) — only authoritative
+            # responses may advance the cache.  Non-authoritative
+            # responses (throttled-zero, all-failed, ERROR) MUST
+            # NOT overwrite the ``payload`` column because that
+            # column is what ``cache_status=HIT`` returns to the
+            # next caller.  If we wrote a throttled-zero here, the
+            # next request would HIT-serve it as authoritative LKG.
+            #
+            # The fix: skip the DB write entirely for non-authoritative
+            # responses and return the live payload without
+            # advancing ``stale_payload`` / ``stale_until``.  The
+            # next request will try again from the loader.
             authoritative = _is_authoritative_success(fresh_payload)
+            if not authoritative:
+                logger.warning(
+                    "azure.cost.cache non_authoritative_skip key=%s status=%s successful=%s",
+                    cache_key,
+                    fresh_payload.get("status"),
+                    fresh_payload.get("successful_accounts"),
+                )
+                return AzureCacheEntry(
+                    payload=fresh_payload,
+                    cache_status=AzureCacheStatus.REFRESHED,
+                    data_freshness=AzureDataFreshness.LIVE,
+                    last_successful_at=None,
+                    azure_post_count=int(
+                        fresh_payload.get("azure_post_count") or 0
+                    ),
+                    cache_key=cache_key,
+                    storage_account_id=storage_account_id,
+                )
             post_count = int(fresh_payload.get("azure_post_count") or 0)
             new_expires_at = now + timedelta(seconds=fresh)
             new_stale_until = now + timedelta(seconds=stale)
@@ -604,12 +671,8 @@ async def get_or_refresh_azure_canonical(
                     period_end=_parse_iso(fresh_payload.get("period", {}).get("end")) or now,
                     expires_at=new_expires_at,
                     last_successful_at=now,
-                    stale_payload=fresh_payload if authoritative else (
-                        row["stale_payload"] if row is not None else None
-                    ),
-                    stale_until=new_stale_until if authoritative else (
-                        row["stale_until"] if row is not None else None
-                    ),
+                    stale_payload=fresh_payload,
+                    stale_until=new_stale_until,
                     azure_post_count=post_count,
                 )
                 session.commit()
