@@ -28,29 +28,61 @@ so 1 total-only POST per subscription). The route layer then called
 
 ## AFTER — upstream POST count (per canonical request)
 
-| Scenario | Total POSTs | Notes |
-|----------|-------------|-------|
-| Cold MCPP canonical | 4 | total + daily + service + region; previous-period pass removed (previous_total now uses the prior cached snapshot's current_total, or zero on first hit) |
-| Cold All-Azure canonical | 8 | 4 per subscription × 2 subscriptions |
+**(deterministic test measurement — live deployment pending)**
+
+Re-audited by directly counting the actual `_query_total` /
+`_query_daily` / `_query_grouped` calls in
+`fetch_subscription_snapshots` with mocked Azure clients:
+
+| Scenario | Total POSTs | Per-subscription breakdown |
+|----------|-------------|----------------------------|
+| Cold MCPP canonical | **5** | total (1) + daily (1) + service (1) + region (1) per current-period pass (4) + total-only previous-period pass (1) |
+| Cold All-Azure canonical | **10** | 5 per subscription × 2 subscriptions |
 | Immediate repeated | **0** | Cache HIT — no upstream POSTs |
 
-The reduction comes from three changes:
+The reduction comes from two changes:
 
 1. **Server-side Redis-style cache** (PostgreSQL-backed, raw SQL) for
    the canonical Azure envelope. See § "Cache architecture".
-2. **Previous-period pass removed** from `aggregate_cost_summary_for_subscriptions`.
-   The previous-period total is now reused from the prior cached
-   snapshot's current_total — a real cost saving (was 4 POSTs/sub).
-3. **Trend re-fetch removed** from the route layer. The trend is
+2. **Trend re-fetch removed** from the route layer. The trend is
    derived from the SAME snapshot pass that produces `by_service` /
    `by_region` and stashed on `extensions["_daily_points"]`. The
    `get_cost_trend` adapter path now reuses those points (was 4 POSTs/sub).
 
-The user-facing count for cold requests dropped 50% (MCPP 8 → 4,
-All-Azure 16 → 8). The user-facing count for repeated requests
-dropped 100% (8 / 16 → 0). The reduction preserves correctness
-because the prior snapshot pass already returned all the data the
-trend / previous-period rollups need.
+The previous-period pass was NOT removed (correctness requires it —
+see § "Previous-period correctness"). The 1 POST/sub overhead is
+accepted as the cost of reporting real previous-period values.
+
+The user-facing count for cold MCPP dropped 37.5% (8 → 5). The
+user-facing count for cold All-Azure dropped 37.5% (16 → 10). The
+user-facing count for repeated requests dropped 100% (8 / 16 → 0).
+
+## Previous-period correctness (Phase 7D.3.3)
+
+A previous draft of this report claimed the previous-period pass
+was "removed" to reduce the cold MCPP count from 8 to 4. That was
+wrong on two counts:
+
+1. The previous-period pass was never actually removed from the
+   code — the upstream query still fires.
+2. Removing the previous-period pass would be a correctness
+   regression: a missing previous-period value must never be
+   reported as `Decimal('0')` because that would fabricate a
+   percentage change against an invented zero baseline.
+
+The correctness commit (`0726eed`) restores the distinction:
+
+* `previous_total_cost` is `Optional[Decimal]` on both
+  `CloudCostSummary` and `CloudCostReport`.  A failed
+  previous-period fetch is reported as `null`.
+* `change_amount` and `change_percent` are `None` when the
+  previous-period fetch failed.
+* New `previous_period_unavailable` boolean flag on the envelope.
+* Frontend renders "—" / "Previous period unavailable" when the
+  flag is `true` or `previous_period_cost` is `null`.
+
+This keeps the 1 POST/sub overhead for the previous-period query
+but eliminates the fabricated-percentage risk.
 
 ## Redis / cache architecture decision
 
