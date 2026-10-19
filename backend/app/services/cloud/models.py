@@ -136,12 +136,14 @@ class CloudCostSummary:
     period_end: date
     currency: str
     current_total: Decimal
-    previous_total: Decimal
-    change_amount: Decimal
-    change_percent: Optional[Decimal]
-    estimated: bool
-    by_service: List[CloudServiceCost]
-    by_region: List[CloudServiceCost]
+    estimated: bool = False
+    # Phase 7D.3.3 (correctness) — Optional so a failed previous-
+    # period fetch is distinguishable from a genuine zero.
+    previous_total: Optional[Decimal] = None
+    change_amount: Optional[Decimal] = None
+    change_percent: Optional[Decimal] = None
+    by_service: List[CloudServiceCost] = field(default_factory=list)
+    by_region: List[CloudServiceCost] = field(default_factory=list)
     extensions: Mapping[str, Any] = field(default_factory=dict)
 
 

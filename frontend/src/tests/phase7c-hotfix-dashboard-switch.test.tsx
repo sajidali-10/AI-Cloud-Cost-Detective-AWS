@@ -9,22 +9,19 @@
 // expected`` — the entire tree unmounted and only a manual
 // browser refresh restored the UI.
 //
-// The fix extracts the per-provider renders into separate child
-// components (``AwsDashboard`` / ``AzureDashboard``) and wraps
-// them in a dashboard-level error boundary so an exception
-// cannot permanently blank the page.
+// Phase 7D.3 unifies the dashboard into a single provider-aware
+// component tree (no more AWS / Azure split child components), so
+// the hook-order invariant holds across every provider switch by
+// construction.  These tests verify that:
 //
-// These tests verify the hotfix by:
-//
-// 1. Rendering Dashboard with AWS.
-// 2. Switching to Azure mid-render (via ProviderContext state).
-// 3. Switching back to AWS.
-// 4. Asserting that no React error is thrown and the dashboard
-//    renders content for whichever provider is active.
-//
-// Without the fix, the second render throws the React hook-count
-// exception and the dashboard returns an error boundary fallback
-// (or, before the boundary was added, blank page).
+//   1. AWS renders without crashing and stamps the data-provider
+//      attribute as "AWS".
+//   2. Azure renders without crashing and stamps the data-provider
+//      attribute as "AZURE".
+//   3. Provider switches never throw a React hook-count exception
+//      and never permanently blank the page — when a canonical
+//      request fails, the page still renders the navigation and
+//      page chrome.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, screen, waitFor } from '@testing-library/react'
@@ -37,9 +34,6 @@ function mockJson(status: number, body: unknown): Response {
   })
 }
 
-// Build a fetcher stub that responds to every endpoint the
-// DashboardPage family hits.  The stub returns the smallest valid
-// shape per provider so the dashboard renders without throwing.
 function buildFetchMock(opts: {
   provider: 'AWS' | 'AZURE'
   selection?: string | null
@@ -78,6 +72,9 @@ function buildFetchMock(opts: {
     if (url.includes('/api/cloud/accounts/selectable')) {
       return mockJson(200, { items: [], count: 0 })
     }
+    if (url.includes('/api/aws/cloud-accounts/selectable')) {
+      return mockJson(200, { items: [], count: 0 })
+    }
     if (url.includes('/api/cloud/costs')) {
       return mockJson(200, {
         report: {
@@ -106,6 +103,56 @@ function buildFetchMock(opts: {
         cache_status: 'REFRESHED',
         cached_at: '2026-10-17T00:00:00Z',
         expires_at: '2026-10-17T01:00:00Z',
+      })
+    }
+    if (url.includes('/api/cloud/resources')) {
+      return mockJson(200, {
+        summary: {
+          provider: opts.provider,
+          scope: 'all',
+          scope_kind: 'all',
+          status: 'SUCCESS',
+          total_resources: 0,
+          by_type: [],
+          by_location: [],
+          by_resource_group: [],
+          by_subscription: [],
+          subscription_errors: [],
+          source: opts.provider === 'AWS' ? 'AWS_RESOURCE_GROUP' : 'AZURE_RESOURCE_GRAPH',
+        },
+        resources: [],
+      })
+    }
+    if (url.includes('/api/cloud/recommendations')) {
+      return mockJson(200, {
+        summary: {
+          provider: opts.provider,
+          scope: 'all',
+          scope_kind: 'all',
+          status: 'SUCCESS',
+          savings_status: 'OK',
+          currency: 'USD',
+          total_recommendations: 0,
+          recommendations_with_savings: 0,
+          recommendations_without_savings: 0,
+          potential_annual_savings: null,
+          potential_savings: '0',
+          savings_period: 'MONTHLY',
+          savings_by_currency: [],
+          by_impact: [],
+          by_resource_type: [],
+          by_subscription: [],
+          by_resource_group: [],
+          by_type: [],
+          by_subcategory: [],
+          subscription_errors: [],
+          by_account: [],
+          by_source: [],
+          by_action: [],
+          account_errors: [],
+          source: opts.provider === 'AWS' ? 'AWS_COST_OPTIMIZATION_HUB' : 'AZURE_ADVISOR',
+        },
+        recommendations: [],
       })
     }
     return mockJson(200, {})
@@ -153,9 +200,16 @@ describe('Phase 7C post-release hotfix — DashboardPage provider switching', ()
       transport: fetchMock as unknown as typeof fetch,
     })
     const { DashboardPage } = await import('../pages/DashboardPage')
-    await renderWithAuthEnabled(<DashboardPage />)
+    const view = await renderWithAuthEnabled(<DashboardPage />)
     await waitFor(() => {
-      // The page renders the heading "Dashboard" + KPI labels.
+      // The unified dashboard stamps `data-provider="AWS"` so
+      // tests can assert the active provider without depending on
+      // per-provider headings (the Phase 7C split-component
+      // layout was retired in Phase 7D.3).
+      const root = view.container.querySelector('[data-testid="unified-dashboard"]')
+      expect(root?.getAttribute('data-provider')).toBe('AWS')
+    })
+    await waitFor(() => {
       expect(screen.getAllByText(/Dashboard/).length).toBeGreaterThan(0)
     })
   })
@@ -172,10 +226,17 @@ describe('Phase 7C post-release hotfix — DashboardPage provider switching', ()
       transport: fetchMock as unknown as typeof fetch,
     })
     const { DashboardPage } = await import('../pages/DashboardPage')
-    await renderWithAuthEnabled(<DashboardPage />)
+    const view = await renderWithAuthEnabled(<DashboardPage />)
     await waitFor(() => {
-      // Azure-specific heading.
-      expect(screen.getAllByText(/Azure Dashboard/).length).toBeGreaterThan(0)
+      const root = view.container.querySelector('[data-testid="unified-dashboard"]')
+      expect(root?.getAttribute('data-provider')).toBe('AZURE')
+    })
+    // Friendly Azure scope attribution always renders on the page
+    // header.  The unified dashboard replaces the Phase 7C
+    // per-provider "Azure Dashboard" heading with this friendly
+    // label, preserving the executive visual rhythm.
+    await waitFor(() => {
+      expect(screen.getAllByText(/All Azure Subscriptions/).length).toBeGreaterThan(0)
     })
   })
 
@@ -185,13 +246,14 @@ describe('Phase 7C post-release hotfix — DashboardPage provider switching', ()
     // provider mid-session threw a React "Rendered fewer hooks
     // than expected" exception that unmounted the entire tree.
     // The hotfix wraps the dashboard in an error boundary that
-    // surfaces a professional error state.  This test simulates a
-    // throwing child to confirm the boundary fallback works.
+    // surfaces a professional error state.  Phase 7D.3 removes
+    // the per-provider split (one tree, one hook order) but
+    // keeps the boundary so any future regression still renders
+    // *something*.  This test forces a 500 from /api/cloud/costs
+    // and asserts the page chrome stays rendered.
     if (typeof window !== 'undefined') {
       window.sessionStorage.setItem('cd.provider.selection.v1', 'AWS')
     }
-    // Force a 500 from /api/cloud/costs to trigger an exception in
-    // the rendered tree.
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('/api/cloud/providers')) {
         return mockJson(200, {
@@ -199,11 +261,20 @@ describe('Phase 7C post-release hotfix — DashboardPage provider switching', ()
           count: 1,
         })
       }
+      if (url.includes('/api/aws/cloud-accounts/selectable')) {
+        return mockJson(200, { items: [], count: 0 })
+      }
       if (url.includes('/api/cloud/accounts/selectable')) {
         return mockJson(200, { items: [], count: 0 })
       }
       if (url.includes('/api/cloud/costs')) {
         return mockJson(500, { status: 'error', error_code: 'UPSTREAM_ERROR' })
+      }
+      if (url.includes('/api/cloud/resources')) {
+        return mockJson(500, { status: 'error' })
+      }
+      if (url.includes('/api/cloud/recommendations')) {
+        return mockJson(500, { status: 'error' })
       }
       return mockJson(200, {})
     })

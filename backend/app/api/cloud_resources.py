@@ -210,30 +210,99 @@ def _resolve_rows(
 
 
 def _build_aws_envelope(summary, *, resources, rows, scope) -> CloudResourceListResponse:
-    """Translate AWS adapter output into the canonical envelope."""
+    """Translate AWS adapter output into the canonical envelope.
+
+    Phase 7D.3.1 — defence-in-depth resource summaries.
+
+    The AWS aggregator does not currently populate ``by_type`` /
+    ``by_location`` / ``by_subscription`` in its extensions, even
+    when ``resources[]`` is populated.  Derive these summaries
+    server-side from the canonical resource list so the invariant
+    ``sum(by_type counts) <= total_resources`` always holds,
+    regardless of the aggregator's output.  An explicit
+    ``Unassigned`` bucket preserves resources that lack a
+    resource_type rather than silently dropping them.
+    """
     from app.services.cloud.models import CloudProviderKind as _CPK
 
     extensions = summary.extensions or {}
-    by_type = [
-        CloudResourceGroupCount(key=item["key"], count=item["count"])
-        for item in extensions.get("by_type", [])
-    ]
-    by_location = [
-        CloudResourceGroupCount(key=item["key"], count=item["count"])
-        for item in extensions.get("by_location", [])
-    ]
-    by_resource_group = [
-        CloudResourceGroupCount(key=item["key"], count=item["count"])
-        for item in extensions.get("by_resource_group", [])
-    ]
-    by_subscription = [
-        CloudResourceSubscriptionShare(
-            subscription_id=item.get("subscription_id") or item.get("account_id") or "",
-            display_name=item.get("display_name", ""),
-            count=item["count"],
+
+    # Build canonical summaries from the normalised resources list.
+    type_counts: dict[str, int] = {}
+    location_counts: dict[str, int] = {}
+    subscription_counts: dict[str, dict[str, str]] = {}  # account_id -> {display_name, count}
+    unassigned_count = 0
+    for resource in resources:
+        rt = (resource.resource_type or "").strip()
+        if rt:
+            type_counts[rt] = type_counts.get(rt, 0) + 1
+        else:
+            unassigned_count += 1
+        loc = (resource.region or "").strip()
+        if loc:
+            location_counts[loc] = location_counts.get(loc, 0) + 1
+        else:
+            location_counts.setdefault("Unassigned", 0)
+            location_counts["Unassigned"] += 1
+        if resource.account_id:
+            entry = subscription_counts.setdefault(
+                resource.account_id,
+                {"display_name": resource.account_id, "count": 0},
+            )
+            entry["count"] += 1
+            # Best-effort: prefer the AWS account_display_name from
+            # the resource metadata when the aggregator stamped it.
+            meta = resource.metadata or {}
+            display = meta.get("account_display_name") if isinstance(meta, dict) else None
+            if display:
+                entry["display_name"] = str(display)
+    if unassigned_count > 0:
+        type_counts["Unassigned"] = unassigned_count
+
+    # Merge with aggregator-supplied breakdowns (if any) so we don't
+    # regress on richer upstream summaries.
+    def _merge_group(ext_key: str, derived: dict[str, int]) -> list:
+        merged: dict[str, int] = dict(derived)
+        for item in extensions.get(ext_key, []) or []:
+            key = item.get("key")
+            if not key:
+                continue
+            merged[key] = merged.get(key, 0) + int(item.get("count", 0))
+        return [
+            CloudResourceGroupCount(key=k, count=v)
+            for k, v in sorted(merged.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+    by_type = _merge_group("by_type", type_counts)
+    by_location = _merge_group("by_location", location_counts)
+    by_resource_group = _merge_group("by_resource_group", {})
+    by_subscription = []
+    for account_id, payload in sorted(subscription_counts.items()):
+        by_subscription.append(
+            CloudResourceSubscriptionShare(
+                subscription_id=account_id,
+                display_name=payload["display_name"],
+                count=payload["count"],
+            )
         )
-        for item in extensions.get("by_subscription", [])
-    ]
+    # If the aggregator already has subscription counts, layer
+    # them on top so we never lose upstream metadata.
+    for item in extensions.get("by_subscription", []) or []:
+        sid = item.get("subscription_id") or item.get("account_id") or ""
+        if not sid:
+            continue
+        existing = next((s for s in by_subscription if s.subscription_id == sid), None)
+        if existing is None:
+            by_subscription.append(
+                CloudResourceSubscriptionShare(
+                    subscription_id=sid,
+                    display_name=item.get("display_name", sid),
+                    count=item.get("count", 0),
+                )
+            )
+        else:
+            existing.count += item.get("count", 0)
+
     subscription_errors = [
         CloudResourceSubscriptionError(
             subscription_id=item.get("subscription_id") or item.get("account_id") or "",
@@ -243,12 +312,17 @@ def _build_aws_envelope(summary, *, resources, rows, scope) -> CloudResourceList
         )
         for item in extensions.get("subscription_errors", [])
     ]
+    # Derive total_resources defensively: prefer the aggregator's
+    # figure, fall back to the canonical count of returned items.
+    total_resources = extensions.get("total_resources", len(resources))
+    if total_resources == 0 and resources:
+        total_resources = len(resources)
     summary_envelope = CloudResourceSummaryEnvelope(
         provider="AWS",
         scope=scope,
         scope_kind="all" if scope == "all" else "single",
         status=extensions.get("status", "SUCCESS"),
-        total_resources=extensions.get("total_resources", len(resources)),
+        total_resources=total_resources,
         by_type=by_type,
         by_location=by_location,
         by_resource_group=by_resource_group,

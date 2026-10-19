@@ -23,6 +23,7 @@
 
 import { HiplinkLogo } from './HiplinkLogo'
 import { StatusBadge } from './StatusBadge'
+import type { DataReadinessKind } from '../lib/finops/costCompleteness'
 
 export interface DashboardHeroProps {
   /** Optional account id (already masked by the caller). */
@@ -31,28 +32,32 @@ export interface DashboardHeroProps {
   regionLabel?: string | null
   /** Optional "last refreshed" human-readable string. */
   refreshedLabel?: string | null
-  /** Optional data status — used to colour the pill. */
-  dataStatus?: 'live' | 'loading' | 'refreshing' | 'unavailable' | 'idle'
+  /** Optional data status — used to colour the pill.  Phase 7D.3.2
+   *  expanded the union to include 'partial' so the same readiness
+   *  derivation flows into the hero without ad-hoc mapping. */
+  dataStatus?: DataReadinessKind
   // Post-Phase 7C cleanup — provider-aware tagline so the Azure
   // dashboard does not render AWS-specific copy.  Defaults to AWS
   // for backwards compatibility with older callers.
   provider?: 'AWS' | 'AZURE' | 'RACKSPACE'
 }
 
-const STATUS_LABEL: Record<NonNullable<DashboardHeroProps['dataStatus']>, string> = {
+const STATUS_LABEL: Record<DataReadinessKind, string> = {
   live: 'Live',
   loading: 'Loading',
   refreshing: 'Refreshing',
   unavailable: 'Unavailable',
   idle: 'Idle',
+  partial: 'Partial',
 }
 
-const STATUS_TONE: Record<NonNullable<DashboardHeroProps['dataStatus']>, 'success' | 'info' | 'warning' | 'danger' | 'neutral'> = {
+const STATUS_TONE: Record<DataReadinessKind, 'success' | 'info' | 'warning' | 'danger' | 'neutral'> = {
   live: 'success',
   loading: 'info',
   refreshing: 'info',
   unavailable: 'danger',
   idle: 'neutral',
+  partial: 'warning',
 }
 
 export function DashboardHero(props: DashboardHeroProps) {

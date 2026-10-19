@@ -50,14 +50,32 @@ export interface CloudCostReport {
   by_region: Array<{ region: string; amount: string; unit: string }>
   by_account: CloudAccountShare[]
   account_errors: CloudAccountError[]
+  /** Phase 7D.3.2 — when the backend (or a test fixture) populates
+   *  these explicitly, the frontend MUST trust them.  The
+   *  ``by_account``-based derivation below is only a fallback so
+   *  older test fixtures that omit the counts continue to work. */
+  successful_accounts?: number | null
+  failed_accounts?: number | null
   source: string
 }
 
 export interface CloudCostReportResponse {
   report: CloudCostReport
-  cache_status: 'HIT' | 'MISS' | 'REFRESHED'
+  cache_status: 'HIT' | 'MISS' | 'REFRESHED' | 'STALE'
   cached_at: string | null
   expires_at: string | null
+  /** Phase 7D.3.3 — coarse freshness signal the frontend renders.
+   *  ``undefined`` for AWS responses (legacy) and for older
+   *  Azure fixtures — treated as ``'LIVE'`` by the readiness
+   *  derivation. */
+  data_freshness?: 'LIVE' | 'CACHED' | 'STALE' | 'UNAVAILABLE' | null
+  /** Phase 7D.3.3 — timestamp of the most recent successful
+   *  upstream call.  ``null`` for AWS responses or when the
+   *  cache has never seen a success. */
+  last_successful_at?: string | null
+  /** Phase 7D.3.3 — number of Azure Cost Management POSTs in
+   *  the last successful refresh.  ``null`` for AWS responses. */
+  azure_post_count?: number | null
 }
 
 export function buildCloudCostsCacheKey(
@@ -130,9 +148,28 @@ export function adaptCloudCostReport(
     code: e.code,
     message: e.message,
   }))
-  const failedAccounts = subscriptionErrors.length
+  // Phase 7D.3.2 — prefer the backend-emitted counts (they are
+  // authoritative).  Only fall back to the by_account-derived
+  // counts when the backend has not populated the field (older
+  // fixtures, providers that don't surface per-subscription
+  // counts).  ``r`` is typed loosely here because the canonical
+  // ``CloudCostReport`` schema doesn't yet declare the fields,
+  // but the production envelope already carries them.
+  const explicitFailed =
+    typeof (r as { failed_accounts?: unknown }).failed_accounts === 'number'
+      ? ((r as { failed_accounts: number }).failed_accounts)
+      : null
+  const explicitSuccessful =
+    typeof (r as { successful_accounts?: unknown }).successful_accounts === 'number'
+      ? ((r as { successful_accounts: number }).successful_accounts)
+      : null
+  const failedAccounts =
+    explicitFailed !== null ? explicitFailed : subscriptionErrors.length
   const subscribedCount = Array.isArray(r.by_account) ? r.by_account.length : 0
-  const successfulAccounts = Math.max(0, subscribedCount - failedAccounts)
+  const successfulAccounts =
+    explicitSuccessful !== null
+      ? explicitSuccessful
+      : Math.max(0, subscribedCount - failedAccounts)
   return {
     report: {
       account_id: r.account_id ?? '',
@@ -140,9 +177,18 @@ export function adaptCloudCostReport(
       previous_period: r.previous_period,
       currency: r.currency,
       total_cost: r.total_cost,
-      previous_period_cost: r.previous_period_cost,
-      change_amount: r.change_amount,
-      change_percent: r.change_percent,
+      // Phase 7D.3.3 (correctness) — propagate ``null`` for
+      // previous_period_cost / change_amount / change_percent
+      // when the previous-period fetch failed.  The UI renders
+      // "—" / "Previous period unavailable" instead of fabricating
+      // a percentage against an invented zero baseline.
+      previous_period_cost: (r.previous_period_cost as string | null) ?? null,
+      change_amount: (r.change_amount as string | null) ?? null,
+      change_percent: r.change_percent ?? null,
+      previous_period_unavailable:
+        typeof (r as unknown as { previous_period_unavailable?: unknown }).previous_period_unavailable === 'boolean'
+          ? ((r as unknown as { previous_period_unavailable: boolean }).previous_period_unavailable)
+          : undefined,
       estimated: r.estimated,
       daily_trend: r.daily_trend,
       by_service: r.by_service,
@@ -164,5 +210,11 @@ export function adaptCloudCostReport(
     cache_status: response.cache_status,
     cached_at: response.cached_at,
     expires_at: response.expires_at,
+    // Phase 7D.3.3 — propagate cache-freshness metadata so the
+    // readiness derivation can render "Cached" / "Stale" labels
+    // and the KPI tiles can show "Stale · last successful <time>".
+    data_freshness: response.data_freshness ?? null,
+    last_successful_at: response.last_successful_at ?? null,
+    azure_post_count: response.azure_post_count ?? null,
   }
 }

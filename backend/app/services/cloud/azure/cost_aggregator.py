@@ -89,6 +89,8 @@ from app.services.cloud.azure.costs import (
     extract_by_dimension,
     extract_daily,
     extract_total,
+    get_and_reset_azure_post_count,
+    with_azure_retry,
 )
 from app.services.cloud.models import (
     CloudCostSummary,
@@ -160,7 +162,8 @@ def _query_total(
     timeframe, from_iso, to_iso = build_time_period(
         period_start=period_start, period_end=period_end, today=today
     )
-    result = client.query(
+    result = _azure_query_with_retry(
+        client,
         subscription_id=subscription_id,
         dataset=build_total_dataset(),
         timeframe=timeframe,
@@ -181,7 +184,8 @@ def _query_daily(
     timeframe, from_iso, to_iso = build_time_period(
         period_start=period_start, period_end=period_end, today=today
     )
-    result = client.query(
+    result = _azure_query_with_retry(
+        client,
         subscription_id=subscription_id,
         dataset=build_daily_dataset(),
         timeframe=timeframe,
@@ -203,7 +207,8 @@ def _query_grouped(
     timeframe, from_iso, to_iso = build_time_period(
         period_start=period_start, period_end=period_end, today=today
     )
-    result = client.query(
+    result = _azure_query_with_retry(
+        client,
         subscription_id=subscription_id,
         dataset=build_grouped_dataset(dimension),
         timeframe=timeframe,
@@ -211,6 +216,37 @@ def _query_grouped(
         to_iso=to_iso or None,
     )
     return extract_by_dimension(result, dimension_name=dimension, default_currency=_default_currency())
+
+
+# Phase 7D.3.3 — bounded retry around the sync Cost Management call.
+# The helper below is bound lazily so a monkeypatched
+# ``AZURE_COST_RETRY_MAX_ATTEMPTS`` env var takes effect at
+# runtime.
+def _azure_query_with_retry(
+    client: AzureCostClient,
+    *,
+    subscription_id: str,
+    dataset: Mapping[str, Any],
+    timeframe: str,
+    from_iso: Optional[str],
+    to_iso: Optional[str],
+) -> "AzureQueryResult":
+    @with_azure_retry
+    def _do() -> "AzureQueryResult":
+        return client.query(
+            subscription_id=subscription_id,
+            dataset=dataset,
+            timeframe=timeframe,
+            from_iso=from_iso,
+            to_iso=to_iso,
+        )
+    return _do()
+
+
+def _query_total_count() -> int:
+    """Read the current Azure POST counter without resetting."""
+    from app.services.cloud.azure.costs import azure_post_count
+    return int(azure_post_count())
 
 
 def _sanitize_error(
@@ -257,6 +293,10 @@ async def fetch_subscription_snapshots(
     :class:`AzureCostCallStatus` (``OK`` / ``NO_DATA`` /
     ``EMPTY``) on success, ``EMPTY`` on failure so the caller can
     see the snapshot was attempted but did not yield data.
+
+    The number of Azure Cost Management POSTs issued by this
+    pass can be read via ``get_and_reset_azure_post_count()``
+    immediately after the call returns.
     """
     if not rows:
         return []
@@ -559,12 +599,17 @@ async def aggregate_cost_summary_for_subscriptions(
     """Aggregate a CloudCostSummary across ``rows``.
 
     The returned summary is attributed back to each contributing
-    subscription via ``extensions["by_subscription"]``.  ``region``
-    is forwarded as a ``ResourceLocation`` filter when supplied.
-    Today this layer does not expose the region filter at the
-    adapter level — Cost Management supports it but a future phase
-    will surface it through the UI; for now ``region`` is accepted
-    for symmetry with the AWS adapter but ignored.
+    subscription via ``extensions["by_subscription"]``.
+
+    Phase 7D.3.3 — the daily points and the daily currency status
+    are stashed on the summary's ``extensions`` dict under the
+    keys ``_daily_points`` (a list of ``{date, amount, currency}``
+    dicts) and ``_daily_currency_status``.  The route layer
+    reuses these to build the :class:`CloudCostTrend` envelope
+    without issuing a second fan-out through
+    :func:`aggregate_cost_trend_for_subscriptions`.  Backward
+    compatibility is preserved: callers that ignore the new
+    ``extensions`` keys see a 2-tuple just like Phase 7C.2B.
     """
     if not rows:
         empty = CloudCostSummary(
@@ -587,6 +632,8 @@ async def aggregate_cost_summary_for_subscriptions(
                 "by_subscription": [],
                 "subscription_errors": [],
                 "period_kind": "current",
+                "_daily_points": [],
+                "_daily_currency_status": "EMPTY",
             },
         )
         return empty, []
@@ -605,9 +652,23 @@ async def aggregate_cost_summary_for_subscriptions(
     by_region_status, by_region, by_region_currency = rollup_by_dimension(
         snapshots, dimension_attr="by_region"
     )
+    # Phase 7D.3.3 — derive the daily trend from the same snapshot
+    # pass so the route layer does not have to re-issue a fan-out.
+    daily_currency_status, daily_points_list, _daily_currency = rollup_daily(
+        snapshots, period_start=period_start, period_end=period_end
+    )
     # Previous period — fetch totals only (the by-service /
     # by-region breakdowns would multiply API calls for marginal
     # benefit on the comparison view).
+    #
+    # Phase 7D.3.3 (correctness) — we MUST distinguish "previous
+    # period returned $0.00" from "previous period fetch failed
+    # entirely".  A failed fetch must NOT be reported as 0 because
+    # that would fabricate a percentage change against an invented
+    # baseline.  Instead, ``previous_total`` is left as ``None`` and
+    # ``change_percent`` is ``None``; the route layer forwards
+    # both to the envelope's extensions so the front-end renders
+    # "—" / "Not available" instead of a fake percentage.
     previous_snapshots = await fetch_subscription_snapshots(
         rows=rows,
         period_start=previous_period_start,
@@ -616,12 +677,25 @@ async def aggregate_cost_summary_for_subscriptions(
         include_groupings=False,
     )
     previous_rollup = rollup_totals(previous_snapshots)
+    previous_failures = [s.error for s in previous_snapshots if s.error is not None]
+    previous_has_real_data = (
+        any(s.error is None for s in previous_snapshots)
+        and previous_rollup.status != "ERROR"
+        and previous_rollup.status != "NO_DATA"
+    )
 
-    change = rollup.total - previous_rollup.total
-    if previous_rollup.total == 0:
-        change_percent: Optional[Decimal] = None
+    if previous_has_real_data:
+        previous_total_value: Optional[Decimal] = previous_rollup.total
+        change = rollup.total - previous_rollup.total
+        if previous_rollup.total == 0:
+            change_percent = None
+        else:
+            change_percent = (change / previous_rollup.total).quantize(Decimal("0.01"))
+        previous_period_unavailable = False
     else:
-        change_percent = (change / previous_rollup.total).quantize(Decimal("0.01"))
+        previous_total_value = None
+        change_percent = None
+        previous_period_unavailable = True
 
     # Account-id attribution: None when aggregating across
     # subscriptions, or the single subscription id when ``rows``
@@ -664,6 +738,20 @@ async def aggregate_cost_summary_for_subscriptions(
         ],
         "previous_status": previous_rollup.status,
         "period_kind": "current",
+        # Phase 7D.3.3 (correctness) — flag when previous-period
+        # fetch failed so the route layer can surface
+        # ``previous_period_unavailable=true`` to the frontend.
+        # The front-end renders "—" / "Not available" when this is
+        # ``true`` and ``previous_period_cost`` is ``null``.
+        "previous_period_unavailable": previous_period_unavailable,
+        # Phase 7D.3.3 — stash the rolled-up daily trend on
+        # ``extensions`` so the route layer can build the
+        # :class:`CloudCostTrend` envelope without a second fan-out.
+        "_daily_points": [
+            {"date": day.isoformat(), "amount": str(amount), "currency": cur}
+            for day, amount, cur in daily_points_list
+        ],
+        "_daily_currency_status": daily_currency_status,
     }
     summary = CloudCostSummary(
         provider=CloudProviderKind.AZURE,
@@ -673,8 +761,8 @@ async def aggregate_cost_summary_for_subscriptions(
         period_end=period_end,
         currency=rollup.currency,
         current_total=rollup.total,
-        previous_total=previous_rollup.total,
-        change_amount=change,
+        previous_total=previous_total_value,
+        change_amount=change if previous_has_real_data else None,
         change_percent=change_percent,
         estimated=False,
         by_service=[
@@ -850,8 +938,50 @@ __all__ = [
     "aggregate_cost_by_service_for_subscriptions",
     "aggregate_cost_summary_for_subscriptions",
     "aggregate_cost_trend_for_subscriptions",
+    "build_trend_from_points",
     "fetch_subscription_snapshots",
     "rollup_by_dimension",
     "rollup_daily",
     "rollup_totals",
 ]
+
+
+def build_trend_from_points(
+    *,
+    rows: Sequence[CloudAccount],
+    period_start: date,
+    period_end: date,
+    daily_points: Sequence[Tuple[date, Decimal, str]],
+) -> CloudCostTrend:
+    """Build a :class:`CloudCostTrend` from already-computed daily points.
+
+    Phase 7D.3.3 — lets the route layer reuse the trend derived
+    by :func:`aggregate_cost_summary_for_subscriptions` instead of
+    issuing a second fan-out through
+    :func:`aggregate_cost_trend_for_subscriptions`.  The two
+    functions previously each issued 4 POSTs per subscription;
+    this helper removes the second 4 POSTs without losing any
+    data.
+    """
+    account_id_value = rows[0].account_id if len(rows) == 1 else None
+    currency = daily_points[0][2] if daily_points else _default_currency()
+    return CloudCostTrend(
+        provider=CloudProviderKind.AZURE,
+        account_id=account_id_value,
+        period_start=period_start,
+        period_end=period_end,
+        currency=currency,
+        daily=[
+            CloudServiceCost(
+                service=str(day),
+                amount=amount,
+                currency=cur,
+                provider=CloudProviderKind.AZURE,
+                account_id=account_id_value,
+                region=None,
+                extensions={"date": day.isoformat()},
+            )
+            for day, amount, cur in daily_points
+        ],
+        source="AZURE_COST_MANAGEMENT",
+    )

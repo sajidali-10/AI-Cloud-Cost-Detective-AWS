@@ -404,9 +404,22 @@ export function buildKpis({ raw, rows }: BuildKpisArgs): UnifiedKpis {
   let authoritativeZero = false
   let savingsUnavailable = false
   if (savingsStatus === 'OK') {
-    // The backend returns potential_savings (MONTHLY for AWS) here.
-    const periodAmount = parseDecimalSafe(raw.potential_savings)
+    // Pick the period-scope figure: for AWS the backend populates
+    // `potential_savings` (MONTHLY); for Azure the canonical
+    // envelope carries the ANNUAL total in `potential_annual_savings`
+    // and may leave `potential_savings` null.  Handle both shapes
+    // so the Phase 7D.3 dashboard normalises both correctly.
     const period = (raw.savings_period ?? '').toUpperCase()
+    let periodAmount: number | null
+    if (period === 'ANNUAL') {
+      periodAmount =
+        parseDecimalSafe(raw.potential_annual_savings) ??
+        parseDecimalSafe(raw.potential_savings)
+    } else {
+      periodAmount =
+        parseDecimalSafe(raw.potential_savings) ??
+        parseDecimalSafe(raw.potential_annual_savings)
+    }
     if (periodAmount === null) {
       headlineAmount = null
       headlineCurrency = raw.currency ?? null
