@@ -490,7 +490,7 @@ def _write_row(
 # ---------------------------------------------------------------------------
 
 
-AzureLoader = Callable[[], Awaitable[dict]]
+AzureLoader = Callable[[], Awaitable[Any]]
 
 
 async def get_or_refresh_azure_canonical(
@@ -543,11 +543,12 @@ async def get_or_refresh_azure_canonical(
                     "azure.cost.cache.read_failed code=%s — falling back to live",
                     type(exc).__name__,
                 )
-                payload = await _safe_loader_call(loader)
+                payload, request_post_count = await _safe_loader_call(loader)
                 return AzureCacheEntry(
                     payload=payload,
                     cache_status=AzureCacheStatus.REFRESHED,
                     data_freshness=AzureDataFreshness.LIVE,
+                    azure_post_count=request_post_count,
                     cache_key=cache_key,
                     storage_account_id=storage_account_id,
                 )
@@ -580,7 +581,14 @@ async def get_or_refresh_azure_canonical(
                     cache_status=AzureCacheStatus.HIT,
                     data_freshness=AzureDataFreshness.CACHED,
                     last_successful_at=_ts_or_none(row["last_successful_at"]) or _ts_or_none(row["created_at"]),
-                    azure_post_count=int(row["azure_post_count"] or 0),
+                    # Phase 7D.3.3 (final closure) — on a HIT, the
+                    # current request performed ZERO upstream POSTs.
+                    # The historical count stored in the row is
+                    # surfaced separately on the response envelope
+                    # as ``azure_post_count_total`` (ops telemetry)
+                    # so the diagnostic value does not leak into the
+                    # request-local counter.
+                    azure_post_count=0,
                     cache_key=cache_key,
                     storage_account_id=storage_account_id,
                 )
@@ -594,9 +602,17 @@ async def get_or_refresh_azure_canonical(
 
             # MISS / STALE — call the loader
             try:
-                fresh_payload = await _safe_loader_call(loader)
+                fresh_payload, request_post_count = await _safe_loader_call(loader)
             except Exception as loader_exc:  # noqa: BLE001 — sanitised at route layer
                 # If we have a still-valid stale row, fall back.
+                # Phase 7D.3.3 (final closure) — the post count on
+                # a STALE fallback is the number of POSTs attempted
+                # during the failed refresh (NOT the historical
+                # count of the row used as LKG).  The loader
+                # already raised, so we report 0 here — the cache
+                # layer's STALE path represents a successful
+                # fallback to the prior authoritative payload, not
+                # new upstream work.
                 if (
                     row is not None
                     and row["stale_payload"] is not None
@@ -612,7 +628,7 @@ async def get_or_refresh_azure_canonical(
                         cache_status=AzureCacheStatus.STALE,
                         data_freshness=AzureDataFreshness.STALE,
                         last_successful_at=_ts_or_none(row["last_successful_at"]),
-                        azure_post_count=int(row["azure_post_count"] or 0),
+                        azure_post_count=0,
                         cache_key=cache_key,
                         storage_account_id=storage_account_id,
                     )
@@ -639,25 +655,34 @@ async def get_or_refresh_azure_canonical(
             authoritative = _is_authoritative_success(fresh_payload)
             if not authoritative:
                 logger.warning(
-                    "azure.cost.cache non_authoritative_skip key=%s status=%s successful=%s",
+                    "azure.cost.cache non_authoritative_skip key=%s status=%s successful=%s posts=%d",
                     cache_key,
                     fresh_payload.get("status"),
                     fresh_payload.get("successful_accounts"),
+                    request_post_count,
                 )
                 return AzureCacheEntry(
                     payload=fresh_payload,
                     cache_status=AzureCacheStatus.REFRESHED,
                     data_freshness=AzureDataFreshness.LIVE,
                     last_successful_at=None,
-                    azure_post_count=int(
-                        fresh_payload.get("azure_post_count") or 0
-                    ),
+                    azure_post_count=request_post_count,
                     cache_key=cache_key,
                     storage_account_id=storage_account_id,
                 )
-            post_count = int(fresh_payload.get("azure_post_count") or 0)
+            post_count = request_post_count
             new_expires_at = now + timedelta(seconds=fresh)
             new_stale_until = now + timedelta(seconds=stale)
+            # Phase 7D.3.3 (final closure) — strip the diagnostic
+            # ``azure_post_count`` from the payload before caching
+            # so it never leaks across HIT.  The historical count
+            # is stored in the dedicated ``azure_post_count`` column
+            # and surfaced on the response as
+            # ``azure_post_count_total`` (ops telemetry).  The
+            # request-local count on the response is always 0 on HIT
+            # (no upstream call) and ``post_count`` on REFRESHED.
+            cached_payload = dict(fresh_payload)
+            cached_payload.pop("azure_post_count", None)
             try:
                 _write_row(
                     session,
@@ -665,13 +690,13 @@ async def get_or_refresh_azure_canonical(
                     cache_namespace=CACHE_NAMESPACE,
                     storage_account_id=storage_account_id,
                     cache_key=cache_key,
-                    payload=fresh_payload,
+                    payload=cached_payload,
                     query_type=str(fresh_payload.get("source") or "AZURE_COST_MANAGEMENT"),
                     period_start=_parse_iso(fresh_payload.get("period", {}).get("start")) or now,
                     period_end=_parse_iso(fresh_payload.get("period", {}).get("end")) or now,
                     expires_at=new_expires_at,
                     last_successful_at=now,
-                    stale_payload=fresh_payload,
+                    stale_payload=cached_payload,
                     stale_until=new_stale_until,
                     azure_post_count=post_count,
                 )
@@ -708,12 +733,34 @@ async def get_or_refresh_azure_canonical(
 # ---------------------------------------------------------------------------
 
 
-async def _safe_loader_call(loader: AzureLoader) -> dict:
-    """Invoke ``loader()`` and surface its exception type verbatim."""
-    payload = await loader()
-    if not isinstance(payload, dict):
+async def _safe_loader_call(loader: AzureLoader) -> Tuple[dict, int]:
+    """Invoke ``loader()`` and surface its exception type verbatim.
+
+    Returns ``(payload, request_local_post_count)``.  The loader
+    may return either:
+
+    * a plain dict — ``request_local_post_count`` is ``0`` (no
+      instrumentation);
+    * a tuple ``(dict, int)`` — the int is the request-local Azure
+      POST attempt count.  This is the recommended form for
+      callers that wire the diagnostic counter.
+
+    The diagnostic count is deliberately NOT written into the
+    cached business payload.  The cache layer surfaces it
+    separately so a HIT response can report 0 (no upstream call)
+    while the cached row retains the historical count for ops.
+    """
+    result = await loader()
+    if isinstance(result, tuple) and len(result) == 2:
+        payload, post_count = result
+        if not isinstance(payload, dict):
+            raise TypeError("azure loader returned a non-dict payload")
+        if not isinstance(post_count, int) or post_count < 0:
+            post_count = 0
+        return payload, post_count
+    if not isinstance(result, dict):
         raise TypeError("azure loader returned a non-dict payload")
-    return payload
+    return result, 0
 
 
 def _ts(value) -> datetime:

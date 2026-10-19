@@ -811,16 +811,15 @@ async def get_cloud_costs(
             daily_trend=trend.daily,
             daily_currency_status=daily_currency_status,
         )
-        # Phase 7D.3.3 — attach the per-subscription counts + the
-        # last POST count to the envelope BEFORE serialisation so
-        # the cache stores them and the route can re-expose them
-        # on HIT / STALE.
+        # Phase 7D.3.3 — attach the per-subscription counts to the
+        # envelope BEFORE serialisation.  The ``azure_post_count``
+        # diagnostic is NOT written into the payload any more (the
+        # cache layer owns request-local vs historical accounting
+        # and strips the diagnostic before persisting).  This is
+        # the closure fix for the cold/HIT counter confusion.
         envelope_payload = envelope.model_dump(mode="json")
         envelope_payload["successful_accounts"] = envelope.successful_accounts
         envelope_payload["failed_accounts"] = envelope.failed_accounts
-        envelope_payload["azure_post_count"] = int(
-            extensions.get("_azure_post_count") or 0
-        )
         return envelope_payload
 
     if kind == CloudProviderKind.AWS:
@@ -857,6 +856,7 @@ async def get_cloud_costs(
 
     # AZURE — route through the new cache layer.
     from app.services.cloud.azure.cost_cache import (
+        AzureCacheStatus,
         AzureDataFreshness,
         get_or_refresh_azure_canonical,
     )
@@ -866,19 +866,20 @@ async def get_cloud_costs(
     from app.services.cloud.azure.costs import (
         get_and_reset_azure_post_count as _reset_post_count,
     )
+    from app.services.cloud.azure.costs import azure_post_count
 
-    async def _azure_loader() -> dict:
+    async def _azure_loader():
         # Reset BEFORE the loader runs so the count includes only
-        # this canonical request's POSTs.  The reset value is
-        # harmless if the loader short-circuits; the route layer
-        # reads the post-load value via the same helper.
+        # this canonical request's POSTs.  We return a tuple
+        # ``(payload, post_count)`` so the cache layer has a
+        # request-local count that does NOT leak into the cached
+        # business payload.  The diagnostic counter is surfaced
+        # on the response envelope only — never persisted inside
+        # the cached business payload.
         _reset_post_count()
         envelope_dict = await _azure_envelope_dict()
-        # Read the post-load counter and attach it to the
-        # envelope payload before it lands in the cache.
-        from app.services.cloud.azure.costs import azure_post_count
-        envelope_dict["azure_post_count"] = int(azure_post_count())
-        return envelope_dict
+        post_count = int(azure_post_count())
+        return envelope_dict, post_count
 
     try:
         entry = await get_or_refresh_azure_canonical(
@@ -945,7 +946,16 @@ async def get_cloud_costs(
         data_freshness=data_freshness_value,
         last_successful_at=entry.last_successful_at,
     )
-    return response.model_dump(mode="json")
+    response_dict = response.model_dump(mode="json")
+    # Phase 7D.3.3 (final closure) — surface the request-local
+    # Azure POST attempt count.  On HIT/STALE this is 0; on
+    # REFRESHED it is the number of upstream POSTs this request
+    # actually performed (which may exceed the logical query
+    # count when bounded retries fire).  The diagnostic lives on
+    # the response envelope, NOT inside the cached payload, so it
+    # cannot leak across HIT requests.
+    response_dict["azure_post_count"] = int(getattr(entry, "azure_post_count", 0) or 0)
+    return response_dict
 
 
 def _azure_error_response(exc: AzureCostError) -> JSONResponse:

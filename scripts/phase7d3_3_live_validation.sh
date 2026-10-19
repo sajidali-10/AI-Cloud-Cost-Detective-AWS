@@ -116,7 +116,7 @@ RESULTS[mcpp_freshness]=$(extract "$MCPP_BODY" "data_freshness")
 RESULTS[mcpp_total]=$(extract "$MCPP_BODY" "report.total_cost")
 RESULTS[mcpp_successful]=$(extract "$MCPP_BODY" "report.successful_accounts")
 RESULTS[mcpp_failed]=$(extract "$MCPP_BODY" "report.failed_accounts")
-RESULTS[mcpp_post_count]=$(extract "$MCPP_BODY" "report.azure_post_count")
+RESULTS[mcpp_post_count]=$(extract "$MCPP_BODY" "azure_post_count")
 RESULTS[mcpp_last_success]=$(extract "$MCPP_BODY" "last_successful_at")
 RESULTS[mcpp_previous_unavailable]=$(extract "$MCPP_BODY" "report.previous_period_unavailable")
 
@@ -130,10 +130,19 @@ if [[ "${RESULTS[mcpp_cache_status]}" == "REFRESHED" || "${RESULTS[mcpp_cache_st
 else
   fail "MCPP unexpected cache_status=${RESULTS[mcpp_cache_status]}"
 fi
+# Track whether MCPP cold produced an authoritative response — if
+# not, we cannot assert HIT on the repeat (no row was ever written).
+if [[ "${RESULTS[mcpp_status]}" == "SUCCESS" && "${RESULTS[mcpp_successful]}" -ge 1 ]]; then
+  MCPP_AUTHORITATIVE=true
+else
+  MCPP_AUTHORITATIVE=false
+fi
 if [[ -n "${RESULTS[mcpp_last_success]}" ]]; then
   ok "MCPP last_successful_at=${RESULTS[mcpp_last_success]}"
+elif [[ "$MCPP_AUTHORITATIVE" == "true" ]]; then
+  fail "MCPP last_successful_at is empty (cold was SUCCESS)"
 else
-  fail "MCPP last_successful_at is empty"
+  ok "MCPP cold is non-authoritative (throttled-zero or similar); last_successful_at may be empty"
 fi
 
 # ---------------------------------------------------------------------------
@@ -144,25 +153,41 @@ bold "[3/7] MCPP immediate-repeat (cache HIT, 0 POSTs expected)"
 MCPP_HIT_BODY=$(probe "$SUB_MCPP")
 RESULTS[mcpp_hit_cache_status]=$(extract "$MCPP_HIT_BODY" "cache_status")
 RESULTS[mcpp_hit_freshness]=$(extract "$MCPP_HIT_BODY" "data_freshness")
-RESULTS[mcpp_hit_post_count]=$(extract "$MCPP_HIT_BODY" "report.azure_post_count")
+RESULTS[mcpp_hit_post_count]=$(extract "$MCPP_HIT_BODY" "azure_post_count")
 
 printf "  cache_status=%s freshness=%s posts=%s\n" \
   "${RESULTS[mcpp_hit_cache_status]}" "${RESULTS[mcpp_hit_freshness]}" "${RESULTS[mcpp_hit_post_count]}"
 
-if [[ "${RESULTS[mcpp_hit_cache_status]}" == "HIT" ]]; then
-  ok "MCPP repeat cache_status=HIT"
+# When the cold request was authoritative, the repeat MUST be a
+# cache HIT with 0 new upstream POSTs.  When the cold was
+# non-authoritative (throttled-zero or similar), no row is ever
+# written, so the repeat naturally re-fetches — that is correct
+# behaviour and we MUST NOT fail the assertion.
+if [[ "$MCPP_AUTHORITATIVE" == "true" ]]; then
+  if [[ "${RESULTS[mcpp_hit_cache_status]}" == "HIT" ]]; then
+    ok "MCPP repeat cache_status=HIT"
+  else
+    fail "MCPP repeat expected HIT (cold was authoritative), got ${RESULTS[mcpp_hit_cache_status]}"
+  fi
+  if [[ "${RESULTS[mcpp_hit_freshness]}" == "CACHED" ]]; then
+    ok "MCPP repeat freshness=CACHED"
+  else
+    fail "MCPP repeat expected CACHED, got ${RESULTS[mcpp_hit_freshness]}"
+  fi
+  if [[ "${RESULTS[mcpp_hit_post_count]}" == "0" || "${RESULTS[mcpp_hit_post_count]}" == "" ]]; then
+    ok "MCPP repeat azure_post_count=${RESULTS[mcpp_hit_post_count]:-0} (no upstream call)"
+  else
+    fail "MCPP repeat azure_post_count=${RESULTS[mcpp_hit_post_count]} (expected 0)"
+  fi
 else
-  fail "MCPP repeat expected HIT, got ${RESULTS[mcpp_hit_cache_status]}"
-fi
-if [[ "${RESULTS[mcpp_hit_freshness]}" == "CACHED" ]]; then
-  ok "MCPP repeat freshness=CACHED"
-else
-  fail "MCPP repeat expected CACHED, got ${RESULTS[mcpp_hit_freshness]}"
-fi
-if [[ "${RESULTS[mcpp_hit_post_count]}" == "0" || "${RESULTS[mcpp_hit_post_count]}" == "" ]]; then
-  ok "MCPP repeat azure_post_count=${RESULTS[mcpp_hit_post_count]:-0} (no upstream call)"
-else
-  fail "MCPP repeat azure_post_count=${RESULTS[mcpp_hit_post_count]} (expected 0)"
+  # Cold was throttled / non-authoritative.  Repeat must NOT be
+  # served from an authoritative HIT and must NOT regress.
+  if [[ "${RESULTS[mcpp_hit_cache_status]}" == "HIT" ]]; then
+    fail "MCPP repeat cache_status=HIT (cold was non-authoritative; HIT would be a bug)"
+  else
+    ok "MCPP repeat cache_status=${RESULTS[mcpp_hit_cache_status]} (cold was non-authoritative; correctly re-fetched)"
+  fi
+  ok "MCPP repeat azure_post_count=${RESULTS[mcpp_hit_post_count]:-0} (live POST attempts during this repeat)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -177,7 +202,7 @@ RESULTS[sponsor_freshness]=$(extract "$SPONSOR_BODY" "data_freshness")
 RESULTS[sponsor_total]=$(extract "$SPONSOR_BODY" "report.total_cost")
 RESULTS[sponsor_successful]=$(extract "$SPONSOR_BODY" "report.successful_accounts")
 RESULTS[sponsor_failed]=$(extract "$SPONSOR_BODY" "report.failed_accounts")
-RESULTS[sponsor_post_count]=$(extract "$SPONSOR_BODY" "report.azure_post_count")
+RESULTS[sponsor_post_count]=$(extract "$SPONSOR_BODY" "azure_post_count")
 
 printf "  status=%s cache_status=%s freshness=%s total=%s successful=%s failed=%s posts=%s\n" \
   "${RESULTS[sponsor_status]}" "${RESULTS[sponsor_cache_status]}" "${RESULTS[sponsor_freshness]}" \
@@ -203,7 +228,7 @@ RESULTS[all_freshness]=$(extract "$ALL_BODY" "data_freshness")
 RESULTS[all_total]=$(extract "$ALL_BODY" "report.total_cost")
 RESULTS[all_successful]=$(extract "$ALL_BODY" "report.successful_accounts")
 RESULTS[all_failed]=$(extract "$ALL_BODY" "report.failed_accounts")
-RESULTS[all_post_count]=$(extract "$ALL_BODY" "report.azure_post_count")
+RESULTS[all_post_count]=$(extract "$ALL_BODY" "azure_post_count")
 
 printf "  status=%s cache_status=%s freshness=%s total=%s successful=%s failed=%s posts=%s\n" \
   "${RESULTS[all_status]}" "${RESULTS[all_cache_status]}" "${RESULTS[all_freshness]}" \

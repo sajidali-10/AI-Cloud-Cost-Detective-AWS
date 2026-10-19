@@ -116,26 +116,32 @@ def reset_locks():
 class StubLoader:
     """A controllable stub loader for the cache tests.
 
-    ``returns`` is the value the next call returns (a dict).
+    ``returns`` is the value the next call returns (a dict, or a
+    ``(dict, int)`` tuple for the request-local post count form).
     ``raises`` is the exception the next call raises.
     Each call is recorded in ``calls``.
     """
 
     def __init__(
         self,
-        returns: Optional[Dict[str, Any]] = None,
+        returns: Optional[Any] = None,
         raises: Optional[BaseException] = None,
     ):
         self.returns = returns
         self.raises = raises
-        self.calls: List[Dict[str, Any]] = 0 if False else []  # list of call info
+        self.calls: List[Dict[str, Any]] = []
 
-    async def __call__(self) -> Dict[str, Any]:
+    async def __call__(self):
         self.calls.append({})
         if self.raises is not None:
             raise self.raises
         if self.returns is None:
             raise RuntimeError("StubLoader has neither returns nor raises")
+        # Support the (payload, post_count) tuple form preferred
+        # by the production route layer.
+        if isinstance(self.returns, tuple) and len(self.returns) == 2:
+            payload, post_count = self.returns
+            return dict(payload), int(post_count)
         return dict(self.returns)
 
 
@@ -216,7 +222,8 @@ class _StubAzureCostError(Exception):
 @pytest.mark.asyncio
 async def test_cache_miss_loader_called_and_row_written(session_factory):
     """cache miss → loader called → row created with stale_payload populated."""
-    loader = StubLoader(returns=_azure_envelope(total_cost="42.50"))
+    env = _azure_envelope(total_cost="42.50")
+    loader = StubLoader(returns=(env, 4))
     with session_factory() as session:
         entry = await get_or_refresh_azure_canonical(
             scope="all",
@@ -643,6 +650,145 @@ async def test_concurrent_same_key_single_upstream_invocation(session_factory):
     assert totals == {"77.77"}
     # Loader invoked at least once (might be 1 if single-flight worked, > 1 if not)
     assert len(loader.calls) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 7D.3.3 (final closure) — request-local counter semantics.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refreshed_post_count_reflects_loader(session_factory):
+    """REFRESHED live request → ``azure_post_count`` is the value
+    returned by the loader, NOT a historical column value.
+    """
+    env = _azure_envelope(total_cost="10.00")
+    env["azure_post_count"] = 4
+    loader = StubLoader(returns=(env, 4))
+    with session_factory() as session:
+        entry = await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=loader,
+            db=session,
+        )
+    assert entry.cache_status == AzureCacheStatus.REFRESHED
+    assert entry.azure_post_count == 4
+
+
+@pytest.mark.asyncio
+async def test_hit_post_count_is_zero(session_factory):
+    """HIT → ``azure_post_count`` is 0 (this request made no upstream
+    calls) even when the cached column was populated by an earlier
+    refresh.
+    """
+    env = _azure_envelope(total_cost="10.00")
+    env["azure_post_count"] = 7  # historical count
+    loader = StubLoader(returns=(env, 7))
+    with session_factory() as session:
+        first = await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=loader,
+            db=session,
+        )
+    assert first.cache_status == AzureCacheStatus.REFRESHED
+    assert first.azure_post_count == 7
+
+    # Immediate repeat → HIT, no upstream call.
+    second_loader = StubLoader(returns=(_azure_envelope(total_cost="never"), 999))
+    with session_factory() as session:
+        entry = await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=second_loader,
+            db=session,
+        )
+    assert entry.cache_status == AzureCacheStatus.HIT
+    assert entry.azure_post_count == 0, (
+        "HIT azure_post_count MUST be 0 even if the cached column "
+        "carries a historical value"
+    )
+    assert second_loader.calls == [], "loader MUST NOT be called on a HIT"
+
+
+@pytest.mark.asyncio
+async def test_cached_payload_does_not_leak_old_diagnostic(session_factory):
+    """The diagnostic ``azure_post_count`` MUST NOT be written into
+    the cached business payload.  A future HIT must never surface a
+    stale counter as if it were request-local.
+    """
+    env = _azure_envelope(total_cost="10.00")
+    env["azure_post_count"] = 9
+    loader = StubLoader(returns=(env, 9))
+    with session_factory() as session:
+        await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=loader,
+            db=session,
+        )
+    with session_factory() as session:
+        row = session.execute(text(
+            "SELECT payload, stale_payload, azure_post_count FROM cost_cache "
+            "WHERE cache_namespace = 'azure' LIMIT 1"
+        )).first()
+        # The diagnostic value lives ONLY in the dedicated column
+        # — not inside the cached business payload (or stale
+        # payload).  This is the closure contract.
+        assert "azure_post_count" not in _row_payload(row.payload)
+        assert "azure_post_count" not in _row_payload(row.stale_payload)
+        # The historical count IS preserved in the dedicated column.
+        assert int(row.azure_post_count) == 9
+
+
+@pytest.mark.asyncio
+async def test_stale_fallback_zero_post_count(session_factory):
+    """STALE after failed refresh → ``azure_post_count`` is 0 (no
+    successful new upstream calls; the loader raised).
+    """
+    env = _azure_envelope(total_cost="50.00")
+    env["azure_post_count"] = 4
+    loader = StubLoader(returns=(env, 4))
+    with session_factory() as session:
+        await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=loader,
+            db=session,
+        )
+    # Force the row into a stale window.
+    with session_factory() as session:
+        session.execute(text(
+            "UPDATE cost_cache SET expires_at = :exp "
+            "WHERE cache_namespace = 'azure'"
+        ), {"exp": datetime.now(timezone.utc) - timedelta(seconds=60)})
+        session.commit()
+    # Subsequent call fails — falls back to STALE-LKG.
+    second_loader = StubLoader(raises=_StubAzureCostError("THROTTLED", 429))
+    with session_factory() as session:
+        entry = await get_or_refresh_azure_canonical(
+            scope="all",
+            region="",
+            kind="month",
+            signature="2026-10|31",
+            loader=second_loader,
+            db=session,
+        )
+    assert entry.cache_status == AzureCacheStatus.STALE
+    assert entry.azure_post_count == 0, (
+        "STALE fallback MUST report 0 new POSTs (the loader raised)"
+    )
 
 
 @pytest.mark.asyncio
