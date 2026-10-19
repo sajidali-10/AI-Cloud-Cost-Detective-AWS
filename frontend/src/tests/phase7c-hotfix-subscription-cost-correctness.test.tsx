@@ -366,9 +366,16 @@ describe('Hotfix #2 — SpendKpi renders completeness states', () => {
   })
 
   it('renders partial subtotal with a Partial marker', () => {
+    // Phase 7D.3.2 — the canonical deriveCostCompleteness only
+    // classifies the report as 'partial' when the backend envelope
+    // explicitly says status='PARTIAL_SUCCESS'.  The legacy AWS
+    // adapter still emits status='SUCCESS' for a single-account
+    // shape, so we explicitly set the partial status here to
+    // exercise the partial-marker render path.
     render(
       <SpendKpi
         report={reportOf({
+          status: 'PARTIAL_SUCCESS',
           total_cost: '7.18',
           successful_accounts: 1,
           failed_accounts: 2,

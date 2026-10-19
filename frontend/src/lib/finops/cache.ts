@@ -118,9 +118,23 @@ export function invalidateCache(
   const preserveLastGood = options.preserveLastGood !== false
   for (const [key, entry] of store.entries()) {
     if (prefix && !key.startsWith(prefix)) continue
+    // Phase 7D.3.2 closure — the field-level wipe MUST clear
+    // ``entry.data`` (the live, in-memory response) AND
+    // ``entry.snapshot.data`` together.  A previous version only
+    // cleared ``snapshot.data`` while leaving ``entry.data``
+    // intact, so the next runFetch transitioned the entry to
+    // ``refreshing`` (instead of ``loading``) and continued to
+    // serve the prior response through the live ``entry.data``
+    // path until the new fetch settled.  That stale-data leak
+    // surfaced as order-dependent failures in three pre-existing
+    // dashboard / optimization tests whose next-mount transport
+    // returned a different shape (502 cost / 500 legacy /
+    // optimization list).
     entry.status = 'idle'
+    entry.data = null
     entry.error = null
     entry.refreshedAt = null
+    entry.inflight = null
     if (!preserveLastGood) {
       entry.lastGood = null
       entry.lastGoodRefreshedAt = null

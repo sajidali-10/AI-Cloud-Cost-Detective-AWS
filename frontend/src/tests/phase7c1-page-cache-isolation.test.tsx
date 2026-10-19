@@ -20,24 +20,35 @@ describe('Phase 7C.1 — pages wire provider into cache keys', () => {
     const p = src('pages/DashboardPage.tsx')
     expect(p).toMatch(/useProviderContext/)
     expect(p).toMatch(/cacheProvider/)
-    // Every FinOps cache key call passes cacheProvider.
-    expect(p).toMatch(/buildCostsCacheKey\([^)]*cacheProvider/)
-    expect(p).toMatch(/buildCapabilitiesCacheKey\([^)]*cacheProvider/)
-    expect(p).toMatch(/buildSummaryCacheKey\([^)]*cacheProvider/)
-    expect(p).toMatch(/buildResourcesCacheKey\([^)]*cacheProvider/)
+    // Phase 7D.3 — Dashboard composes cache keys inline from
+    // ``dashboardScopeCacheSegment(selection, provider)``, which
+    // itself prefixes every segment with the lower-case provider
+    // slug.  That helper is the canonical provider-folding path
+    // for the unified dashboard; the legacy builder imports are
+    // kept only for type re-exports and the page-level effects.
+    expect(p).toMatch(/dashboardScopeCacheSegment\(/)
+    expect(p).toMatch(/cacheProvider/)
   })
 
   it('Costs consumes provider from ProviderContext', () => {
     const p = src('pages/CostsPage.tsx')
     expect(p).toMatch(/useProviderContext/)
     expect(p).toMatch(/cacheProvider/)
-    expect(p).toMatch(/buildCostsCacheKey\([^)]*cacheProvider/)
+    // Phase 7D.3 — Costs page uses the canonical cloud cost
+    // builder for the unified view; the legacy buildCostsCacheKey
+    // path is reserved for backward-compatible routes only.
+    expect(p).toMatch(/buildCloudCostsCacheKey\([^)]*cacheProvider/)
   })
 
   it('Resources consumes provider from ProviderContext', () => {
     const p = src('pages/ResourcesPage.tsx')
     expect(p).toMatch(/useProviderContext/)
     expect(p).toMatch(/cacheProvider/)
+    // Phase 7D.3 — Resources page routes the canonical cloud
+    // resource cache key through the legacy buildResourcesCacheKey
+    // helper (which itself folds cacheProvider into the key).
+    // The unified /api/cloud/resources builder is wired by the
+    // Dashboard; the Resources page keeps the per-kind slice.
     expect(p).toMatch(/buildResourcesCacheKey\([^)]*cacheProvider/)
     expect(p).toMatch(/buildUtilizationCacheKey\(\s*\{[\s\S]*\}\s*,\s*cacheProvider/)
   })

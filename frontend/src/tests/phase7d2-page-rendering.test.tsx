@@ -23,7 +23,7 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { __resetApiForTests, configureApi } from '../lib/api'
-import { invalidateCache } from '../lib/finops/store'
+import { invalidateCache, invalidateFinopsCache } from '../lib/finops/store'
 import { OptimizationPage } from '../pages/OptimizationPage'
 import { authDisabledElement } from './helpers/auth-bootstrap'
 
@@ -190,13 +190,17 @@ function azureAllSummary(total: number, savings: string | null): Record<string, 
 
 beforeEach(() => {
   __resetApiForTests()
-  invalidateCache()
+  // Phase 7D.3.2 closure — full wipe (preserveLastGood: false).
+  // Without this, a prior test's authoritative lastGood leaks
+  // into the next mount and surfaces as stale rows under a
+  // different mock transport.
+  invalidateFinopsCache()
   if (typeof window !== 'undefined') window.sessionStorage.clear()
 })
 
 afterEach(async () => {
   cleanup()
-  invalidateCache()
+  invalidateFinopsCache()
   __resetApiForTests()
   if (typeof window !== 'undefined') window.sessionStorage.clear()
 })
@@ -415,7 +419,7 @@ describe('Phase 7D.2 — page-level: provider-switch safety', () => {
     // triggers by remounting via state.  The sessionStorage write
     // + remount simulates the post-fix UX in test time.
     cleanup()
-    invalidateCache()
+    invalidateFinopsCache()
     configureApi({
       getToken: () => null,
       onSessionExpired: () => {},
@@ -434,7 +438,7 @@ describe('Phase 7D.2 — page-level: provider-switch safety', () => {
     window.sessionStorage.setItem('cd.provider.selection.v1', 'AWS')
     window.sessionStorage.setItem('cd.account.selection.v1', 'all')
     cleanup()
-    invalidateCache()
+    invalidateFinopsCache()
     configureApi({
       getToken: () => null,
       onSessionExpired: () => {},

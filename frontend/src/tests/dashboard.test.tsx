@@ -19,7 +19,7 @@ import { AccountProvider } from '../lib/accountContext'
 import { ProviderProvider } from '../lib/providerContext'
 import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
-import { invalidateCache } from '../lib/finops/store'
+import { invalidateCache, invalidateFinopsCache } from '../lib/finops/store'
 import { DashboardPage } from '../pages/DashboardPage'
 import { MemoryRouter } from '../lib/router'
 
@@ -243,13 +243,21 @@ function installMockRoutes(opts: {
 describe('DashboardPage (unified Phase 7D.3)', () => {
   beforeEach(() => {
     __resetApiForTests()
-    invalidateCache()
+    // Phase 7D.3.2 closure — the teardown MUST use the full-wipe
+    // variant (preserveLastGood: false) so a previous test's
+    // authoritative cost snapshot does not leak as a "Refresh
+    // temporarily unavailable" last-good fallback into a test that
+    // expects the canonical Unavailable error state.  The default
+    // invalidateCache() preserves lastGood by design (production
+    // page-level refreshes depend on it); tests that want a true
+    // clean slate must opt out explicitly.
+    invalidateFinopsCache()
     if (typeof window !== 'undefined') {
       window.sessionStorage.setItem('cd.account.selection.v1', 'all')
     }
   })
   afterEach(() => {
-    invalidateCache()
+    invalidateFinopsCache()
     cleanup()
     if (typeof window !== 'undefined') window.sessionStorage.clear()
   })
