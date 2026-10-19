@@ -54,9 +54,17 @@ export interface CostReport {
   previous_period: CostPeriod
   currency: string
   total_cost: string
-  previous_period_cost: string
-  change_amount: string
-  change_percent: string | null // null when previous period is zero
+  // Phase 7D.3.3 (correctness) — ``null`` when the previous-period
+  // fetch failed.  A genuine zero is still reported as ``"0.00"``.
+  // The UI MUST render "—" / "Not available" instead of fabricating
+  // a percentage against an invented zero baseline.
+  previous_period_cost: string | null
+  change_amount: string | null
+  change_percent: string | null // null when previous period is zero OR unavailable
+  /** Phase 7D.3.3 (correctness) — ``true`` when the previous-
+   *  period fetch failed and the front-end should render
+   *  "Previous period unavailable" instead of a fabricated %. */
+  previous_period_unavailable?: boolean
   estimated: boolean
   daily_trend: DailyCostPoint[]
   by_service: ServiceCost[]

@@ -300,9 +300,17 @@ class CloudCostReport(BaseModel):
     previous_period: CostPeriod
     currency: str = "USD"
     total_cost: Decimal
-    previous_period_cost: Decimal
-    change_amount: Decimal
-    change_percent: Optional[Decimal]
+    # Phase 7D.3.3 (correctness) — ``previous_period_cost`` is
+    # Optional so a failed previous-period fetch can be reported
+    # as ``null`` instead of fabricating a ``Decimal('0')``.  The
+    # front-end renders "—" / "Not available" when this is null.
+    previous_period_cost: Optional[Decimal] = None
+    # ``change_amount`` is also Optional for the same reason: when
+    # the previous period is unavailable we MUST NOT report a
+    # numeric change (even ``Decimal('0')`` would imply "no change"
+    # against an invented baseline).
+    change_amount: Optional[Decimal] = None
+    change_percent: Optional[Decimal] = None
     estimated: bool = False
     daily_trend: List[DailyCostPoint]
     by_service: List[ServiceCost]
@@ -310,6 +318,17 @@ class CloudCostReport(BaseModel):
     by_account: List[CloudCostAccountShare] = Field(default_factory=list)
     account_errors: List[CloudCostAccountError] = Field(default_factory=list)
     source: str = "CLOUD_COST"
+
+    # ------------------------------------------------------------------
+    # Phase 7D.3.3 (correctness) — additive flags.
+    # ------------------------------------------------------------------
+
+    #: ``true`` when the previous-period upstream call failed and
+    #: ``previous_period_cost`` / ``change_amount`` /
+    #: ``change_percent`` are all ``null``.  UI renders
+    #: "Not available" instead of a fabricated percentage.  ``null``
+    #: for AWS responses and for legacy fixtures.
+    previous_period_unavailable: Optional[bool] = None
 
     # ------------------------------------------------------------------
     # Phase 7D.3.3 — additive completeness + freshness metadata.

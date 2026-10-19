@@ -739,6 +739,25 @@ function ChangeKpi({
   if (!report) {
     return <MetricCard label="Change vs Previous Period" description="—" value={undefined} />
   }
+  // Phase 7D.3.3 (correctness) — when the previous-period fetch
+  // failed, ``previous_period_cost`` / ``change_amount`` /
+  // ``change_percent`` are all ``null``.  We MUST NOT fabricate a
+  // percentage (even ``0%`` would imply "no change" against an
+  // invented baseline).  Render "—" / "Previous period unavailable".
+  const previousUnavailable =
+    report.previous_period_unavailable === true ||
+    report.previous_period_cost == null
+  if (previousUnavailable) {
+    return (
+      <MetricCard
+        label="Change vs Previous Period"
+        icon={<DeltaIcon />}
+        value="—"
+        tone="neutral"
+        description="Previous period unavailable"
+      />
+    )
+  }
   const pct = formatChangePercent(report.total_cost, report.previous_period_cost)
   const abs = formatSignedChange(report.change_amount, report.currency)
   const tone = changeTone(report.total_cost, report.previous_period_cost)
@@ -755,16 +774,13 @@ function ChangeKpi({
     period.kind === 'month'
       ? 'vs previous month'
       : `vs previous ${period.days} days`
-  const description =
-    pct === '—' && changeValue === null
-      ? 'Previous period unavailable'
-      : `${directionWord} ${compareLabel} · ${abs}`
+  const description = `${directionWord} ${compareLabel} · ${abs}`
   return (
     <MetricCard
       label="Change vs Previous Period"
       icon={<DeltaIcon />}
       value={pct}
-      tone={pct === '—' ? 'neutral' : tone}
+      tone={tone}
       description={description}
     />
   )

@@ -36,6 +36,7 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from unittest.mock import patch
 
 import pytest
 
@@ -644,3 +645,144 @@ def test_retry_helper_retries_throttled_upto_max(monkeypatch):
     assert result == "ok"
     # Initial attempt + 2 retries = 3 calls total
     assert calls["n"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Phase 7D.3.3 (correctness) — previous-period tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_previous_period_unavailable_not_zero(session_factory):
+    """When the previous-period fetch fails, ``previous_total`` is
+    ``None`` — NOT ``Decimal('0')`` — and ``change_percent`` is
+    ``None``.  The route layer forwards the
+    ``previous_period_unavailable`` flag so the UI renders "—".
+    """
+    from decimal import Decimal
+    from app.services.cloud.azure.cost_aggregator import (
+        aggregate_cost_summary_for_subscriptions,
+    )
+    from app.services.cloud.azure.costs import (
+        AzureCostClient,
+        AzureCostError,
+        AzureCostErrorCategory,
+    )
+    from app.services.cloud.models import CloudAccount
+    from datetime import date
+
+    class _Row:
+        provider = "AZURE"
+        account_id = "sub:mcpp-test"
+        display_name = "MCPP"
+        tenant_id = "tenant"
+        subscription_id = "sub:mcpp-test"
+
+    rows = [_Row()]
+
+    # The current-period path returns real data; the previous-
+    # period path raises THROTTLED so the aggregator must mark the
+    # previous period as unavailable.
+    call_count = {"n": 0}
+
+    def fake_query(*, subscription_id, dataset, timeframe, from_iso, to_iso):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First call is the current-period total — succeed.
+            from app.services.cloud.azure.costs import AzureQueryResult
+            return AzureQueryResult(columns=(), rows=())
+        # Every subsequent call (daily / service / region /
+        # previous-period total) is a 429.
+        raise AzureCostError(category=AzureCostErrorCategory.THROTTLED)
+
+    with patch.object(AzureCostClient, "query", side_effect=fake_query):
+        summary, failures = await aggregate_cost_summary_for_subscriptions(
+            rows=rows,
+            period_start=date(2026, 10, 1),
+            period_end=date(2026, 11, 1),
+            previous_period_start=date(2026, 9, 1),
+            previous_period_end=date(2026, 10, 1),
+            today=date(2026, 10, 19),
+        )
+
+    # The aggregator's ``CloudCostSummary`` carries None for the
+    # previous-period values when the previous fetch failed.
+    assert summary.previous_total is None, (
+        "previous_total MUST be None when previous-period fetch failed; "
+        f"got {summary.previous_total!r}"
+    )
+    assert summary.change_amount is None
+    assert summary.change_percent is None
+    # And the ``previous_period_unavailable`` flag is propagated
+    # on ``extensions`` so the route layer can forward it to the
+    # envelope.
+    assert summary.extensions.get("previous_period_unavailable") is True
+
+
+@pytest.mark.asyncio
+async def test_previous_period_available_real_value(session_factory):
+    """When both current AND previous period succeed, the
+    aggregator MUST compute real percentages — never fabricate 0.
+    """
+    from decimal import Decimal
+    from app.services.cloud.azure.cost_aggregator import (
+        aggregate_cost_summary_for_subscriptions,
+    )
+    from app.services.cloud.azure.costs import AzureCostClient, AzureQueryResult
+    from datetime import date
+
+    class _Row:
+        provider = "AZURE"
+        account_id = "sub:mcpp"
+        display_name = "MCPP"
+        tenant_id = "tenant"
+        subscription_id = "sub:mcpp"
+
+    rows = [_Row()]
+
+    # Return a valid current-period response and a valid previous-
+    # period response with a REAL previous total (Decimal('50.00'))
+    # so the change_percent is meaningful.
+    def fake_query(*, subscription_id, dataset, timeframe, from_iso, to_iso):
+        from app.services.cloud.azure.costs import (
+            _Column,
+            AzureQueryResult,
+        )
+        # Cost Management returns (UsageDate, Currency, PreTaxCost)
+        # shaped rows.  We synthesise a minimal schema with a
+        # ``PreTaxCost`` column.
+        cols = (
+            _Column(name="PreTaxCost", type="Number", index=0),
+        )
+        # dataset.granularity == None for total queries → one row.
+        # dataset.granularity == 'Daily' for daily queries → one
+        # row per day.
+        if (dataset or {}).get("granularity") == "Daily":
+            return AzureQueryResult(columns=cols, rows=())
+        # Total query: vary the amount by whether this is the
+        # current or previous period (different ``from_iso``).
+        amount = "100.00" if "2026-09" in (from_iso or "") else "200.00"
+        # We return the previous-period amount when from_iso starts
+        # with 2026-09; current-period amount when from_iso starts
+        # with 2026-10.
+        if from_iso and "2026-09" in from_iso:
+            amount = "50.00"
+        else:
+            amount = "100.00"
+        return AzureQueryResult(columns=cols, rows=((amount,),))
+
+    with patch.object(AzureCostClient, "query", side_effect=fake_query):
+        summary, failures = await aggregate_cost_summary_for_subscriptions(
+            rows=rows,
+            period_start=date(2026, 10, 1),
+            period_end=date(2026, 11, 1),
+            previous_period_start=date(2026, 9, 1),
+            previous_period_end=date(2026, 10, 1),
+            today=date(2026, 10, 19),
+        )
+
+    # current_total == 100, previous_total == 50 → +100%
+    assert summary.current_total == Decimal("100")
+    assert summary.previous_total == Decimal("50")
+    assert summary.change_percent == Decimal("1.00")  # +100%
+    assert summary.extensions.get("previous_period_unavailable") is False

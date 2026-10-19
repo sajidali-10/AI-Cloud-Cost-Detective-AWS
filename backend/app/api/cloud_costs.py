@@ -415,13 +415,21 @@ def _build_aws_envelope(
         summary.period_start, summary.period_end
     )
     previous_period = CostPeriod(start=prev_start, end=prev_end, days=period.days)
-    change_amount = summary.current_total - summary.previous_total
-    if summary.previous_total == 0:
-        change_percent: Optional[Decimal] = None
+    # Phase 7D.3.3 (correctness) — ``previous_total`` is now
+    # Optional.  The AWS upstream always returns a numeric previous
+    # period (Cost Explorer's GetCostAndUsage always supports a
+    # previous window), so the Optional branch is defensive only.
+    if summary.previous_total is not None:
+        change_amount: Optional[Decimal] = summary.current_total - summary.previous_total
+        if summary.previous_total == 0:
+            change_percent: Optional[Decimal] = None
+        else:
+            change_percent = (change_amount / summary.previous_total).quantize(
+                Decimal("0.01")
+            )
     else:
-        change_percent = (change_amount / summary.previous_total).quantize(
-            Decimal("0.01")
-        )
+        change_amount = None
+        change_percent = None
     extensions = summary.extensions or {}
     by_account_extensions = extensions.get("by_account", []) or []
     by_account = [
@@ -515,14 +523,28 @@ def _build_azure_envelope(
         summary.period_start, summary.period_end
     )
     previous_period = CostPeriod(start=prev_start, end=prev_end, days=period.days)
-    change_amount = summary.current_total - summary.previous_total
-    if summary.previous_total == 0:
-        change_percent = None
+    # Phase 7D.3.3 (correctness) — ``previous_total`` is now
+    # Optional.  When the previous-period fetch failed, we MUST
+    # NOT fabricate a numeric change / percentage.  Both
+    # ``change_amount`` and ``change_percent`` are left as ``None``
+    # and the envelope's ``previous_period_unavailable`` flag is
+    # set so the front-end renders "—" / "Not available".
+    if summary.previous_total is not None:
+        change_amount = summary.current_total - summary.previous_total
+        if summary.previous_total == 0:
+            change_percent = None
+        else:
+            change_percent = (change_amount / summary.previous_total).quantize(
+                Decimal("0.01")
+            )
     else:
-        change_percent = (change_amount / summary.previous_total).quantize(
-            Decimal("0.01")
-        )
+        change_amount = None
+        change_percent = None
     by_account_extensions = extensions.get("by_subscription", []) or []
+    # Phase 7D.3.3 (correctness) — forward the
+    # ``previous_period_unavailable`` flag from the aggregator so
+    # the front-end renders "—" / "Not available" when the
+    # previous-period fetch failed entirely.
     by_account = [
         CloudCostAccountShare(
             account_id=item["subscription_id"],
@@ -595,6 +617,13 @@ def _build_azure_envelope(
         source="AZURE_COST_MANAGEMENT",
         successful_accounts=successful_count,
         failed_accounts=failed_count,
+        # Phase 7D.3.3 (correctness) — surface whether the
+        # previous-period fetch succeeded so the front-end renders
+        # "—" / "Not available" instead of fabricating a percentage
+        # against an invented zero baseline.
+        previous_period_unavailable=bool(
+            extensions.get("previous_period_unavailable", False)
+        ),
     )
 
 

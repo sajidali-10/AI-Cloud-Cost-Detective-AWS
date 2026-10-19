@@ -177,9 +177,18 @@ export function adaptCloudCostReport(
       previous_period: r.previous_period,
       currency: r.currency,
       total_cost: r.total_cost,
-      previous_period_cost: r.previous_period_cost,
-      change_amount: r.change_amount,
-      change_percent: r.change_percent,
+      // Phase 7D.3.3 (correctness) — propagate ``null`` for
+      // previous_period_cost / change_amount / change_percent
+      // when the previous-period fetch failed.  The UI renders
+      // "—" / "Previous period unavailable" instead of fabricating
+      // a percentage against an invented zero baseline.
+      previous_period_cost: (r.previous_period_cost as string | null) ?? null,
+      change_amount: (r.change_amount as string | null) ?? null,
+      change_percent: r.change_percent ?? null,
+      previous_period_unavailable:
+        typeof (r as unknown as { previous_period_unavailable?: unknown }).previous_period_unavailable === 'boolean'
+          ? ((r as unknown as { previous_period_unavailable: boolean }).previous_period_unavailable)
+          : undefined,
       estimated: r.estimated,
       daily_trend: r.daily_trend,
       by_service: r.by_service,

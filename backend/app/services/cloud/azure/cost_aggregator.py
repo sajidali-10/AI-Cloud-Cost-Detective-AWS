@@ -243,6 +243,12 @@ def _azure_query_with_retry(
     return _do()
 
 
+def _query_total_count() -> int:
+    """Read the current Azure POST counter without resetting."""
+    from app.services.cloud.azure.costs import azure_post_count
+    return int(azure_post_count())
+
+
 def _sanitize_error(
     exc: AzureCostError,
     *,
@@ -654,6 +660,15 @@ async def aggregate_cost_summary_for_subscriptions(
     # Previous period — fetch totals only (the by-service /
     # by-region breakdowns would multiply API calls for marginal
     # benefit on the comparison view).
+    #
+    # Phase 7D.3.3 (correctness) — we MUST distinguish "previous
+    # period returned $0.00" from "previous period fetch failed
+    # entirely".  A failed fetch must NOT be reported as 0 because
+    # that would fabricate a percentage change against an invented
+    # baseline.  Instead, ``previous_total`` is left as ``None`` and
+    # ``change_percent`` is ``None``; the route layer forwards
+    # both to the envelope's extensions so the front-end renders
+    # "—" / "Not available" instead of a fake percentage.
     previous_snapshots = await fetch_subscription_snapshots(
         rows=rows,
         period_start=previous_period_start,
@@ -662,12 +677,25 @@ async def aggregate_cost_summary_for_subscriptions(
         include_groupings=False,
     )
     previous_rollup = rollup_totals(previous_snapshots)
+    previous_failures = [s.error for s in previous_snapshots if s.error is not None]
+    previous_has_real_data = (
+        any(s.error is None for s in previous_snapshots)
+        and previous_rollup.status != "ERROR"
+        and previous_rollup.status != "NO_DATA"
+    )
 
-    change = rollup.total - previous_rollup.total
-    if previous_rollup.total == 0:
-        change_percent: Optional[Decimal] = None
+    if previous_has_real_data:
+        previous_total_value: Optional[Decimal] = previous_rollup.total
+        change = rollup.total - previous_rollup.total
+        if previous_rollup.total == 0:
+            change_percent = None
+        else:
+            change_percent = (change / previous_rollup.total).quantize(Decimal("0.01"))
+        previous_period_unavailable = False
     else:
-        change_percent = (change / previous_rollup.total).quantize(Decimal("0.01"))
+        previous_total_value = None
+        change_percent = None
+        previous_period_unavailable = True
 
     # Account-id attribution: None when aggregating across
     # subscriptions, or the single subscription id when ``rows``
@@ -710,6 +738,12 @@ async def aggregate_cost_summary_for_subscriptions(
         ],
         "previous_status": previous_rollup.status,
         "period_kind": "current",
+        # Phase 7D.3.3 (correctness) — flag when previous-period
+        # fetch failed so the route layer can surface
+        # ``previous_period_unavailable=true`` to the frontend.
+        # The front-end renders "—" / "Not available" when this is
+        # ``true`` and ``previous_period_cost`` is ``null``.
+        "previous_period_unavailable": previous_period_unavailable,
         # Phase 7D.3.3 — stash the rolled-up daily trend on
         # ``extensions`` so the route layer can build the
         # :class:`CloudCostTrend` envelope without a second fan-out.
@@ -727,8 +761,8 @@ async def aggregate_cost_summary_for_subscriptions(
         period_end=period_end,
         currency=rollup.currency,
         current_total=rollup.total,
-        previous_total=previous_rollup.total,
-        change_amount=change,
+        previous_total=previous_total_value,
+        change_amount=change if previous_has_real_data else None,
         change_percent=change_percent,
         estimated=False,
         by_service=[

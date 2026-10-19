@@ -433,6 +433,24 @@ function ChangeKpi({
 }) {
   if (loading && !report) return <MetricCard label="Cost change" value={undefined} description="Loading…" />
   if (!report) return <MetricCard label="Cost change" value={undefined} description="—" />
+  // Phase 7D.3.3 (correctness) — when the previous-period fetch
+  // failed, ``previous_period_cost`` / ``change_amount`` /
+  // ``change_percent`` are all ``null``.  We MUST NOT fabricate a
+  // percentage (even ``0%`` would imply "no change" against an
+  // invented baseline).  Render "—" / "Not available".
+  const previousUnavailable =
+    report.previous_period_unavailable === true ||
+    report.previous_period_cost == null
+  if (previousUnavailable) {
+    return (
+      <MetricCard
+        label="Cost change"
+        value="—"
+        tone="neutral"
+        description="Previous period unavailable"
+      />
+    )
+  }
   const pct = formatChangePercent(report.total_cost, report.previous_period_cost)
   const abs = formatSignedChange(report.change_amount, report.currency)
   const tone = changeTone(report.total_cost, report.previous_period_cost)
