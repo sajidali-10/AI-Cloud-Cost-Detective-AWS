@@ -147,8 +147,11 @@ class FinOpsContextBuilder:
         end_date: Optional[date] = None,
         region: Optional[str] = None,
     ) -> FinOpsContext:
-        from app.api.cloud_costs import _resolve_period, _resolve_rows
         from app.services.cloud.models import CloudProviderKind
+        from app.services.cloud.period_resolver import (
+            resolve_period as _resolve_period,
+            resolve_rows as _resolve_rows,
+        )
         from app.services.cloud.registry import ProviderRegistry
 
         period, prev, _, _, err_resp = _resolve_period(
@@ -279,8 +282,11 @@ class FinOpsContextBuilder:
         self, *, adapter, kind, rows, period_start, period_end,
         prev_start, prev_end, effective_region, scope,
     ) -> Optional[FinOpsCostSlice]:
-        from app.api.cloud_costs import _build_aws_envelope, _build_azure_envelope
         from app.services.cloud.azure.cost_aggregator import build_trend_from_points
+        from app.services.cloud.cost_envelope import (
+            build_aws_envelope,
+            build_azure_envelope,
+        )
 
         if adapter is None:
             return None
@@ -316,7 +322,7 @@ class FinOpsContextBuilder:
                     daily_trend = list(trend.daily or [])
                 except Exception:  # noqa: BLE001
                     daily_trend = []
-                envelope = _build_aws_envelope(
+                envelope = build_aws_envelope(
                     summary, rows=rows, scope=scope, daily_trend=daily_trend,
                 )
             else:
@@ -342,7 +348,7 @@ class FinOpsContextBuilder:
                     period_end=period_end,
                     daily_points=daily,
                 )
-                azure_envelope = _build_azure_envelope(
+                azure_envelope = build_azure_envelope(
                     summary,
                     rows=rows,
                     scope=scope,

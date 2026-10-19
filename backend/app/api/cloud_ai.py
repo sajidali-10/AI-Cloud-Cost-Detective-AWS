@@ -28,7 +28,7 @@ from app.services.cloud.finops_ai_service import FinOpsAIService, get_finops_ai_
 
 logger = logging.getLogger("cost-detective-backend.cloud_ai.api")
 
-router = APIRouter(prefix="/ai", tags=["ai"])
+router = APIRouter(prefix="/cloud/ai", tags=["ai"])
 
 _service_factory = get_finops_ai_service
 

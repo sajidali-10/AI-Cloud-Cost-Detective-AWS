@@ -127,6 +127,7 @@ describe('Phase 7C.2A — token grouping', () => {
     ])
     expected.delete('/')
     expected.delete('/analyst')
+    expected.delete('/cloud-ai')
     expected.delete('/conversations')
     for (const path of grouped) expected.delete(path)
     expect(expected.size).toBe(0)
