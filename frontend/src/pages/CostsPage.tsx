@@ -51,6 +51,7 @@ import {
   dataReadinessLabel,
   deriveCostCompleteness,
   deriveDashboardReadiness,
+  deriveDataFreshness,
   type DataReadinessKind,
 } from '../lib/finops/costCompleteness'
 import { useFinopsPeriod } from '../lib/finops/period'
@@ -211,6 +212,7 @@ export function CostsPage() {
           loading={cost.entry.status === 'loading'}
           period={period}
           stale={showStale}
+          freshness={deriveDataFreshness(cost.entry.data)}
         />
         <ChangeKpi
           report={renderableReport}
@@ -346,23 +348,34 @@ function SpendKpi({
   loading,
   period,
   stale,
+  freshness,
 }: {
   report: CostReportResponse['report'] | null
   lastGood: CostReportResponse['report'] | null
   loading: boolean
   period: BillingPeriod
   stale: boolean
+  freshness?: ReturnType<typeof deriveDataFreshness>
 }) {
   const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
   const completeness = deriveCostCompleteness(report)
+  const fresh = freshness ?? deriveDataFreshness(null)
+  // Phase 7D.3.3 — if the report is unavailable but the server
+  // told us ``data_freshness='STALE'`` (the canonical Azure
+  // cache layer served an LKG), surface that fact in the
+  // subtitle so the user understands why the page still has a
+  // value despite the failure.
   if (loading && !report) return <MetricCard label="Total spend" value={undefined} description="Loading…" />
   if (completeness.kind === 'unavailable') {
     if (lastGood && deriveCostCompleteness(lastGood).kind !== 'unavailable') {
+      const staleDesc = fresh.kind === 'stale'
+        ? `Stale · last successful ${fresh.description.replace(/^Stale\s*·\s*last successful\s*/, '')} · refresh unavailable`
+        : `${label} · ${lastGood.currency} · Stale · refresh unavailable`
       return (
         <MetricCard
           label="Total spend"
           value={formatCurrencyCompact(lastGood.total_cost, lastGood.currency)}
-          description={`${label} · ${lastGood.currency} · Stale · refresh unavailable`}
+          description={staleDesc}
           tone="warning"
 
         />
@@ -391,11 +404,19 @@ function SpendKpi({
     )
   }
   const live = report as NonNullable<CostReportResponse['report']>
+  // Phase 7D.3.3 — for STALE / CACHED, surface the freshness
+  // caption so the user can tell the data isn't brand-new.
+  let description = `${label} · ${live.currency}`
+  if (fresh.kind === 'stale') {
+    description = `${label} · ${live.currency} · ${fresh.description}`
+  } else if (fresh.kind === 'cached') {
+    description = `${label} · ${live.currency} · Cached`
+  }
   return (
     <MetricCard
       label="Total spend"
       value={formatCurrencyCompact(live.total_cost, live.currency)}
-      description={`${label} · ${live.currency}`}
+      description={description}
 
     />
   )

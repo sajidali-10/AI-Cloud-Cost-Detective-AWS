@@ -22,7 +22,7 @@ export interface AwsIdentity {
 // Cost Explorer (GET /api/aws/costs?days=)
 // ---------------------------------------------------------------------------
 
-export type CacheStatus = 'HIT' | 'MISS' | 'REFRESHED'
+export type CacheStatus = 'HIT' | 'MISS' | 'REFRESHED' | 'STALE'
 
 export interface CostPeriod {
   start: string // ISO date YYYY-MM-DD
@@ -83,6 +83,16 @@ export interface CostReportResponse {
   cache_status: CacheStatus
   cached_at: string | null
   expires_at: string | null
+  /** Phase 7D.3.3 — coarse freshness signal.  ``undefined`` for
+   *  AWS responses and for legacy fixtures (treated as ``'LIVE'``
+   *  by the readiness derivation). */
+  data_freshness?: 'LIVE' | 'CACHED' | 'STALE' | 'UNAVAILABLE' | null
+  /** Phase 7D.3.3 — timestamp of the most recent successful
+   *  upstream call.  ``null`` for AWS responses. */
+  last_successful_at?: string | null
+  /** Phase 7D.3.3 — number of Azure Cost Management POSTs in
+   *  the last successful refresh.  ``null`` for AWS responses. */
+  azure_post_count?: number | null
 }
 
 // ---------------------------------------------------------------------------

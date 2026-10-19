@@ -460,15 +460,21 @@ class AzureCloudProvider(CloudProvider):
         )
 
         rows = list(accounts) if accounts else []
-        summary, failures = await aggregate_cost_summary_for_subscriptions(
-            rows=rows,
-            period_start=period_start,
-            period_end=period_end,
-            previous_period_start=previous_period_start,
-            previous_period_end=previous_period_end,
-            today=date.today(),
-            region=region,
+        summary, failures = (
+            await aggregate_cost_summary_for_subscriptions(
+                rows=rows,
+                period_start=period_start,
+                period_end=period_end,
+                previous_period_start=previous_period_start,
+                previous_period_end=previous_period_end,
+                today=date.today(),
+                region=region,
+            )
         )
+        # Phase 7D.3.3 — the daily points are already stashed on
+        # ``extensions`` by the aggregator (``_daily_points`` and
+        # ``_daily_currency_status``); we don't need to do anything
+        # additional here.  Return the summary as-is.
         return summary
 
     async def get_cost_trend(
@@ -479,18 +485,40 @@ class AzureCloudProvider(CloudProvider):
         period_end: date,
         region: Optional[str] = None,
     ) -> CloudCostTrend:
+        """Return the daily cost trend.
+
+        Phase 7D.3.3 — the trend is derived from the same snapshot
+        pass that produced the summary so this call issues ZERO
+        additional Azure POSTs.  This adapter calls
+        :meth:`get_cost_summary` once and reuses the rolled-up
+        daily points stashed on the summary's ``extensions``.
+        """
         from app.services.cloud.azure.cost_aggregator import (
-            aggregate_cost_trend_for_subscriptions,
+            build_trend_from_points,
         )
+        from decimal import Decimal as _Decimal
 
         rows = list(accounts) if accounts else []
-        trend, failures, currency_status = await aggregate_cost_trend_for_subscriptions(
+        summary = await self.get_cost_summary(
+            accounts=accounts,
+            period_start=period_start,
+            period_end=period_end,
+            previous_period_start=period_start,
+            previous_period_end=period_end,
+            region=region,
+        )
+        extensions = dict(summary.extensions or {})
+        cached_points = extensions.get("_daily_points") or []
+        daily = [
+            (date.fromisoformat(p["date"]), _Decimal(str(p["amount"])), p["currency"])
+            for p in cached_points
+        ]
+        return build_trend_from_points(
             rows=rows,
             period_start=period_start,
             period_end=period_end,
-            today=date.today(),
+            daily_points=daily,
         )
-        return trend
 
     async def get_cost_by_service(
         self,

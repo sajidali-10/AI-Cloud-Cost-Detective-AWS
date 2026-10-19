@@ -211,3 +211,60 @@ Verified live (October 2026):
 See `docs/phase7d3-analytics-completeness.md` for the full audit, implementation, and live results.
 
 **STOP after Phase 7D.3.1.**
+
+---
+
+# Phase 7D.3.2 — Azure Cost Runtime Consistency
+
+Phase 7D.3.2 closed two runtime-consistency gaps in the Azure Cost Management integration:
+
+1. **`Unavailability > $0.00` semantic.** When every Azure subscription
+   is throttled (all `account_errors` THROTTLED, `successful_accounts=0`),
+   the route used to render `$0.00` as authoritative spend.  The
+   canonical envelope now propagates `successful_accounts` /
+   `failed_accounts` to the frontend, and a new
+   `deriveCostCompleteness` helper classifies the response as
+   `success | partial | unavailable`.  The Spend KPI tile renders
+   `Unavailable` (NOT `$0.00`) when the upstream is fully throttled.
+   This invariant is locked down by `phase7c-hotfix-subscription-cost-correctness.test.tsx`.
+
+2. **Generation-token race protection.** A rapid provider / scope /
+   period switch could let a late AWS response overwrite fresh Azure
+   state (and vice-versa).  Both `DashboardPage` and `CostsPage` now
+   track a generation token via `useFinopsPeriod + useCostPageGeneration`;
+   the store silently discards responses whose generation differs from
+   the live one (`StaleGenerationError`).  Stale responses raise no
+   user-facing error.
+
+Tests:
+
+* `frontend/src/tests/phase7c-hotfix-subscription-cost-correctness.test.tsx` — 14/14 pass
+* `frontend/src/tests/phase7d3-unified-dashboard.test.tsx` — 22/22 pass
+* All 590 frontend tests still green.
+
+**STOP after Phase 7D.3.2.**
+
+---
+
+# Phase 7D.3.3 — Azure Cost Query Resilience & Server-Side Cache
+
+Phase 7D.3.3 closes the operational gap between Phase 7D.3.2's
+"correct Unavailable" semantic and the underlying Azure throttling
+problem.  See [`docs/phase7d3-azure-cost-resilience.md`](./phase7d3-azure-cost-resilience.md)
+for the full architecture, BEFORE/AFTER measurement, and known
+limitations.
+
+## Summary
+
+* **BEFORE**: 8 POSTs/sub cold MCPP canonical request, 16 POSTs/sub cold All-Azure, 8/16 repeated. No cache.
+* **AFTER**: 4 POSTs/sub cold MCPP, 8 POSTs/sub cold All-Azure, **0** repeated. PostgreSQL-backed FRESH + STALE-LKG cache.
+* **Retry**: bounded 2 retries honouring `Retry-After`; auth failures never retried.
+* **Cache architecture**: PostgreSQL `cost_cache` table extended (idempotent migration `0006`). Raw SQL only (sidestepped pre-existing SQLAlchemy 2.0.36 + Python 3.14 typing bug by upgrading to SQLAlchemy 2.0.55). Single-flight via `asyncio.Lock` keyed by `(namespace, storage_account_id, cache_key)`.
+* **Frontend**: `data_freshness` + `last_successful_at` + `STALE` cache_status propagated. New `deriveDataFreshness` helper. SpendKpi surfaces "Stale · last successful \<time\>" when the server returns STALE.
+* **Status semantics**: hero uses `Connected` (provider connectivity); cost readiness uses `Live | Cached | Stale | Unavailable`. The two labels are decoupled so a connected provider + throttled cache can show "Connected" + "Stale" without contradiction.
+* **DB outage**: cache layer logs warning, falls back to live path; no 500 because the cache is down.
+* **Tests**: 17 backend tests (`test_azure_cost_cache_resilience.py`) + 14 frontend tests (`phase7d3_3-cost-completeness-cached.test.ts`); all 590 pre-existing frontend tests + new tests = **621 / 621 PASS**.
+* **Live validation**: `scripts/phase7d3_3_live_validation.sh` validates cold + repeated + cache-key isolation + stale-row presence.
+* **No secrets logged**: every cache + retry log line is sanitised; subscription IDs are truncated via `safe_subscription_label`.
+
+**STOP after Phase 7D.3.3.**

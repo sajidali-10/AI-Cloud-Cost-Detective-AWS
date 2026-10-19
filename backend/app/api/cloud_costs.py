@@ -559,6 +559,12 @@ def _build_azure_envelope(
     currency_status = extensions.get("currency_status", "OK")
     if daily_currency_status == "MIXED_CURRENCY":
         currency_status = "MIXED_CURRENCY"
+    # Phase 7D.3.3 — surface per-subscription counts directly on
+    # the envelope so the frontend does not need to derive them
+    # from ``by_account`` / ``account_errors`` counts.
+    subscribed_count = len(by_account)
+    failed_count = len(account_errors)
+    successful_count = max(0, subscribed_count - failed_count)
     return CloudCostReport(
         provider="AZURE",
         scope=scope,
@@ -587,6 +593,8 @@ def _build_azure_envelope(
         by_account=by_account,
         account_errors=account_errors,
         source="AZURE_COST_MANAGEMENT",
+        successful_accounts=successful_count,
+        failed_accounts=failed_count,
     )
 
 
@@ -680,7 +688,7 @@ async def get_cloud_costs(
 
     adapter = registry.require(kind)
 
-    async def _loader() -> CloudCostReport:
+    async def _aws_envelope() -> CloudCostReport:
         summary = await adapter.get_cost_summary(
             accounts=rows,
             period_start=period.start,
@@ -689,80 +697,174 @@ async def get_cloud_costs(
             previous_period_end=prev.end,
             region=effective_region or None,
         )
-        if kind == CloudProviderKind.AWS:
-            # Mirror the Azure pattern — fetch the daily trend via
-            # the dedicated ``get_cost_trend`` call so the canonical
-            # envelope carries real per-day data sourced from the
-            # existing Cost Explorer daily query.  The aggregator
-            # already returns this; the canonical AWS path simply
-            # never plumbed it through.  No fabricated data.
-            #
-            # A trend fetch failure MUST NOT 502 the whole envelope —
-            # the summary still has value.  Fall back to an empty
-            # trend and surface the failure in ``account_errors`` so
-            # the dashboard-level partial banner picks it up.
-            daily_trend: list = []
-            try:
-                trend = await adapter.get_cost_trend(
-                    accounts=rows,
-                    period_start=period.start,
-                    period_end=period.end,
-                    region=effective_region or None,
-                )
-                daily_trend = list(trend.daily or [])
-            except Exception as trend_exc:  # noqa: BLE001 - sanitised
-                logger.warning(
-                    "cloud.costs.daily_trend_failed provider=AWS code=%s",
-                    type(trend_exc).__name__,
-                )
-                # Augment the summary's account_errors so the
-                # partial-data banner surfaces the gap.
-                extensions = dict(summary.extensions or {})
-                raw_errors = list(extensions.get("account_errors", []) or [])
-                raw_errors.append(
-                    {
-                        "account_id": "aggregate",
-                        "display_name": "All AWS Accounts",
-                        "code": "DailyTrendUnavailable",
-                        "message": f"daily trend unavailable: {type(trend_exc).__name__}",
-                    }
-                )
-                extensions["account_errors"] = raw_errors
-                summary = replace(summary, extensions=extensions)
-            return _build_aws_envelope(
-                summary,
-                rows=rows,
-                scope=scope,
-                daily_trend=daily_trend,
+        # A trend fetch failure MUST NOT 502 the whole envelope —
+        # the summary still has value.  Fall back to an empty
+        # trend and surface the failure in ``account_errors`` so
+        # the dashboard-level partial banner picks it up.
+        daily_trend: list = []
+        try:
+            trend = await adapter.get_cost_trend(
+                accounts=rows,
+                period_start=period.start,
+                period_end=period.end,
+                region=effective_region or None,
             )
-        # AZURE: also fetch the daily trend so the envelope is
-        # complete.
-        from app.services.cloud.azure.cost_aggregator import (
-            aggregate_cost_trend_for_subscriptions,
+            daily_trend = list(trend.daily or [])
+        except Exception as trend_exc:  # noqa: BLE001 - sanitised
+            logger.warning(
+                "cloud.costs.daily_trend_failed provider=AWS code=%s",
+                type(trend_exc).__name__,
+            )
+            extensions = dict(summary.extensions or {})
+            raw_errors = list(extensions.get("account_errors", []) or [])
+            raw_errors.append(
+                {
+                    "account_id": "aggregate",
+                    "display_name": "All AWS Accounts",
+                    "code": "DailyTrendUnavailable",
+                    "message": f"daily trend unavailable: {type(trend_exc).__name__}",
+                }
+            )
+            extensions["account_errors"] = raw_errors
+            summary = replace(summary, extensions=extensions)
+        return _build_aws_envelope(
+            summary,
+            rows=rows,
+            scope=scope,
+            daily_trend=daily_trend,
         )
 
-        trend, failures, daily_currency_status = await aggregate_cost_trend_for_subscriptions(
-            rows=rows,
+    async def _azure_envelope_dict() -> dict:
+        """Build a JSON-safe dict of the Azure canonical envelope.
+
+        Returned as a dict (not a :class:`CloudCostReport`) so the
+        Azure cache layer can serialise it directly into the
+        ``cost_cache.payload`` JSONB column.  The route layer
+        rehydrates the dict back to a ``CloudCostReport`` on
+        cache HIT.
+        """
+        summary = await adapter.get_cost_summary(
+            accounts=rows,
             period_start=period.start,
             period_end=period.end,
-            today=date.today(),
+            previous_period_start=prev.start,
+            previous_period_end=prev.end,
+            region=effective_region or None,
         )
-        return _build_azure_envelope(
+        extensions = dict(summary.extensions or {})
+        cached_points = extensions.get("_daily_points") or []
+        # The Azure adapter stashes the rolled-up daily points on
+        # ``extensions``; build the trend dataclass from them so
+        # we don't issue a second fan-out.
+        from app.services.cloud.azure.cost_aggregator import (
+            build_trend_from_points,
+        )
+        from decimal import Decimal as _Decimal
+        daily = [
+            (
+                date.fromisoformat(p["date"]),
+                _Decimal(str(p["amount"])),
+                p["currency"],
+            )
+            for p in cached_points
+        ]
+        daily_currency_status = str(extensions.get("_daily_currency_status") or "OK")
+        trend = build_trend_from_points(
+            rows=list(rows),
+            period_start=period.start,
+            period_end=period.end,
+            daily_points=daily,
+        )
+        envelope = _build_azure_envelope(
             summary,
             rows=rows,
             scope=scope,
             daily_trend=trend.daily,
             daily_currency_status=daily_currency_status,
         )
+        # Phase 7D.3.3 — attach the per-subscription counts + the
+        # last POST count to the envelope BEFORE serialisation so
+        # the cache stores them and the route can re-expose them
+        # on HIT / STALE.
+        envelope_payload = envelope.model_dump(mode="json")
+        envelope_payload["successful_accounts"] = envelope.successful_accounts
+        envelope_payload["failed_accounts"] = envelope.failed_accounts
+        envelope_payload["azure_post_count"] = int(
+            extensions.get("_azure_post_count") or 0
+        )
+        return envelope_payload
+
+    if kind == CloudProviderKind.AWS:
+        # Phase 7D.3.3 — the AWS path keeps its Phase 2 read-through
+        # cache (mounted on the AWS legacy route) and does NOT go
+        # through the new Azure cache layer.  The canonical
+        # provider-neutral route serves AWS via the same envelope
+        # but does not write to cost_cache (preserves backwards
+        # compatibility with Phase 7C.2B).
+        try:
+            envelope = await _aws_envelope()
+        except AzureCostError as exc:
+            return _azure_error_response(exc)
+        except Exception as exc:  # noqa: BLE001 - sanitised
+            logger.warning(
+                "cloud.costs.upstream_failed provider=%s code=%s",
+                kind.value, type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "error_code": type(exc).__name__,
+                    "message": "upstream cost provider failed",
+                },
+            )
+        response = CloudCostReportResponse(
+            report=envelope,
+            cache_status=CacheStatus.REFRESHED,
+            cached_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
+        )
+        return response.model_dump(mode="json")
+
+    # AZURE — route through the new cache layer.
+    from app.services.cloud.azure.cost_cache import (
+        AzureDataFreshness,
+        get_or_refresh_azure_canonical,
+    )
+
+    # Reset the POST counter at the entry of the loader so the
+    # value we persist reflects only this canonical request.
+    from app.services.cloud.azure.costs import (
+        get_and_reset_azure_post_count as _reset_post_count,
+    )
+
+    async def _azure_loader() -> dict:
+        # Reset BEFORE the loader runs so the count includes only
+        # this canonical request's POSTs.  The reset value is
+        # harmless if the loader short-circuits; the route layer
+        # reads the post-load value via the same helper.
+        _reset_post_count()
+        envelope_dict = await _azure_envelope_dict()
+        # Read the post-load counter and attach it to the
+        # envelope payload before it lands in the cache.
+        from app.services.cloud.azure.costs import azure_post_count
+        envelope_dict["azure_post_count"] = int(azure_post_count())
+        return envelope_dict
 
     try:
-        envelope = await _loader()
+        entry = await get_or_refresh_azure_canonical(
+            scope=scope,
+            region=effective_region or "",
+            kind=cache_kind,
+            signature=cache_signature,
+            loader=_azure_loader,
+        )
     except AzureCostError as exc:
         return _azure_error_response(exc)
     except Exception as exc:  # noqa: BLE001 - sanitised
         logger.warning(
-            "cloud.costs.upstream_failed provider=%s code=%s",
-            kind.value, type(exc).__name__,
+            "cloud.costs.upstream_failed provider=AZURE code=%s",
+            type(exc).__name__,
         )
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -773,11 +875,46 @@ async def get_cloud_costs(
             },
         )
 
+    # Rehydrate the cached envelope dict into a CloudCostReport.
+    try:
+        envelope = CloudCostReport.model_validate(entry.payload)
+    except Exception as exc:  # noqa: BLE001 - corrupted cache row
+        logger.warning(
+            "cloud.costs.cache.corrupt_payload key=%s code=%s",
+            entry.cache_key, type(exc).__name__,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={
+                "status": "error",
+                "error_code": "CorruptCachePayload",
+                "message": "cached envelope failed validation; please retry",
+            },
+        )
+
+    # Translate the cache layer's enum onto the schema enum.
+    cache_status_mapping = {
+        AzureDataFreshness.LIVE: CacheStatus.REFRESHED,
+        AzureDataFreshness.CACHED: CacheStatus.HIT,
+        AzureDataFreshness.STALE: CacheStatus.STALE,
+        AzureDataFreshness.UNAVAILABLE: CacheStatus.MISS,
+    }
+    cache_status = cache_status_mapping.get(entry.data_freshness, CacheStatus.REFRESHED)
+    data_freshness_value = entry.data_freshness.value
+
+    # Compute cache expiry hint based on the freshness window.
+    if entry.data_freshness == AzureDataFreshness.STALE:
+        expires_at = entry.last_successful_at or datetime.now(timezone.utc)
+    else:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=300)
+
     response = CloudCostReportResponse(
         report=envelope,
-        cache_status=CacheStatus.REFRESHED,
-        cached_at=datetime.now(timezone.utc),
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
+        cache_status=cache_status,
+        cached_at=entry.last_successful_at,
+        expires_at=expires_at,
+        data_freshness=data_freshness_value,
+        last_successful_at=entry.last_successful_at,
     )
     return response.model_dump(mode="json")
 

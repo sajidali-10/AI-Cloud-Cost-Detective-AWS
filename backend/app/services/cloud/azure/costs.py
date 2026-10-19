@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -153,6 +154,150 @@ UNASSIGNED_BUCKET: str = "Unassigned"
 #: Validated dynamically before use — see :func:`_resolve_columns`.
 DIM_SERVICE_NAME: str = "ServiceName"
 DIM_RESOURCE_LOCATION: str = "ResourceLocation"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7D.3.3 — POST counter (process-local, never logged).
+# ---------------------------------------------------------------------------
+
+
+class _AzurePostCounter:
+    """Thread-safe counter of outbound Azure Cost Management POSTs.
+
+    The counter is the only instrumentation the cache layer needs to
+    correlate BEFORE/AFTER measurements against the cached row's
+    ``azure_post_count`` column.  It is never logged as a payload —
+    only its integer value is surfaced through the cache row.
+    """
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def inc(self, n: int = 1) -> None:
+        with self._lock:
+            self._value += n
+
+    def get(self) -> int:
+        with self._lock:
+            return self._value
+
+    def reset(self) -> int:
+        with self._lock:
+            previous = self._value
+            self._value = 0
+        return previous
+
+
+_azure_post_counter = _AzurePostCounter()
+
+
+def get_and_reset_azure_post_count() -> int:
+    """Reset + return the current Azure POST counter.
+
+    Called by the cache layer after a single canonical request
+    completes so the value can be persisted to the cache row.
+    """
+    return _azure_post_counter.reset()
+
+
+def azure_post_count() -> int:
+    """Read the counter without resetting (for tests / observability)."""
+    return _azure_post_counter.get()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7D.3.3 — bounded retry + Retry-After honour.
+# ---------------------------------------------------------------------------
+
+
+def _retry_max_attempts() -> int:
+    """Number of retries AFTER the first attempt.
+
+    The spec targets a maximum of 2 retries (3 attempts total).
+    Tests can pin this to ``0`` or ``1`` via the env knob.
+    """
+    return int(os.getenv("AZURE_COST_RETRY_MAX_ATTEMPTS", "2"))
+
+
+def _retry_base_seconds() -> float:
+    """Initial backoff interval (seconds).  Subsequent retries
+    double this up to ``_retry_max_seconds``.
+    """
+    return float(os.getenv("AZURE_COST_RETRY_BASE_SECONDS", "0.5"))
+
+
+def _retry_max_seconds() -> float:
+    """Maximum backoff interval (seconds).  Caps the
+    exponential schedule so a flapping throttle cannot push the
+    loop into multi-second waits.
+    """
+    return float(os.getenv("AZURE_COST_RETRY_MAX_SECONDS", "4.0"))
+
+
+def _retry_jitter_seconds() -> float:
+    """Random jitter added to every backoff interval (seconds)."""
+    return float(os.getenv("AZURE_COST_RETRY_JITTER_SECONDS", "0.25"))
+
+
+import random
+
+
+def with_azure_retry(operation):
+    """Execute ``operation()`` with bounded retry.
+
+    Retries ONLY on
+    :class:`AzureCostErrorCategory.THROTTLED`,
+    :class:`AzureCostErrorCategory.UPSTREAM_ERROR` (5xx),
+    and :class:`AzureCostErrorCategory.NETWORK_ERROR`.
+    Auth failures (401 / 403 / 404) propagate immediately.
+
+    When the raised :class:`AzureCostError` carries a
+    ``Retry-After`` value, that value is honoured on the first
+    retry (capped by ``_retry_max_seconds`` so an unusual
+    upstream value cannot stall the worker).
+
+    Phase 7D.3.3 deliberately replaces the prior "spin retries at
+    hundreds of milliseconds" pattern with a small bounded loop —
+    spinning makes the throttle worse and provides no
+    informational value.
+    """
+
+    def _sleep_for(attempt: int, exc: "AzureCostError") -> float:
+        if exc.retry_after is not None and exc.retry_after > 0:
+            return min(float(exc.retry_after), _retry_max_seconds())
+        base = _retry_base_seconds() * (2 ** attempt)
+        cap = min(base, _retry_max_seconds())
+        jitter = random.uniform(0.0, _retry_jitter_seconds())
+        return cap + jitter
+
+    def wrapper(*args, **kwargs):
+        max_attempts = max(1, 1 + _retry_max_attempts())
+        for attempt in range(max_attempts):
+            try:
+                return operation(*args, **kwargs)
+            except AzureCostError as exc:
+                if exc.category not in (
+                    AzureCostErrorCategory.THROTTLED,
+                    AzureCostErrorCategory.UPSTREAM_ERROR,
+                    AzureCostErrorCategory.NETWORK_ERROR,
+                ):
+                    raise
+                if attempt + 1 >= max_attempts:
+                    raise
+                sleep_for = _sleep_for(attempt, exc)
+                logger.info(
+                    "azure.cost.query.retry attempt=%d sleep=%.2fs code=%s",
+                    attempt + 1,
+                    sleep_for,
+                    exc.category.value,
+                )
+                import time as _time
+                _time.sleep(sleep_for)
+        # Defensive — the loop above always returns or raises.
+        raise AzureCostError(category=AzureCostErrorCategory.UPSTREAM_ERROR)
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +561,11 @@ class AzureCostClient:
                     response = self._http.post(
                         url, json=body, headers=headers
                     )
+                # Phase 7D.3.3 — count every outbound POST so the
+                # cache layer can report BEFORE/AFTER measurements.
+                # Pagination re-uses the same body, so we count each
+                # page as one POST.
+                _azure_post_counter.inc()
             except httpx.HTTPError as exc:
                 logger.warning(
                     "azure.cost.query.network_error sub=%s code=%s",

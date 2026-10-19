@@ -92,6 +92,7 @@ import {
   dataReadinessLabel,
   deriveCostCompleteness,
   deriveDashboardReadiness,
+  deriveDataFreshness,
   type DataReadinessKind,
   type DomainSnapshot,
 } from '../lib/finops/costCompleteness'
@@ -438,6 +439,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           providerLabel={provider === 'AZURE' ? 'Total Spend' : 'Total Spend'}
           lastGood={cost.entry.lastGood?.report ?? null}
           stale={!!cost.entry.error && !!cost.entry.lastGood}
+          freshness={deriveDataFreshness(cost.entry.data)}
         />
         <ChangeKpi
           report={cost.entry.data?.report ?? null}
@@ -628,6 +630,7 @@ export function SpendKpi({
   providerLabel,
   lastGood,
   stale,
+  freshness,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
@@ -640,9 +643,12 @@ export function SpendKpi({
   /** Whether ``lastGood`` is being rendered because the current
    *  fetch failed.  Drives a "Stale" caption. */
   stale?: boolean
+  /** Phase 7D.3.3 — server-emitted cache-freshness signal. */
+  freshness?: ReturnType<typeof deriveDataFreshness>
 }) {
   const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
   const completeness = deriveCostCompleteness(report)
+  const fresh = freshness ?? deriveDataFreshness(null)
   if (loading && !report) {
     return <MetricCard label={providerLabel} description="Loading…" value={undefined} />
   }
@@ -655,12 +661,17 @@ export function SpendKpi({
   if (completeness.kind === 'unavailable') {
     if (lastGood && deriveCostCompleteness(lastGood).kind !== 'unavailable') {
       const lg = lastGood
+      // Phase 7D.3.3 — when the server reports ``data_freshness='STALE'``
+      // we have a precise last-successful timestamp to surface.
+      const staleDesc = fresh.kind === 'stale'
+        ? `${label} · ${lg.currency} · ${fresh.description} · refresh unavailable`
+        : `${label} · ${lg.currency} · Stale · refresh unavailable`
       return (
         <MetricCard
           label={providerLabel}
           icon={<SpendIcon />}
           value={formatCurrencyCompact(lg.total_cost, lg.currency)}
-          description={`${label} · ${lg.currency} · Stale · refresh unavailable`}
+          description={staleDesc}
           tone="warning"
 
         />
@@ -694,12 +705,20 @@ export function SpendKpi({
       />
     )
   }
+  // Phase 7D.3.3 — surface STALE / CACHED freshness so the user
+  // can tell the data isn't brand-new.
+  let description = `${label} · ${live.currency}`
+  if (fresh.kind === 'stale') {
+    description = `${label} · ${live.currency} · ${fresh.description}`
+  } else if (fresh.kind === 'cached') {
+    description = `${label} · ${live.currency} · Cached`
+  }
   return (
     <MetricCard
       label={providerLabel}
       icon={<SpendIcon />}
       value={formatCurrencyCompact(live.total_cost, live.currency)}
-      description={`${label} · ${live.currency}`}
+      description={description}
 
     />
   )

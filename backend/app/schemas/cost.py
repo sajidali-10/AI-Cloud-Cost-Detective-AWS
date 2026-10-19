@@ -24,11 +24,35 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class CacheStatus(str, Enum):
-    """How a given ``CostReportResponse`` was served by the cache layer."""
+    """How a given ``CostReportResponse`` was served by the cache layer.
+
+    Phase 7D.3.3 adds ``STALE`` to the enum so the Azure cache
+    layer can surface a last-known-good fallback.  The value is
+    additive — every existing consumer that checked
+    ``HIT``/``MISS``/``REFRESHED`` continues to work; ``STALE``
+    is a new value that an explicitly-upgraded consumer (the
+    frontend readiness derivation) maps to the "Stale" UI label.
+    """
 
     HIT = "HIT"
     MISS = "MISS"
     REFRESHED = "REFRESHED"
+    STALE = "STALE"
+
+
+class DataFreshness(str, Enum):
+    """Phase 7D.3.3 — coarse freshness signal the frontend renders.
+
+    Distinct from :class:`CacheStatus` because HIT and REFRESHED
+    both produce LIVE data; only STALE / MISS produce non-LIVE.
+    AWS consumers that do not yet emit this field default to
+    ``LIVE`` so the additive change is fully backward compatible.
+    """
+
+    LIVE = "LIVE"
+    CACHED = "CACHED"
+    STALE = "STALE"
+    UNAVAILABLE = "UNAVAILABLE"
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +311,26 @@ class CloudCostReport(BaseModel):
     account_errors: List[CloudCostAccountError] = Field(default_factory=list)
     source: str = "CLOUD_COST"
 
+    # ------------------------------------------------------------------
+    # Phase 7D.3.3 — additive completeness + freshness metadata.
+    # All Optional so existing AWS clients that do not populate them
+    # continue to deserialise without changes.
+    # ------------------------------------------------------------------
+
+    #: Number of subscriptions / accounts that returned real cost
+    #: data (already populated in Phase 7D.3.2; duplicated here so
+    #: the canonical envelope is self-describing without an
+    #: adapter-specific projection).
+    successful_accounts: Optional[int] = None
+
+    #: Number of subscriptions / accounts that returned an error
+    #: (THROTTLED / AUTH / ...).
+    failed_accounts: Optional[int] = None
+
+    #: Number of Azure Cost Management POSTs in the last successful
+    #: refresh (BEFORE/AFTER measurement).  Zero for AWS responses.
+    azure_post_count: Optional[int] = None
+
 
 class CloudCostReportResponse(BaseModel):
     """The wire envelope for a provider-neutral cost report."""
@@ -298,6 +342,21 @@ class CloudCostReportResponse(BaseModel):
     cached_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
 
+    # ------------------------------------------------------------------
+    # Phase 7D.3.3 — additive cache-freshness metadata.
+    # All Optional so existing clients that ignore the new fields
+    # continue to deserialise without changes.
+    # ------------------------------------------------------------------
+
+    #: Coarse freshness signal the frontend renders.  ``None`` for
+    #: clients that do not yet populate it (treated as ``LIVE``).
+    data_freshness: Optional["DataFreshness"] = None
+
+    #: Timestamp of the most recent successful upstream call.
+    #: Populated by the Azure cache layer; ``None`` for AWS or for
+    #: legacy envelopes.
+    last_successful_at: Optional[datetime] = None
+
 
 __all__ = [
     "AccountCostError",
@@ -308,6 +367,7 @@ __all__ = [
     "CloudCostReport",
     "CloudCostReportResponse",
     "CostPeriod",
+    "DataFreshness",
     "CostReport",
     "CostReportResponse",
     "DailyCostPoint",

@@ -1,6 +1,6 @@
-// Phase 7D.3.2 — Shared cost-completeness and readiness helpers.
+// Phase 7D.3.2 / 7D.3.3 — Shared cost-completeness and readiness helpers.
 //
-// This module is the SINGLE source of truth for two questions
+// This module is the SINGLE source of truth for three questions
 // the Dashboard and Costs pages used to answer differently:
 //
 //   1. Given a successful cost response, is the numeric total
@@ -12,19 +12,22 @@
 //      See ``deriveDashboardReadiness`` and
 //      ``deriveDataReadinessLabel``.
 //
-// Before Phase 7D.3.2, DashboardPage had its own
-// ``successful_accounts`` / ``failed_accounts`` branches and the
-// Costs page rendered raw ``report.total_cost`` even when
-// ``status='PARTIAL_SUCCESS'`` and ``successful_accounts === 0``.
-// The asymmetry surfaced "$0.00" as authoritative spend whenever
-// Azure throttled every subscription.
+//   3. Given a ``data_freshness`` hint from the server (Phase
+//      7D.3.3), what single freshness label should the KPI tiles
+//      and hero surface?  See ``deriveDataFreshness``.
 //
-// No new backend fields are required.  The canonical
-// ``CloudCostReport`` envelope already carries
-// ``status`` / ``currency_status`` / ``by_account`` /
-// ``account_errors``; the frontend derives the per-report view
-// model from those fields (see ``adaptCloudCostReport`` in
-// ``./cloudCosts``).
+// Phase 7D.3.2 also locked down the asymmetry where the
+// Dashboard had its own ``successful_accounts`` /
+// ``failed_accounts`` branches and the Costs page rendered raw
+// ``report.total_cost`` even when ``status='PARTIAL_SUCCESS'``
+// and ``successful_accounts === 0``.  The asymmetry surfaced
+// "$0.00" as authoritative spend whenever Azure throttled every
+// subscription.
+//
+// Phase 7D.3.3 extends the model with the FRESH / STALE-LKG
+// signal so the Dashboard / Costs pages can render "Stale ·
+// last successful <time>" without breaking Phase 7D.3.2
+// invariants.
 
 import type { CostReport, CostReportResponse } from '../../types/finops'
 import type { LoadStatus } from './cache'
@@ -217,5 +220,88 @@ export function costDomainSnapshot(
     status,
     error,
     hasData: completeness.kind !== 'unavailable',
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Phase 7D.3.3 — Data freshness (server hint → view-model)
+// ---------------------------------------------------------------------------
+
+export type DataFreshnessKind = 'live' | 'cached' | 'stale' | 'unavailable'
+
+export interface DataFreshness {
+  kind: DataFreshnessKind
+  /** Friendly description for KPI subtitle: "Cached" / "Stale · last successful <time>" / etc. */
+  description: string
+  /** Last successful upstream timestamp; ``null`` for ``unavailable``. */
+  lastSuccessfulAt: string | null
+}
+
+/**
+ * Map the server-emitted ``data_freshness`` hint onto a view-model
+ * the KPI tiles and hero can render directly.
+ *
+ * Defaults to ``'live'`` for AWS responses and for legacy fixtures
+ * that do not yet populate the new field — preserves every Phase
+ * 7A / 7B / 7C / 7D.1 / 7D.2 regression contract.
+ */
+export function deriveDataFreshness(
+  response: CostReportResponse | null | undefined,
+): DataFreshness {
+  if (!response) {
+    return { kind: 'unavailable', description: 'no data', lastSuccessfulAt: null }
+  }
+  const hint = response.data_freshness ?? null
+  const lastSuccessful = response.last_successful_at ?? null
+  switch (hint) {
+    case 'STALE':
+      return {
+        kind: 'stale',
+        description: lastSuccessful
+          ? `Stale · last successful ${formatShortTimestamp(lastSuccessful)}`
+          : 'Stale',
+        lastSuccessfulAt: lastSuccessful,
+      }
+    case 'CACHED':
+      return {
+        kind: 'cached',
+        description: lastSuccessful
+          ? `Cached · ${formatShortTimestamp(lastSuccessful)}`
+          : 'Cached',
+        lastSuccessfulAt: lastSuccessful,
+      }
+    case 'UNAVAILABLE':
+      return {
+        kind: 'unavailable',
+        description: 'Azure refresh temporarily unavailable',
+        lastSuccessfulAt: lastSuccessful,
+      }
+    case 'LIVE':
+    default:
+      return {
+        kind: 'live',
+        description: 'Live',
+        lastSuccessfulAt: lastSuccessful,
+      }
+  }
+}
+
+/**
+ * Best-effort short timestamp formatter.  We do NOT pull in a
+ * date library — ``Intl.DateTimeFormat`` is universally available
+ * in modern browsers + Node 20+.
+ */
+function formatShortTimestamp(iso: string): string {
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return iso
+    return d.toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    })
+  } catch {
+    return iso
   }
 }

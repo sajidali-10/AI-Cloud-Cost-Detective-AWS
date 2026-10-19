@@ -61,9 +61,21 @@ export interface CloudCostReport {
 
 export interface CloudCostReportResponse {
   report: CloudCostReport
-  cache_status: 'HIT' | 'MISS' | 'REFRESHED'
+  cache_status: 'HIT' | 'MISS' | 'REFRESHED' | 'STALE'
   cached_at: string | null
   expires_at: string | null
+  /** Phase 7D.3.3 — coarse freshness signal the frontend renders.
+   *  ``undefined`` for AWS responses (legacy) and for older
+   *  Azure fixtures — treated as ``'LIVE'`` by the readiness
+   *  derivation. */
+  data_freshness?: 'LIVE' | 'CACHED' | 'STALE' | 'UNAVAILABLE' | null
+  /** Phase 7D.3.3 — timestamp of the most recent successful
+   *  upstream call.  ``null`` for AWS responses or when the
+   *  cache has never seen a success. */
+  last_successful_at?: string | null
+  /** Phase 7D.3.3 — number of Azure Cost Management POSTs in
+   *  the last successful refresh.  ``null`` for AWS responses. */
+  azure_post_count?: number | null
 }
 
 export function buildCloudCostsCacheKey(
@@ -189,5 +201,11 @@ export function adaptCloudCostReport(
     cache_status: response.cache_status,
     cached_at: response.cached_at,
     expires_at: response.expires_at,
+    // Phase 7D.3.3 — propagate cache-freshness metadata so the
+    // readiness derivation can render "Cached" / "Stale" labels
+    // and the KPI tiles can show "Stale · last successful <time>".
+    data_freshness: response.data_freshness ?? null,
+    last_successful_at: response.last_successful_at ?? null,
+    azure_post_count: response.azure_post_count ?? null,
   }
 }
