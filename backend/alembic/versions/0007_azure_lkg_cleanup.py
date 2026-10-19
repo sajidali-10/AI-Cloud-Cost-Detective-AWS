@@ -1,6 +1,6 @@
 """azure cost cache — invalidate invalid LKG rows
 
-Revision ID: 0007_azure_invalidate_invalid_lkg
+Revision ID: 0007_azure_lkg_cleanup
 Revises: 0006_azure_cost_cache_resilience
 Create Date: 2026-10-19
 
