@@ -26,6 +26,7 @@ import { CostsPage } from './pages/CostsPage'
 import { ResourcesPage } from './pages/ResourcesPage'
 import { OptimizationPage } from './pages/OptimizationPage'
 import { AIAnalystPage } from './pages/AIAnalystPage'
+import { CloudAIPage } from './pages/CloudAIPage'
 import { ConversationsPage } from './pages/ConversationsPage'
 import { UsersPage } from './pages/UsersPage'
 import { SecurityPage } from './pages/SecurityPage'
@@ -98,6 +99,7 @@ function buildRoutes({ role, user, authEnabled }: BuildRoutesArgs): RouteSpec[] 
   ]
   if (role === 'ADMIN' || role === 'ANALYST') {
     r.push({ path: '/analyst', element: <AIAnalystPage /> })
+    r.push({ path: '/cloud-ai', element: <CloudAIPage /> })
     r.push({ path: '/conversations', element: <ConversationsPage /> })
   }
   if (role === 'ADMIN') {
