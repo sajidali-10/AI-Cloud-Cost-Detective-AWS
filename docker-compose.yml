@@ -71,8 +71,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # Phase 8.1: do not block the UI on LiteLLM being healthy.
+      # When AI_ENABLED=false the application talks to LiteLLM at request
+      # time and tolerates a missing/broken gateway; gating backend startup
+      # on `service_healthy` was previously cascading the LiteLLM outage
+      # (pre-existing: `cost-analyst` model alias is None) into a total
+      # dashboard outage via Nginx → backend → litellm.  `service_started`
+      # only waits for the LiteLLM process to exist, so the core FinOps
+      # surfaces stay available even when AI is degraded.  When a real
+      # provider is wired in (Phase 8.2+), this remains safe because the
+      # backend's AI client fails open with `enabled=False` until the
+      # gateway becomes reachable.
       litellm:
-        condition: service_healthy
+        condition: service_started
     environment:
       APP_ENV: ${APP_ENV}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
@@ -154,10 +165,24 @@ services:
         condition: service_healthy
       frontend:
         condition: service_healthy
+    # Phase 8.1: Nginx is the only host-published reverse proxy.
+    #   :80  — HTTP → HTTPS permanent redirect for finops.hiplink.com
+    #   :443 — TLS termination, serves SPA + proxies /api/*
+    # Backend (8000), frontend (8080), LiteLLM (4000), and Postgres (5432)
+    # are intentionally NOT host-published — they are reachable only via
+    # the internal `internal` Docker network.
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # Production TLS files.  Mounted read-only from the host path
+      # `/etc/finops/tls/` (operator-managed).  If the directory does
+      # not yet exist, Docker auto-creates it as an empty dir so the
+      # mount succeeds; `nginx -t` then fails until the operator drops
+      # in `fullchain.pem` + `privkey.pem`.  See
+      # docs/phase8-1-https-nginx.md for the install procedure.
+      - /etc/finops/tls:/etc/nginx/tls:ro
     networks:
       - internal
     healthcheck:

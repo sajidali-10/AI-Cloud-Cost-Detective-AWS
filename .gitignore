@@ -63,3 +63,8 @@ temp/
 # --- Generated / local-only content ---
 .kimchi/scratch/
 .kimchi/
+
+# --- Phase 8.1 dev placeholder certificate (for nginx -t validation
+# only; the real *.hiplink.com wildcard is installed at /etc/finops/tls/
+# on the host and is never committed). ---
+scripts/certs-dev-placeholder/
