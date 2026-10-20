@@ -116,22 +116,32 @@ ssl_certificate_key /etc/nginx/tls/privkey.pem;
 
 ### Installation
 
-Until the real `*.hiplink.com` wildcard is installed, a **self-signed
-dev placeholder** is generated locally for deterministic `nginx -t`
-validation only.  That placeholder is NOT a production certificate and
-must be replaced.
+> **Status: production `*.hiplink.com` wildcard is installed.**  
+> The certificate was issued by **Sectigo** (CN=Sectigo Public Server
+> Authentication CA DV R36), covers `*.hiplink.com` (so it includes
+> `finops.hiplink.com`), and expires **Jan 20 23:59:59 2027 GMT**.
+> Live chain validation against the system trust store PASSES — see
+> §16 for the validator output.
 
-To install the real wildcard:
+Until the real wildcard is in place, a **self-signed dev placeholder**
+is generated locally for deterministic `nginx -t` validation only.
+That placeholder is NOT a production certificate and must be replaced
+before any Phase 8.1 closure.
+
+To install (or replace) the wildcard:
 
 ```bash
 sudo install -d -m 0755 -o root -g root /etc/finops/tls
 sudo install -m 0644 -o root -g root fullchain.pem /etc/finops/tls/fullchain.pem
 sudo install -m 0600 -o root -g root privkey.pem   /etc/finops/tls/privkey.pem
 sudo ./scripts/phase8_1_nginx_config_test.sh
+docker compose up -d --force-recreate --no-deps nginx
+./scripts/phase8_1_https_validation.sh   # gate #13 must PASS
 ```
 
-After installation, `nginx -t` will succeed and Phase 8.1 validation
-gate #13 will move from `PEND` to `PASS`.
+After installation, `nginx -t` succeeds and Phase 8.1 validation gate
+#13 validates the live chain (see §16).  With a trusted CA-signed cert
+installed, gate #13 must report `PASS`, never `PENDING`.
 
 ### Secrets policy
 
@@ -203,30 +213,33 @@ before deployment to avoid breaking the SPA.
 
 ---
 
-## 9. HSTS activation rule
+## 9. HSTS
 
-> **HSTS is intentionally NOT enabled in Phase 8.1.**
+> **Status: HSTS is enabled** on the production `:443` server block
+> serving `finops.hiplink.com`.  The live trusted-chain validator
+> (gate #13) reports `PASS` for the served `*.hiplink.com` wildcard
+> (Sectigo DV R36), so HSTS has been activated per the closure spec.
 
-HSTS will only be enabled after the live HTTPS path has been
-successfully validated end-to-end with the real `*.hiplink.com`
-wildcard.  Activation procedure:
+Directive emitted on every HTTPS response (including 4xx):
 
-1. Confirm `curl https://finops.hiplink.com/ -I` returns 200 with a
-   browser-trusted certificate.
-2. Confirm the validator (`scripts/phase8_1_https_validation.sh`)
-   reports `pass=N fail=0 pending=0`.
-3. Edit `nginx/default.conf` and uncomment the HSTS directive in the
-   finops.hiplink.com `:443` server block:
+```
+Strict-Transport-Security: max-age=31536000
+```
 
-   ```
-   add_header Strict-Transport-Security "max-age=31536000" always;
-   ```
+* `max-age=31536000` — one year (the standard production value).
+* **`includeSubDomains` is deliberately omitted.**  This application
+  does not own or control every `*.hiplink.com` vhost; activating
+  HSTS for subdomains would impose HTTPS-only policy on unrelated
+  services without their owners' consent.
+* **`preload` is deliberately omitted.**  Browsers' HSTS preload list
+  is permanent and global; submitting this hostname would be
+  irreversible for every `*.hiplink.com` vhost.  Preload is a
+  separate decision that requires explicit operator sign-off and
+  is out of scope for Phase 8.1.
 
-4. Restart Nginx: `docker compose up -d --force-recreate --no-deps nginx`.
-
-**Do NOT add `includeSubDomains` or `preload`** in Phase 8.1 — that
-would impose HTTPS-only policy on every `*.hiplink.com` vhost without
-explicit sign-off from the owners of those vhosts.
+Gate #10 of the validator confirms the exact directive is present and
+fails if any other form (`includeSubDomains`, `preload`, shorter
+`max-age`, etc.) is detected.
 
 ---
 
@@ -349,22 +362,40 @@ Verifies 14 gates:
 7. HTTP→HTTPS 301 redirect for production Host
 8. HTTPS `/` returns 2xx
 9. HTTPS `/api/health` returns 2xx
-10. Security headers present
+10. Security headers present (including HSTS = `max-age=31536000`)
 11. TLS 1.2 + 1.3 succeed; TLS 1.0 + 1.1 rejected
 12. Certificate covers `finops.hiplink.com`
-13. Certificate chain validates
+13. **Certificate chain validates against the system trust store via
+    a live `openssl s_client` handshake against `finops.hiplink.com:443`
+    with `-verify_return_error`.**  Local-file
+    `openssl verify fullchain.pem` is NOT used for gate #13 because
+    a passing local-file check can hide a broken served chain.
+    `Verification: OK` / `Verify return code: 0` is required.
 14. Internal `http://localhost` path still serves the SPA (Phase 7)
+
+**Closure result (real signed `*.hiplink.com` wildcard from Sectigo):**
+
+```
+Phase 8.1 summary
+  pass=27  fail=0  pending=0  skipped=0
+DETERMINISTIC CONFIGURATION: PASS
+LIVE TLS: PASS
+```
 
 Exit codes:
 
 | Code | Meaning                                                 |
 |------|---------------------------------------------------------|
-| 0    | All deterministic checks PASS; live checks PASS or PEND |
-| 1    | One or more deterministic checks FAIL                   |
+| 0    | All checks PASS (deterministic + live TLS + gate #13)   |
+| 1    | One or more checks FAIL or PEND                         |
 | 2    | Pre-condition violated                                  |
 
-Until the real `*.hiplink.com` wildcard is installed, gate #13 reports
-`PENDING` with self-signed-certificate info.  This is intentional.
+Gate #13 is intentionally **non-pending** once a CA-signed certificate
+is installed at `/etc/finops/tls/`.  It either validates the live chain
+(`PASS`) or it fails (`FAIL`).  The old self-signed-placeholder
+`PENDING` branch has been removed — a self-signed certificate cannot
+satisfy live chain validation against the system trust store and
+must be replaced before Phase 8.1 closure.
 
 ---
 
@@ -452,8 +483,8 @@ limited to restoring the previous `docker-compose.yml` +
 |----------------------------------------------------------------------|-----------------------------------------------------------|
 | `nginx -t` fails with "cannot load certificate"                      | `/etc/finops/tls/` empty or files missing                  |
 | `nginx -t` fails with "host not found in upstream"                   | Compose service `nginx` not on `internal` network         |
-| `nginx -t` warns "ssl_stapling ignored, issuer certificate not found"| Self-signed dev placeholder; resolves with real CA cert    |
-| HTTPS connection reset; HTTP curl returns Apache                     | A second web server bound to public IP; check `ss -lntp`  |
+| Gate #13 reports `Verification error`                                | Chain incomplete or wrong intermediate; verify served chain with `openssl s_client -connect finops.hiplink.com:443 -servername finops.hiplink.com -verify_return_error` |
+| HSTS header missing in `curl -I https://finops.hiplink.com/`         | Nginx not reloaded after `nginx/default.conf` change; run `docker compose up -d --force-recreate --no-deps nginx` |
 | Phase 7D.5 regression breaks                                         | Backend source changed; restore from `phase-7d5-complete` tag |
 | LiteLLM keeps restarting, dashboard unaffected                       | Pre-existing issue; AI is disabled (`AI_ENABLED=false`)   |
 
@@ -472,14 +503,14 @@ are documented here for visibility only:
   `litellm: service_started` so the dashboard remains available when
   `AI_ENABLED=false`.
 
-* **Host-level Apache interception of the bare Elastic IP** — direct
-  `http://18.210.127.233/` reaches a host-level Apache server (out of
-  Phase 8.1 scope).  Production DNS resolves `finops.hiplink.com` to
-  the same IP and is correctly handled by Docker Nginx (301 redirect).
-  Operators should plan a follow-up to remove or rebind the host-level
-  listener.
-
-* **HSTS activation** — deferred until live validation passes.
+* **Host-level Apache interception of the bare Elastic IP** —
+  rechecked during Phase 8.1 closure.  `apache2` and `httpd` are
+  **not installed** on this host (`which apache2 httpd` returns
+  nothing).  The host's only `:80`/`:443` listeners are Docker
+  Nginx (verified via `ss -lntp`, all four sockets are owned by
+  `docker-proxy`).  Direct `http://98.85.39.207/` returns
+  `301 Moved Permanently` from Docker Nginx (not Apache).  No
+  conflicting listener exists; no action taken.
 
 * **CSP** — deferred until hand-tested against the React frontend
   bundle.

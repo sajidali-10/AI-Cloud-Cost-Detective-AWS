@@ -21,16 +21,21 @@
 #
 # The validator distinguishes two states:
 #   - DETERMINISTIC configuration checks (always run, must PASS)
-#   - LIVE TLS checks (run only when a CA-signed certificate covers the
-#     production hostname).  Until the real *.hiplink.com wildcard is
-#     installed at /etc/finops/tls/, the dev placeholder self-signed cert
-#     is used and the live-TLS section reports PENDING.
+#   - LIVE TLS checks (run against the production endpoint)
+#
+# For production chain validation (gate #13) the script connects to
+# ${PROD_HOST}:443 with openssl s_client -verify_return_error and
+# requires the live handshake to verify against the system trust store.
+# Local-file `openssl verify fullchain.pem` is intentionally NOT used
+# for gate #13 — it can pass while the served chain is broken, so the
+# real chain is always validated from a live handshake.
 #
 # Output never contains the certificate private key, secret values, or
-# auth tokens.
+# auth tokens.  openssl is invoked without -k, -verify_quiet, or any
+# flag that disables certificate verification.
 #
 # Exit codes:
-#   0  every deterministic check PASSED; live checks PASSED or PENDING
+#   0  every check PASSED (deterministic + live TLS, including gate #13)
 #   1  one or more deterministic checks FAILED
 #   2  pre-condition violated
 
@@ -199,10 +204,12 @@ if echo "$HDRS" | grep -iq '^server: nginx$'; then
 else
     bad "server banner not minimal: $(echo "$HDRS" | awk '/^[Ss]erver:/ {print $2}')"
 fi
-if echo "$HDRS" | grep -iq '^strict-transport-security'; then
-    info "HSTS is enabled — ensure live validation preceded this (Phase 8.1 §13)"
+if echo "$HDRS" | grep -iq '^strict-transport-security:[[:space:]]*max-age=31536000'; then
+    ok "HSTS present: Strict-Transport-Security: max-age=31536000"
+elif echo "$HDRS" | grep -iq '^strict-transport-security'; then
+    bad "HSTS present but with wrong directive (must be max-age=31536000 only — no includeSubDomains, no preload)"
 else
-    info "HSTS is NOT enabled (correct per §13 — enable after live validation)"
+    bad "HSTS header MISSING — required after live trusted-chain validation"
 fi
 
 # ---------------------------------------------------------------------------
@@ -255,23 +262,45 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 13. Certificate chain validates (live).
+# 13. Certificate chain validates (live, against the production endpoint).
+#
+# Production chain validation must exercise the certificate chain
+# ACTUALLY SERVED by Nginx on finops.hiplink.com:443 — not merely
+# the local fullchain.pem file.  Local-file verification can pass
+# while the served chain is broken (e.g. wrong intermediate order,
+# missing intermediate on disk, SNI mismatch), so we always validate
+# the live handshake with openssl s_client against the system trust
+# store.
+#
+# Rules (per Phase 8.1 closure spec):
+#   * Use -verify_return_error so failures are surfaced as a non-zero
+#     exit code and a clear "Verify return code: N" line.
+#   * Use the system trust store (no custom -CAfile, no -k, no
+#     -verify_quiet, no certificate verification disabled in any form).
+#   * Never print private-key material — only subject/issuer/verify
+#     status from the live handshake.
+#   * Gate PASSES only when the live handshake reports verify
+#     return code 0 (i.e. "Verification: OK" or "Verify return code: 0").
 # ---------------------------------------------------------------------------
 
 bold "[13/14] Certificate chain validation"
-CHAIN_OUT=$(openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt \
-    /etc/finops/tls/fullchain.pem 2>&1 || true)
-if echo "$CHAIN_OUT" | grep -qE ': OK$|: OK\s*$'; then
-    ok "Certificate chain validates against system trust store"
+SCLIENT_OUT=$(echo | openssl s_client \
+    -connect "${PROD_HOST}:443" \
+    -servername "$PROD_HOST" \
+    -verify_return_error \
+    </dev/null 2>&1 || true)
+LIVE_SUBJ=$(echo "$SCLIENT_OUT" | awk -F'subject=' '/^subject=/{print $2; exit}')
+LIVE_ISS=$(echo "$SCLIENT_OUT" | awk -F'issuer=' '/^issuer=/{print $2; exit}')
+LIVE_VRC=$(echo "$SCLIENT_OUT" | grep -E '^Verify return code:' | tail -1 | sed 's/^Verify return code:[[:space:]]*//')
+if echo "$SCLIENT_OUT" | grep -qE '^Verification: OK$|Verify return code: 0\b'; then
+    ok "Certificate chain validates against system trust store (live)"
+    if [[ -n "$LIVE_SUBJ" ]]; then info "served subject: $LIVE_SUBJ"; fi
+    if [[ -n "$LIVE_ISS"  ]]; then info "served issuer:  $LIVE_ISS";  fi
 else
-    if openssl x509 -in /etc/finops/tls/fullchain.pem -noout -issuer 2>/dev/null \
-            | grep -qE 'CN\s*=\s*'"$PROD_HOST"'\s*$'; then
-        pend "Certificate is self-signed (dev placeholder) — install real *.hiplink.com wildcard"
-        info "openssl verify output: $CHAIN_OUT"
-    else
-        pend "Certificate chain validation inconclusive — install real *.hiplink.com wildcard"
-        info "openssl verify output: $CHAIN_OUT"
-    fi
+    bad "Certificate chain validation FAILED — live ${PROD_HOST}:443 did not verify against system trust store"
+    if [[ -n "$LIVE_VRC" ]]; then info "openssl verify return code: $LIVE_VRC"; fi
+    if [[ -n "$LIVE_SUBJ" ]]; then info "served subject:  $LIVE_SUBJ"; fi
+    if [[ -n "$LIVE_ISS"  ]]; then info "served issuer:   $LIVE_ISS";  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -299,17 +328,14 @@ fi
 bold "Phase 8.1 summary"
 echo "  pass=$PASS  fail=$FAIL  pending=$PEND  skipped=$SKIP"
 echo
-if [[ "$FAIL" -eq 0 ]]; then
+if [[ "$FAIL" -eq 0 && "$PEND" -eq 0 ]]; then
     bold "DETERMINISTIC CONFIGURATION: PASS"
-    if [[ "$PEND" -eq 0 ]]; then
-        bold "LIVE TLS: PASS"
-        exit 0
-    else
-        bold "LIVE TLS: PENDING — install real *.hiplink.com wildcard certificate at /etc/finops/tls/"
-        info "See docs/phase8-1-https-nginx.md §5."
-        exit 0
-    fi
+    bold "LIVE TLS: PASS"
+    exit 0
 else
-    bold "DETERMINISTIC CONFIGURATION: FAIL — see lines above"
+    bold "PHASE 8.1: NOT GREEN — see FAIL/PEND lines above"
+    if [[ "$PEND" -ne 0 ]]; then
+        info "PENDING gates indicate a partial state — see docs/phase8-1-https-nginx.md §5/§9."
+    fi
     exit 1
 fi
