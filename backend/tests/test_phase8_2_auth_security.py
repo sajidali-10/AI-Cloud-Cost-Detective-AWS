@@ -400,3 +400,401 @@ class TestNoDevAuthInProduction:
                 jwt_secret="dev-only-change-me",
                 cors_allowed_origins=PRODUCTION_ORIGIN,
             )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.2 trusted-proxy final fix — deterministic contract tests.
+#
+# These four tests pin the security contract:
+#
+#   1.  Legitimate Nginx forwarded client IP accepted.
+#   2.  Spoofed external forwarded IP cannot override real client IP.
+#   3.  Two distinct client IPs receive independent rate-limit buckets.
+#   4.  Untrusted direct peer forwarded headers rejected.
+#
+# They are deliberately implemented against an ASGI surface
+# (Starlette ``Client`` tuple) rather than a live HTTP server so they
+# are fully deterministic, hermetic, and run in any order without
+# fixture cross-talk.  The peer IP ``172.18.0.5`` is the production
+# Nginx container's bridge address inside the ``internal`` docker
+# network — the same address that triggered the closure report.
+# ---------------------------------------------------------------------------
+
+
+class TestTrustedProxyFinalFix:
+    """Phase 8.2 closure — deterministic trusted-proxy contract tests."""
+
+    @staticmethod
+    def _build_app(*, capacity: int = 10) -> tuple[FastAPI, "AuthRateLimiter"]:
+        """Build a small FastAPI app that mirrors production wiring.
+
+        Returns ``(app, limiter)``.  The ``limiter`` is a fresh
+        in-process ``AuthRateLimiter`` so per-test state is hermetic.
+        Routes use ``resolve_client_ip(request)`` — the same call
+        the real ``/api/auth/login`` handler makes — so the rate
+        limit is keyed off whatever the middleware recorded.
+        """
+        from starlette.requests import Request
+
+        from app.core.auth_rate_limiter import AuthRateLimiter
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        app = FastAPI()
+        app.add_middleware(TrustedProxyHeadersMiddleware)
+        limiter = AuthRateLimiter(AuthRateLimit(capacity=capacity, refill_per_second=0.0))
+
+        @app.get("/whoami")
+        async def whoami(request: Request) -> dict:
+            return {
+                "client_ip": getattr(request.state, "client_ip", None),
+                "forwarded_proto": getattr(request.state, "forwarded_proto", None),
+            }
+
+        @app.post("/probe-login")
+        async def probe_login(request: Request) -> dict:
+            from app.core.auth_rate_limiter import AuthRateLimited
+
+            client_ip = resolve_client_ip(request)
+            try:
+                limiter.check(endpoint="auth.login", client_key=client_ip)
+            except AuthRateLimited as exc:
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=429,
+                    detail={"retry_after_seconds": exc.retry_after_seconds},
+                    headers={"Retry-After": str(exc.retry_after_seconds)},
+                )
+            return {"ok": True, "client_ip": client_ip}
+
+        return app, limiter
+
+    @staticmethod
+    def _make_request(
+        *, peer: tuple[str, int], method: str = "GET", path: str = "/whoami",
+        xff: str | None = None,
+        xfp: str | None = None,
+        host: str | None = None,
+    ):
+        """Build a Starlette ``Request`` with a controlled immediate peer.
+
+        The Phase 8.2 final fix tests need to simulate peer addresses
+        that ``TestClient`` cannot represent (it hardcodes
+        ``client=('testclient', 50000)``).  We construct a Starlette
+        ``Request`` directly from the ASGI scope, then drive the
+        middleware's ``dispatch`` method manually — the same pattern
+        used by the existing ``TestTrustedProxyHeaders`` class above.
+        """
+        from starlette.requests import Request
+
+        headers: list[tuple[bytes, bytes]] = []
+        if xff is not None:
+            headers.append((b"x-forwarded-for", xff.encode("latin-1")))
+        if xfp is not None:
+            headers.append((b"x-forwarded-proto", xfp.encode("latin-1")))
+        if host is not None:
+            headers.append((b"host", host.encode("latin-1")))
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": headers,
+            "client": peer,
+            "scheme": "http",
+            "server": ("test", 80),
+            "query_string": b"",
+        }
+        return Request(scope)
+
+    @staticmethod
+    def _run_middleware(mw, request) -> dict:
+        """Drive ``mw.dispatch`` and capture the resolved state.
+
+        Returns a dict with the keys ``client_ip`` and (when the
+        route set it) ``forwarded_proto``.  Mirrors what the real
+        ``/whoami`` route would record from ``request.state``.
+        """
+        import asyncio
+
+        captured: dict = {}
+
+        async def _next(_request):
+            captured["client_ip"] = getattr(_request.state, "client_ip", None)
+            captured["forwarded_proto"] = getattr(_request.state, "forwarded_proto", None)
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(mw.dispatch(request, _next))
+        finally:
+            loop.close()
+        return captured
+
+    @staticmethod
+    def _drive_request_to_route(
+        mw, request, *, limiter: "AuthRateLimiter",
+    ) -> tuple[int, dict]:
+        """Drive a request through the middleware + a route that does
+        the auth rate-limit check, returning ``(status_code, body)``.
+
+        Used by the rate-limit bucketing tests.  The route replays
+        exactly what ``/api/auth/login`` does in production:
+        ``client_ip = resolve_client_ip(request); limiter.check(...)``.
+        """
+        import asyncio
+
+        from app.core.auth_rate_limiter import AuthRateLimited, AuthRateLimiter
+        from app.core.proxy_headers import resolve_client_ip
+        from fastapi import HTTPException
+
+        async def _next(_request):
+            client_ip = resolve_client_ip(_request)
+            try:
+                limiter.check(endpoint="auth.login", client_key=client_ip)
+            except AuthRateLimited as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail={"retry_after_seconds": exc.retry_after_seconds},
+                    headers={"Retry-After": str(exc.retry_after_seconds)},
+                )
+            return {"ok": True, "client_ip": client_ip}
+
+        loop = asyncio.new_event_loop()
+        try:
+            try:
+                body = loop.run_until_complete(mw.dispatch(request, _next))
+                return 200, body if isinstance(body, dict) else {}
+            except HTTPException as exc:
+                return exc.status_code, dict(exc.headers or {})
+        finally:
+            loop.close()
+
+    # ------------------------------------------------------------------
+    # 1. Legitimate Nginx forwarded client IP accepted.
+    # ------------------------------------------------------------------
+    def test_legit_nginx_forwarded_client_ip_accepted(self) -> None:
+        """Nginx (peer 172.18.0.5, RFC1918) can forward a client IP.
+
+        The production Nginx sits at 172.18.0.5 inside the
+        ``internal`` docker bridge (172.18.0.0/16).  We construct a
+        request with that exact peer address and assert the
+        middleware records the forwarded client IP — not the
+        immediate peer.
+        """
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        request = self._make_request(
+            peer=("172.18.0.5", 443),
+            xff="203.0.113.42",
+        )
+        captured = self._run_middleware(mw, request)
+        # The forwarded client IP MUST be accepted (NOT replaced by
+        # the immediate peer).
+        assert captured["client_ip"] == "203.0.113.42", captured
+        assert captured["forwarded_proto"] == "http", captured
+
+    def test_legit_nginx_forwarded_proto_https_accepted(self) -> None:
+        """Nginx can also rewrite the scheme via X-Forwarded-Proto."""
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        request = self._make_request(
+            peer=("172.18.0.5", 443),
+            xff="203.0.113.42",
+            xfp="https",
+        )
+        captured = self._run_middleware(mw, request)
+        assert captured["forwarded_proto"] == "https", captured
+
+    # ------------------------------------------------------------------
+    # 2. Spoofed external forwarded IP cannot override real client IP.
+    # ------------------------------------------------------------------
+    def test_spoofed_external_xff_cannot_override_real_client_ip(self) -> None:
+        """A direct peer (NOT in trusted CIDRs) cannot spoof XFF.
+
+        Simulates a non-RFC1918 source — i.e. an attacker who has
+        somehow reached backend port 8000 directly (host loopback
+        or compromised docker network membership).  The middleware
+        MUST ignore the forwarded header and use the immediate peer.
+        """
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        # 198.51.100.50 is TEST-NET-2 (RFC 5737) — explicitly NOT in
+        # any default trusted CIDR.  The attacker claims to be 1.2.3.4
+        # via XFF; the backend must use the real kernel-reported
+        # source (198.51.100.50).
+        request = self._make_request(
+            peer=("198.51.100.50", 54321),
+            xff="1.2.3.4",
+        )
+        captured = self._run_middleware(mw, request)
+        assert captured["client_ip"] == "198.51.100.50", (
+            "spoofed XFF MUST NOT override the kernel-reported peer"
+        )
+
+    def test_spoofed_xff_does_not_change_rate_limit_key(self) -> None:
+        """Spoofed XFF does not allow bucket rotation for the same peer.
+
+        This is the brute-force-defence corollary: if an attacker
+        rotates XFF on every request, they MUST still share a
+        single rate-limit bucket because the trust check forces
+        the kernel-reported peer address into the bucket key.
+        """
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        _, limiter = self._build_app(capacity=2)
+
+        # Same attacker peer, three different spoofed XFF values.
+        # Bucket key must be the immediate peer (198.51.100.50),
+        # NOT the rotating XFF values.  capacity=2 means the first
+        # two succeed and the third 429s — proving the bucket is
+        # keyed by the kernel-reported peer (shared) and not the
+        # attacker-controlled XFF (rotating).
+        for idx, xff in enumerate(("1.1.1.1", "2.2.2.2", "3.3.3.3")):
+            request = self._make_request(
+                peer=("198.51.100.50", 54321),
+                method="POST",
+                path="/probe-login",
+                xff=xff,
+            )
+            status, body = self._drive_request_to_route(
+                mw, request, limiter=limiter,
+            )
+            if idx < 2:
+                assert status == 200, (xff, status, body)
+                assert body["client_ip"] == "198.51.100.50", body
+            else:
+                # Third attempt: bucket empty → 429.
+                assert status == 429, (xff, status, body)
+                assert "Retry-After" in body, body
+
+    # ------------------------------------------------------------------
+    # 3. Two distinct client IPs receive independent rate-limit buckets.
+    # ------------------------------------------------------------------
+    def test_two_distinct_client_ips_have_independent_buckets(self) -> None:
+        """Real per-client bucketing — NOT per-Nginx-container.
+
+        When Nginx forwards two different client IPs (one legitimate
+        user at 203.0.113.10, one at 203.0.113.11), they MUST land
+        in independent rate-limit buckets.  This is exactly the
+        failure mode the closure report named — the previous model
+        dropped all XFF and keyed every request by the Nginx bridge
+        IP, collapsing the entire Internet into a single bucket.
+        """
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        _, limiter = self._build_app(capacity=1)
+
+        # Both requests arrive via Nginx (peer 172.18.0.5).  Client A:
+        # 203.0.113.10.  Client B: 203.0.113.11.  Capacity=1 means each
+        # client gets exactly one token; their second attempts 429.
+        def _post(xff: str) -> tuple[int, dict]:
+            request = self._make_request(
+                peer=("172.18.0.5", 443),
+                method="POST",
+                path="/probe-login",
+                xff=xff,
+            )
+            return self._drive_request_to_route(mw, request, limiter=limiter)
+
+        # Client A's first call succeeds, Client B's first call succeeds.
+        s_a1, b_a1 = _post("203.0.113.10")
+        s_b1, b_b1 = _post("203.0.113.11")
+        assert s_a1 == 200 and b_a1["client_ip"] == "203.0.113.10", b_a1
+        assert s_b1 == 200 and b_b1["client_ip"] == "203.0.113.11", b_b1
+
+        # Second attempt per client → 429.
+        s_a2, _ = _post("203.0.113.10")
+        s_b2, _ = _post("203.0.113.11")
+        assert s_a2 == 429, s_a2
+        assert s_b2 == 429, s_b2
+
+        # Two distinct keys tracked, NOT one (the closure report
+        # explicitly named per-Nginx-container collapse as the
+        # failure mode; this assertion prevents regression).
+        assert limiter.stats()["tracked_keys"] == 2, limiter.stats()
+
+    # ------------------------------------------------------------------
+    # 4. Untrusted direct peer forwarded headers rejected.
+    # ------------------------------------------------------------------
+    def test_untrusted_direct_peer_forwarded_headers_rejected(
+        self, caplog
+    ) -> None:
+        """Direct (non-trusted) peer presenting XFF is logged + dropped.
+
+        Verifies the audit trail: when an untrusted peer presents
+        forwarded headers, the middleware logs the rejection at
+        INFO and continues using the immediate peer as the
+        authoritative client address.
+        """
+        from app.core.proxy_headers import TrustedProxyHeadersMiddleware
+
+        mw = TrustedProxyHeadersMiddleware(FastAPI())
+        # 8.8.8.8 is a public IP — not in any default trusted CIDR.
+        # The attacker also sets a fake Host header to test that
+        # header is logged but not used to influence trust.
+        request = self._make_request(
+            peer=("8.8.8.8", 33333),
+            xff="9.9.9.9, 10.0.0.1",
+            xfp="https",
+            host="spoofed.example",
+        )
+        with caplog.at_level("INFO", logger="cost-detective-backend.proxy_headers"):
+            captured = self._run_middleware(mw, request)
+
+        assert captured["client_ip"] == "8.8.8.8", captured
+        # X-Forwarded-Proto from an untrusted peer must NOT poison
+        # the recorded scheme.
+        assert captured["forwarded_proto"] == "http", captured
+
+        # The audit log MUST contain a rejection event referencing
+        # the immediate peer (8.8.8.8) — this is what the Phase 8.2
+        # closure report surfaced.
+        rejection_events = [
+            r for r in caplog.records
+            if "proxy.forwarded_headers.rejected" in r.getMessage()
+        ]
+        assert rejection_events, (
+            "expected a proxy.forwarded_headers.rejected audit log entry; "
+            f"got: {[r.getMessage() for r in caplog.records]}"
+        )
+        assert "peer=8.8.8.8" in rejection_events[0].getMessage()
+
+    def test_default_trust_set_includes_docker_bridge_cidr(self) -> None:
+        """Default trust set MUST include the Docker bridge CIDR.
+
+        The production Nginx sits at 172.18.0.5 inside the
+        172.18.0.0/16 docker bridge.  The default trusted-CIDR
+        list MUST cover that subnet (172.16.0.0/12 is the
+        superset).  Hardcoding 172.18.0.0/16 would be too tight
+        and would break any future docker-compose project that
+        happens to pick a different /16 inside the /12.
+        """
+        import ipaddress
+
+        from app.core.proxy_headers import trusted_proxy_cidrs
+
+        nets = [ipaddress.ip_network(c, strict=False) for c in trusted_proxy_cidrs()]
+
+        # Direct check: 172.18.0.5 (Nginx bridge IP from the closure
+        # report) MUST fall into one of the trusted networks.  Docker
+        # bridges always sit inside RFC1918 172.16.0.0/12, so a
+        # superset /12 in the default list covers every /16 Docker
+        # could pick (172.17.0.0/16, 172.18.0.0/16, …).
+        nginx_ip = ipaddress.ip_address("172.18.0.5")
+        assert any(nginx_ip in n for n in nets), (
+            f"Nginx bridge IP 172.18.0.5 must be in default trusted CIDR set; "
+            f"got: {nets}"
+        )
+
+        # And: the default trust set MUST NOT blindly trust public
+        # Internet ranges.  If it does, the closure report's
+        # "broadly trust arbitrary Internet sources" failure mode is
+        # back.  An attacker reaching backend port 8000 over a
+        # public IP must be rejected.
+        public_8 = ipaddress.ip_address("8.8.8.8")
+        assert not any(public_8 in n for n in nets), (
+            "default trust set MUST NOT include public Internet ranges"
+        )
