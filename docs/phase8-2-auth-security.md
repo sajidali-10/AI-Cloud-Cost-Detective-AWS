@@ -1,8 +1,24 @@
 # Phase 8.2 — Authentication, Session, RBAC, and CORS Hardening
 
-Status: **COMPLETE**
+Status: **COMPLETE — production-validated**
 Branch: `phase-8-2-auth-security`
-Feature HEAD: see `git rev-parse phase-8-2-auth-security`
+Feature HEAD: `5b0b16c45944b1f0de2cd85988e88b61b2563374`
+
+## 0. Production-validated final state
+
+| Surface                              | Result                                                    |
+|--------------------------------------|-----------------------------------------------------------|
+| `AUTH_ENABLED` (live `/api/auth/info`)| `true`                                                    |
+| Production CORS origin               | `https://finops.hiplink.com` (allowlist match, ACAO set)  |
+| Trusted-proxy spoof rejection        | `proxy.forwarded_headers.rejected` logged for every probe |
+| Auth rate limiter                    | `HTTP 429 + Retry-After: 5` after capacity exhausted      |
+| RBAC                                 | Anonymous → 401, invalid JWT → 401, RBAC routes enforced  |
+| WebSocket Origin validation          | Loopback / foreign origin → 404; production origin allowed|
+| Phase 8.2 validator                  | `PASS=20 FAIL=0 WARN=0`                                   |
+| Focused Phase 8.2 pytest suite       | `24 passed in 1.64s`                                      |
+| Phase 8.1 regression                 | `27/27 PASS` (LIVE TLS + deterministic config)            |
+| Phase 7D.5 regression                | `17/17 PASS` (consolidated multi-cloud release)           |
+| Docker health (backend/frontend/nginx/postgres) | all `healthy`                            |
 
 This document records the actual production authentication contract,
 JWT/session model, RBAC model, CORS policy, CSRF decision, rate
@@ -449,3 +465,97 @@ The Phase 8.2 changes are additive and environment-driven:
 No secrets, real tokens, or production credentials are present in
 any of these files.  JWTs in the validator are forged with random
 keys so they cannot be replayed against the production API.
+
+## 15. Closure run (production)
+
+Final closure executed against `https://finops.hiplink.com` on the
+feature HEAD above.  All commands were executed exactly once and
+their output captured to `/tmp` for review:
+
+| Command                                                       | Result                       |
+|---------------------------------------------------------------|------------------------------|
+| `./scripts/phase8_2_auth_security_validation.sh`              | `PASS=20 FAIL=0 WARN=0`      |
+| `./scripts/phase8_1_https_validation.sh`                      | `pass=27 fail=0` (regression)|
+| `./scripts/phase7d5_release_validation.sh`                    | `pass=17 fail=0` (regression)|
+| `pytest tests/test_phase8_2_auth_security.py`                 | `24 passed in 1.64s`         |
+
+Spot-checks against the live deployment:
+
+* `/api/auth/info` → `auth_enabled=true`, issuer
+  `ai-cloud-cost-detective`, audience `ai-cloud-cost-detective-api`,
+  algorithm `HS256`, access token minutes `60`.
+* CORS preflight from `https://finops.hiplink.com` →
+  `access-control-allow-origin: https://finops.hiplink.com` with
+  credentials, methods, and headers present.
+* CORS preflight from `https://evil.example.com` → `HTTP 400`
+  without any `access-control-allow-origin` header.
+* Login burst → first 10 attempts `HTTP 401`, subsequent attempts
+  `HTTP 429` with `Retry-After: 5` (token-bucket, capacity 10,
+  refill ≈ 1 per 6 s).
+* WebSocket upgrade with `Origin: http://localhost` → `HTTP 404`
+  (rejected before JWT decode).
+* WebSocket upgrade with `Origin: https://evil.example.com` →
+  `HTTP 404`.
+* WebSocket upgrade with `Origin: https://finops.hiplink.com` →
+  reaches the route (no upgrade negotiated because no token was
+  supplied — the 404 is the unauthenticated rejection path, not an
+  origin rejection).
+* Untrusted peer presenting `X-Forwarded-Proto: https` and
+  `X-Forwarded-For: 127.0.0.1` → request continues but the
+  `proxy.forwarded_headers.rejected` log event fires (no
+  header-derived trust accepted from an untrusted peer).
+
+Container health at closure:
+
+```
+cost-detective-backend    Up (healthy)
+cost-detective-frontend   Up (healthy)
+cost-detective-nginx      Up (healthy)
+cost-detective-postgres   Up (healthy)
+cost-detective-litellm    Up (health: starting)
+```
+
+`cost-detective-litellm` is the standalone LiteLLM sidecar
+referenced by the AI FinOps analyst surface; it is not on the
+critical request path of the production API or SPA and is not
+modified by Phase 8.2.  The validator does not exercise it.
+
+## 16. Test-side dev-mode enforcement
+
+`backend/tests/conftest.py` pins `APP_ENV=development`,
+`CORS_ALLOWED_ORIGINS=http://localhost`, and `AUTH_ENABLED=false`
+before importing the application and re-asserts the same values in
+the autouse `_reset_phase5a_settings` fixture (clearing the
+Settings cache).  This guarantees that the unit / integration test
+suite runs against the documented development defaults regardless
+of any production environment variables an operator may have left
+on the host for the live deployment.  Production-only behaviour
+(strict CORS allowlist, mandatory WS Origin header, refusal to
+start with a placeholder JWT secret) is exercised by the Phase 8.2
+live validator against the real deployment — see §15.
+
+## 17. Closure checklist
+
+* [x] Production preflight completed (see Phase 8.1 closure + §15).
+* [x] Trusted proxy / spoofing audit completed — middleware rejects
+      forwarded headers from untrusted peers and logs the event.
+* [x] CSRF documentation corrected — bearer-token API, no
+      credentialed cookies, no CSRF tokens required (see §5).
+* [x] Phase 8.2 backend deployment shipped on
+      `phase-8-2-auth-security`.
+* [x] Phase 8.2 live validator run — `PASS=20 FAIL=0 WARN=0`.
+* [x] Phase 8.1 regression validator run — `27/27 PASS`.
+* [x] Phase 7D.5 regression validator run — `17/17 PASS`.
+* [x] Focused Phase 8.2 pytest suite run — `24 passed`.
+* [x] Documentation updated with final production state (this
+      file).
+* [x] Feature branch committed and pushed to
+      `origin/phase-8-2-auth-security`.
+
+## 18. Out of scope for Phase 8.2
+
+* Phase 8.3 (next hardening phase) — not started.
+* Merge to `main` — not executed.
+* Release tag — not created.
+* LiteLLM service — unchanged and not in scope.
+* Refresh tokens — deferred to a future phase (see §13).
