@@ -284,12 +284,30 @@ async def health_ready(response: Response) -> Dict[str, Any]:
         "database": db_status,
         "litellm": llm_status,
     }
-    all_ok = all(v == "ok" for v in components.values())
-    if not all_ok:
+    # Phase 7D.5 (§6) — only the database is a hard readiness
+    # dependency.  LiteLLM being unreachable is a dependency
+    # condition (the AI endpoint returns a controlled UNAVAILABLE
+    # / DISABLED response) but MUST NOT mark the backend
+    # unhealthy.  Likewise, AWS / Azure transient throttling
+    # does NOT affect application readiness — those are
+    # upstream data sources, not infra dependencies.
+    db_ok = components["database"] == "ok"
+    if not db_ok:
         response.status_code = 503
         return {
-            "status": "degraded",
+            "status": "not_ready",
             "components": components,
+            "reason": "database_unavailable",
+        }
+    if llm_status != "ok":
+        # Database OK + LiteLLM down → still ready, but report
+        # the dependency condition honestly.  The AI endpoints
+        # surface DISABLED / UNAVAILABLE without making the
+        # backend unhealthy.
+        return {
+            "status": "ready",
+            "components": components,
+            "dependency_conditions": ["litellm_unavailable"],
         }
     return {
         "status": "ready",

@@ -97,6 +97,11 @@ from app.services.cloud.azure.costs import (
     AzureCostError,
     AzureCostErrorCategory,
 )
+from app.services.observability import (
+    operation_timer,
+    mark_failure,
+    new_request_id,
+)
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("cost-detective-backend.cloud_costs")
@@ -852,7 +857,15 @@ async def get_cloud_costs(
             cached_at=datetime.now(timezone.utc),
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
         )
-        return response.model_dump(mode="json")
+        response_dict = response.model_dump(mode="json")
+        # Phase 7D.5 — structured operational log.  NEVER logs secrets.
+        from app.services.observability import operation_timer
+        with operation_timer("cloud.costs") as _ops:
+            _ops["provider"] = kind.value
+            _ops["scope_kind"] = response_dict.get("report", {}).get("scope_kind", "")
+            _ops["freshness"] = response_dict.get("data_freshness", "")
+            _ops["cache_status"] = response_dict.get("cache_status", "")
+        return response_dict
 
     # AZURE — route through the new cache layer.
     from app.services.cloud.azure.cost_cache import (
@@ -955,6 +968,14 @@ async def get_cloud_costs(
     # the response envelope, NOT inside the cached payload, so it
     # cannot leak across HIT requests.
     response_dict["azure_post_count"] = int(getattr(entry, "azure_post_count", 0) or 0)
+    # Phase 7D.5 — structured operational log.  NEVER logs secrets.
+    from app.services.observability import operation_timer
+    with operation_timer("cloud.costs") as _ops:
+        _ops["provider"] = response_dict.get("provider", "")
+        _ops["scope_kind"] = response_dict.get("report", {}).get("scope_kind", "")
+        _ops["freshness"] = response_dict.get("data_freshness", "")
+        _ops["cache_status"] = response_dict.get("cache_status", "")
+        _ops["upstream_call_count"] = response_dict.get("azure_post_count", 0)
     return response_dict
 
 

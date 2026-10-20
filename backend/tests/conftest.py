@@ -1,9 +1,29 @@
 """Shared pytest fixtures: isolate tests from real env vars / secrets."""
 import os
+import socket
 
 # Ensure required settings exist BEFORE app imports.
 os.environ.setdefault("APP_SECRET_KEY", "test-secret")
-os.environ.setdefault("POSTGRES_HOST", "localhost")
+# Phase 7D.5 (release hardening) — respect an explicit
+# ``POSTGRES_HOST`` from the environment (the canonical test
+# wrapper ``scripts/test_backend_release.sh`` sets this to the
+# docker-compose service name ``postgres`` when running inside the
+# backend container).  When no env var is set, fall back to
+# ``localhost`` if it resolves via DNS, otherwise to ``postgres``
+# (for in-container use).  We deliberately do NOT hardcode
+# ``postgres`` as the unconditional default so direct host
+# pytest invocations on the EC2 host do not silently redirect
+# to a docker-network-only service name.
+def _resolve_default_host() -> str:
+    for candidate in ("localhost", "postgres"):
+        try:
+            socket.getaddrinfo(candidate, 5432, type=socket.SOCK_STREAM)
+            return candidate
+        except (socket.gaierror, OSError):
+            continue
+    return "localhost"
+if "POSTGRES_HOST" not in os.environ:
+    os.environ["POSTGRES_HOST"] = _resolve_default_host()
 os.environ.setdefault("POSTGRES_PORT", "5432")
 os.environ.setdefault("POSTGRES_ADMIN_USER", "postgres")
 os.environ.setdefault("POSTGRES_ADMIN_PASSWORD", "test")
@@ -13,7 +33,8 @@ os.environ.setdefault("COST_DETECTIVE_DB_PASSWORD", "test")
 os.environ.setdefault("LITELLM_DB", "litellm")
 os.environ.setdefault("LITELLM_DB_USER", "litellm_user")
 os.environ.setdefault("LITELLM_DB_PASSWORD", "test")
-os.environ.setdefault("LITELLM_HOST", "localhost")
+if "LITELLM_HOST" not in os.environ:
+    os.environ["LITELLM_HOST"] = _resolve_default_host()
 os.environ.setdefault("LITELLM_PORT", "4000")
 os.environ.setdefault("LITELLM_MASTER_KEY", "sk-test")
 os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost")
