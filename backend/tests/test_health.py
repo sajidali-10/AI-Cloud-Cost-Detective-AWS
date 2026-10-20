@@ -24,7 +24,11 @@ def test_health_returns_ok(client):
 
 
 def test_health_ready_degraded_when_db_unreachable(monkeypatch, client):
-    """When the DB is unreachable, /health/ready must return 503 with sanitized status."""
+    """When the DB is unreachable, /health/ready must return 503 with
+    sanitized status.  Phase 7D.5: DB is the single hard dependency;
+    the new contract uses ``status='not_ready'`` + ``reason`` so
+    orchestrators can distinguish 'not ready' from 'ready but
+    degraded'."""
     import app.main as main
 
     def fake_db_down():
@@ -39,7 +43,8 @@ def test_health_ready_degraded_when_db_unreachable(monkeypatch, client):
     r = client.get("/health/ready")
     assert r.status_code == 503
     body = r.json()
-    assert body["status"] == "degraded"
+    assert body["status"] == "not_ready"
+    assert body["reason"] == "database_unavailable"
     assert body["components"]["backend"] == "ok"
     assert body["components"]["database"] == "error"
     # Must not leak credentials / connection strings / stack traces.
@@ -49,7 +54,11 @@ def test_health_ready_degraded_when_db_unreachable(monkeypatch, client):
     assert "postgresql" not in text.lower()
 
 
-def test_health_ready_degraded_when_litellm_unreachable(monkeypatch, client):
+def test_health_ready_litellm_down_does_not_make_core_unhealthy(monkeypatch, client):
+    """Phase 7D.5: LiteLLM being unreachable does NOT make the
+    backend unhealthy.  /health/ready still returns 200 with the
+    ``dependency_conditions`` field listing ``litellm_unavailable``.
+    The AI endpoint returns a controlled UNAVAILABLE response."""
     import app.main as main
 
     def fake_db_ok():
@@ -62,10 +71,11 @@ def test_health_ready_degraded_when_litellm_unreachable(monkeypatch, client):
     monkeypatch.setattr(main, "_check_litellm", fake_litellm_down)
 
     r = client.get("/health/ready")
-    assert r.status_code == 503
+    assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "degraded"
+    assert body["status"] == "ready"
     assert body["components"]["litellm"] == "error"
+    assert "litellm_unavailable" in body.get("dependency_conditions", [])
 
 
 def test_root_returns_service_metadata(client):
