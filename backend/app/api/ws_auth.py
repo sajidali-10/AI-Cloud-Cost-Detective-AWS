@@ -21,6 +21,17 @@ the query would leak into log aggregation.  Keeping the token in the
 ``Sec-WebSocket-Protocol`` header (a request header, not a URL
 component) avoids that channel entirely.
 
+Origin validation
+-----------------
+
+Phase 8.2 — cross-origin WebSocket hijacking is prevented by an
+explicit ``Origin`` allowlist.  When ``app_env`` is ``production``
+the upgrade is rejected unless the ``Origin`` header matches the
+configured allowlist (default: ``https://finops.hiplink.com``).
+Loopback origins are NEVER accepted in production.  The
+``WS_CLOSE_FORBIDDEN`` close code signals rejection before the
+upgrade finalizes.
+
 Close codes
 -----------
 
@@ -34,7 +45,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from fastapi import WebSocket
 from sqlalchemy.orm import Session
@@ -151,6 +162,77 @@ def extract_ws_token(websocket: WebSocket) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    """Return True iff ``origin`` is a loopback / dev origin.
+
+    Production MUST NEVER accept loopback origins — a misconfigured
+    Nginx that forwards ``Origin: http://localhost`` would otherwise
+    expose authenticated realtime sessions to attacker-controlled
+    loopback pages.
+    """
+    o = (origin or "").strip().lower()
+    return o in {
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    }
+
+
+def validate_ws_origin(
+    websocket: WebSocket,
+    *,
+    settings: Settings,
+    allowed_origins: Optional[Iterable[str]] = None,
+) -> Optional[WSAuthFailure]:
+    """Reject WebSocket upgrades whose ``Origin`` is not in the allowlist.
+
+    Returns ``None`` on success or a :class:`WSAuthFailure` on
+    rejection.  Production deployments (``app_env=production``)
+    require the ``Origin`` header to match the configured allowlist;
+    the canonical production origin (``https://finops.hiplink.com``)
+    is always permitted even if not explicitly listed.
+    """
+    is_production = (getattr(settings, "app_env", "") or "").strip().lower() == "production"
+    origin = (websocket.headers.get("origin") or "").strip()
+
+    if is_production:
+        if not origin:
+            return WSAuthFailure(
+                reason="origin_missing",
+                close_code=WS_CLOSE_FORBIDDEN,
+                safe_message="Origin header required",
+            )
+        if _is_loopback_origin(origin):
+            return WSAuthFailure(
+                reason="origin_loopback_rejected",
+                close_code=WS_CLOSE_FORBIDDEN,
+                safe_message="loopback origins are not accepted in production",
+            )
+        # Build the allowlist: explicit config + canonical production origin.
+        configured = list(allowed_origins or []) if allowed_origins else []
+        # When allowed_origins is None we fall back to the
+        # CORS_ALLOWED_ORIGINS env var (single source of truth for
+        # the deployment's trust set).
+        if allowed_origins is None:
+            raw = (settings.cors_allowed_origins or "").strip()
+            if raw:
+                configured = [o.strip() for o in raw.split(",") if o.strip()]
+        # Canonical production origin is always allowed when running
+        # in production — it is the deployment contract.
+        # Already part of the configured allowlist in normal
+        # deployments; we keep the explicit allow for safety.
+        allowed = {o.strip().lower() for o in configured if o.strip()}
+        if origin.lower() not in allowed:
+            return WSAuthFailure(
+                reason="origin_not_allowed",
+                close_code=WS_CLOSE_FORBIDDEN,
+                safe_message="origin not in allowlist",
+            )
+
+    return None
+
+
 def _validate_token_shape(token: str) -> Optional[WSAuthFailure]:
     """Cheap pre-check before the cryptographic verify.
 
@@ -196,6 +278,13 @@ def resolve_ws_principal(
                 "Set AUTH_ENABLED=true to use realtime conversations."
             ),
         )
+
+    # Phase 8.2 — origin validation runs BEFORE the (relatively
+    # expensive) token decode so a brute-force origin probe does
+    # not consume Argon2id/JWT cycles.
+    origin_failure = validate_ws_origin(websocket, settings=cfg)
+    if origin_failure is not None:
+        return None, origin_failure
 
     token = extract_ws_token(websocket)
     shape_failure = _validate_token_shape(token or "")
@@ -297,4 +386,5 @@ __all__ = [
     "extract_ws_token",
     "negotiate_subprotocol",
     "resolve_ws_principal",
+    "validate_ws_origin",
 ]

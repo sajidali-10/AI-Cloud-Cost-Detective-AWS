@@ -39,6 +39,16 @@ os.environ.setdefault("LITELLM_PORT", "4000")
 os.environ.setdefault("LITELLM_MASTER_KEY", "sk-test")
 os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+# Tests run regardless of the container's APP_ENV (an operator may
+# leave production env vars on the host for the live deployment).
+# Conftest forces the dev defaults so unit/integration tests do
+# not accidentally trigger production-only behaviour (strict CORS
+# allowlist, mandatory WS Origin header, refusal to start with a
+# placeholder JWT_SECRET).  Production behaviour is exercised by
+# the Phase 8.2 live validator against the real deployment.
+os.environ["APP_ENV"] = "development"
+os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost"
+os.environ["AUTH_ENABLED"] = "false"
 
 # Phase 5A: tests that exercise ``AUTH_ENABLED=true`` need a long,
 # non-placeholder JWT secret.  We default ``AUTH_ENABLED`` to False
@@ -72,10 +82,20 @@ import pytest
 
 from app.core.config import get_settings
 from app.core.security import reset_security_core_for_tests
+from app.core.auth_rate_limiter import reset_auth_rate_limiter_for_tests
 
 
 @pytest.fixture(autouse=True)
 def _reset_phase5a_settings():
+    # Phase 8.2 closure: when the backend container is started in
+    # production mode (``APP_ENV=production``) the test session
+    # inherits those env vars.  Tests must run against the
+    # development defaults; production-only behaviour is exercised
+    # by the Phase 8.2 live validator against the real deployment.
+    os.environ["APP_ENV"] = "development"
+    os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost"
+    os.environ["AUTH_ENABLED"] = "false"
+    get_settings.cache_clear()  # type: ignore[attr-defined]
     yield
     # Restore the default env vars that Phase 5A tests may have
     # monkey-patched.
@@ -83,3 +103,9 @@ def _reset_phase5a_settings():
     os.environ["JWT_SECRET"] = _TEST_JWT_SECRET
     get_settings.cache_clear()  # type: ignore[attr-defined]
     reset_security_core_for_tests()
+    # Phase 8.2 — drop the auth rate-limiter singleton so a test
+    # that exercises /api/auth/login does not leak its bucket into
+    # the next test.  Starlette TestClient uses "testclient" as the
+    # peer IP for every connection, so without this reset the
+    # limiter would refuse logins after a handful of tests.
+    reset_auth_rate_limiter_for_tests()

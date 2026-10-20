@@ -9,16 +9,27 @@ Three endpoints, all under ``/api/auth``:
 Routes are thin: they parse requests, delegate to
 :class:`AuthService`, and serialise the result.  No password,
 hash, or token is ever logged at this layer.
+
+Phase 8.2 — the login endpoint is rate-limited per resolved client
+IP.  Repeated failed logins (and the corresponding Argon2id
+verifies) cost real CPU, so the limiter is applied BEFORE the
+service call regardless of whether the credentials are valid.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
+from fastapi.responses import JSONResponse
 
 from app.api.deps import get_current_user, login_error_response
+from app.core.auth_rate_limiter import (
+    AuthRateLimited,
+    get_auth_rate_limiter,
+)
 from app.core.config import Settings, get_settings
+from app.core.proxy_headers import resolve_client_ip
 from app.db.models import AppUser
 from app.db.session import get_db
 from app.schemas.auth import (
@@ -48,6 +59,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 )
 def login(
     payload: LoginRequest,
+    request: Request,
     db = Depends(get_db),
 ) -> Any:
     auth = AuthService(db=db)
@@ -57,12 +69,42 @@ def login(
     unauthenticated requests).  Failures are reported as a generic
     ``InvalidCredentials`` 401 — no information about whether the
     email exists is leaked.
+
+    Phase 8.2 — a per-client-IP rate limiter caps repeated login
+    attempts; over-budget requests get a predictable 429 with a
+    ``Retry-After`` header BEFORE any Argon2id verify is performed.
     """
+    client_ip = resolve_client_ip(request)
+    limiter = get_auth_rate_limiter()
+    try:
+        limiter.check(endpoint="auth.login", client_key=client_ip)
+    except AuthRateLimited as exc:
+        logger.info(
+            "auth.login.rate_limited client_ip=%s retry_after=%s",
+            client_ip, exc.retry_after_seconds,
+        )
+        # Reuse the generic envelope so the response shape is
+        # consistent with other auth failures.  The HTTP status is
+        # 429 (Too Many Requests) per RFC 6585.
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "status": "error",
+                "error_code": "RateLimited",
+                "message": "too many login attempts; retry later",
+                "retry_after_seconds": int(exc.retry_after_seconds),
+            },
+            headers={"Retry-After": str(int(exc.retry_after_seconds))},
+        )
+
     try:
         user = auth.authenticate(email=payload.email, password=payload.password)
     except InvalidCredentials as exc:
         # Sanitized response — never reveals which check failed.
-        logger.info("auth.login.denied email=%s", (payload.email or "").strip().lower())
+        logger.info(
+            "auth.login.denied email=%s client_ip=%s",
+            (payload.email or "").strip().lower(), client_ip,
+        )
         return login_error_response(exc)
 
     # Stamp last_login_at and issue a token.  Both are best-effort:
