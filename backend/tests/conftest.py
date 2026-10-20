@@ -72,6 +72,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.core.security import reset_security_core_for_tests
+from app.core.auth_rate_limiter import reset_auth_rate_limiter_for_tests
 
 
 @pytest.fixture(autouse=True)
@@ -83,3 +84,9 @@ def _reset_phase5a_settings():
     os.environ["JWT_SECRET"] = _TEST_JWT_SECRET
     get_settings.cache_clear()  # type: ignore[attr-defined]
     reset_security_core_for_tests()
+    # Phase 8.2 — drop the auth rate-limiter singleton so a test
+    # that exercises /api/auth/login does not leak its bucket into
+    # the next test.  Starlette TestClient uses "testclient" as the
+    # peer IP for every connection, so without this reset the
+    # limiter would refuse logins after a handful of tests.
+    reset_auth_rate_limiter_for_tests()

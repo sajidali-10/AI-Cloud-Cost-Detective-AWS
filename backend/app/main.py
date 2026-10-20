@@ -19,6 +19,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.cors import build_cors_middleware
+from app.core.proxy_headers import TrustedProxyHeadersMiddleware
 from app.api.aws import router as aws_router
 # Phase 4: AI Cost Analyst router (own /ai prefix).  Imported for
 # its side-effect of registering @router.<verb> decorators.
@@ -88,6 +90,19 @@ app = FastAPI(
         "(read-only AWS evidence + grounded advisory AI)."
     ),
 )
+
+# Phase 8.2 — trusted reverse-proxy awareness MUST be mounted
+# BEFORE CORS so the resolved client IP is available to the CORS
+# middleware and to auth rate-limit key derivation.
+app.add_middleware(TrustedProxyHeadersMiddleware)
+
+# Phase 8.2 — production-aware CORS allowlist.  This call validates
+# the ``CORS_ALLOWED_ORIGINS`` env var against ``app_env`` and
+# raises at startup on a misconfiguration (empty production
+# allowlist, wildcard with credentials, accidental loopback origins
+# in production).  The same configuration is logged at INFO so
+# operators can verify the resolved allowlist at boot.
+build_cors_middleware(app, settings)
 
 # Phase 1: read-only AWS identity + resource discovery router.
 # Mounted at /aws/identity and /aws/resources. Nginx strips the /api/ prefix
