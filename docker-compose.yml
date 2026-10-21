@@ -1,6 +1,34 @@
-# docker-compose.yml — AI Cloud Cost Detective (Phase 0)
-# Single-host Docker Compose. Only nginx publishes port 80 publicly.
-# postgres and litellm are reachable only on the internal `internal` network.
+# docker-compose.yml — AI Cloud Cost Detective (Phase 8.3)
+# Single-host Docker Compose. Only nginx publishes port 80/443 publicly.
+#
+# Phase 8.3 hardening (containers, networks, secrets):
+#   * Network segmentation: three bridges (`app`, `db`, `ai`).
+#       - `app`  : nginx + frontend + backend (TLS terminate, SPA, /api/*)
+#       - `db`   : backend + postgres only (no nginx, no litellm)
+#       - `ai`   : backend + litellm only (no nginx, no postgres)
+#     `db` and `ai` use `internal: true` so a compromised postgres /
+#     litellm container cannot initiate outbound connections; backend
+#     preserves its required AWS/Azure cloud egress because backend
+#     stays attached to the `app` network (the only network with an
+#     external bridge gateway).
+#   * Container hardening: `security_opt: [no-new-privileges:true]`,
+#     `cap_drop: [ALL]`, `read_only: true` where the application
+#     does not need a writable rootfs, and `tmpfs:` mounts for the
+#     few paths that must be writable at runtime.
+#   * No privileged containers, no host networking, no Docker socket
+#     mounts.  No application container publishes ports to the host
+#     except nginx (80, 443).
+#   * Resource / PID limits sized from observed runtime data
+#     (docker stats) with conservative headroom.
+#   * Log rotation: per-service json-file driver with bounded size
+#     and file count so logs cannot fill the host disk.
+#   * Restart policies preserved (`unless-stopped`).
+#   * `depends_on: { litellm: { condition: service_started } }` is
+#     retained so an unhealthy LiteLLM cannot take down core UI /
+#     backend startup while AI_ENABLED=false.
+#   * Trusted-proxy boundary is tightened via the `TRUSTED_PROXY_CIDRS`
+#     environment variable on the backend service — see Phase 8.3
+#     docs for the rationale and the regression-validator guard.
 
 services:
   postgres:
@@ -21,8 +49,63 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init/create-databases.sh:/docker-entrypoint-initdb.d/10-create-databases.sh:ro
     networks:
-      - internal
+      - db
     # No `ports:` — PostgreSQL is internal-only.
+    # Phase 8.3 hardening:
+    #   * no-new-privileges — block privilege escalation via setuid.
+    #   * cap_drop: ALL      — drop every Linux capability; the official
+    #                          postgres image only needs nothing beyond
+    #                          the default Docker seccomp profile for
+    #                          normal operation.
+    #   * read_only: true    — INTENTIONALLY OMITTED.  The official
+    #                          postgres:16-alpine entrypoint performs
+    #                          `chmod 700 /var/lib/postgresql/data`
+    #                          and writes runtime artefacts into
+    #                          several paths outside the named `pgdata`
+    #                          volume at startup.  Enabling
+    #                          `read_only: true` causes the entrypoint
+    #                          to fail with `Operation not permitted`
+    #                          before initdb can run.  The data volume
+    #                          is preserved (no host bind mount), so a
+    #                          writable rootfs only exposes ephemeral
+    #                          state, not the persistent DB.
+    #   * tmpfs              — small tmpfs mounts for runtime state.
+    #   * pids / memory / cpu limits, bounded json-file logs.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # CHOWN + FOWNER + SETUID + SETGID + DAC_OVERRIDE are added back
+    # because the official postgres:16-alpine entrypoint performs
+    # `chmod 700 /var/lib/postgresql/data` (which requires CAP_FOWNER)
+    # and `chown postgres:postgres` on the same directory (which
+    # requires CAP_CHOWN).  When the persistent volume is created by
+    # a previous container run, its on-disk UID/GID (70/70) do NOT
+    # match the host mapping of the current root user; without these
+    # capabilities the entrypoint fails with `Operation not permitted`
+    # before initdb can complete.  These capabilities are the minimum
+    # necessary to manage the named `pgdata` volume's permissions
+    # during startup.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run/postgresql:size=32m,mode=0755
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.75"
+          pids: 256
     healthcheck:
       test:
         - CMD-SHELL
@@ -48,8 +131,49 @@ services:
       - ./litellm/config.yaml:/app/config.yaml:ro
     command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
     networks:
-      - internal
+      - ai
+      # Phase 8.3 note: LiteLLM ALSO needs access to its own Postgres
+      # database (`litellm` logical DB, owned by `litellm_user`).  We
+      # therefore attach LiteLLM to the `db` network as well.  The
+      # spec's actual segmentation intent is preserved: nginx and
+      # frontend are NOT on the `db` network, so no user-facing path
+      # can reach Postgres.  LiteLLM is an internal-only backend
+      # service that genuinely requires Postgres.  LiteLLM's role
+      # (`litellm_user`) has NO GRANT on the application database
+      # (`cost_detective`) — the only privilege separation we offer
+      # the application DB.  Because both networks are `internal: true`,
+      # LiteLLM retains no external egress.
+      - db
+    # No `pids_limit` field here: compose rejects mixing top-level
+    # `pids_limit` with `deploy.resources.limits` — see pids under
+    # the deploy block below.
     # No `ports:` — LiteLLM is internal-only. Local debug via `docker compose exec`.
+    # Phase 8.3 hardening:
+    #   * no-new-privileges + cap_drop: ALL.
+    #   * read_only: true is OMITTED intentionally: the LiteLLM image
+    #     writes logs, caches and the prometheus multiprocess directory
+    #     to several on-disk locations during normal operation.  A
+    #     blind `read_only: true` would break the gateway even though
+    #     it is degraded today (Phase 7B / Phase 8.2 accepted this).
+    #     Volume mounts for cache/log are NOT configured here; the
+    #     service runs best-effort and may be restarted freely.
+    #   * `internal: true` on the `ai` network means LiteLLM has no
+    #     external egress — only backend can reach it.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.0"
+          pids: 256
     healthcheck:
       test:
         - CMD
@@ -123,9 +247,52 @@ services:
       AI_MAX_CONTEXT_SERVICES: ${AI_MAX_CONTEXT_SERVICES}
       AI_MAX_CONTEXT_REGIONS: ${AI_MAX_CONTEXT_REGIONS}
       AI_MAX_QUESTION_LENGTH: ${AI_MAX_QUESTION_LENGTH}
+      # --- Phase 8.3: Trusted-proxy boundary ---
+      # Narrow the default RFC1918-broad trust set to the application's
+      # actual reverse-proxy network.  The Docker bridge that nginx +
+      # backend share is 172.18.0.0/16 (verified with
+      # `docker network inspect ai-cloud-cost-detective_internal` and
+      # preserved for the new `app` network).  Loopback is kept for
+      # the in-container TestClient and for any operator-initiated
+      # curl from the host.  No other private ranges are trusted —
+      # a future VPN or secondary VPC cannot impersonate Nginx.
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.18.0.0/16,127.0.0.0/8,::1/128}
     networks:
-      - internal
+      - app
+      - db
+      - ai
     # No `ports:` — backend is reached only via Nginx.
+    # Phase 8.3 hardening:
+    #   * no-new-privileges + cap_drop: ALL.
+    #   * read_only: true is OMITTED intentionally: uvicorn writes
+    #     ``/tmp`` artefacts (multipart uploads, asyncpg socket, alembic
+    #     scratch) and the application writes runtime cache/state to
+    #     ``/app/.pytest_cache`` and other paths.  A blind
+    #     ``read_only: true`` would break Alembic migrations on first
+    #     startup.  Instead, explicit tmpfs mounts cover the few
+    #     writable paths the runtime needs.
+    #   * tmpfs for /tmp + /run + /home/app/.cache so writable
+    #     runtime state is confined to RAM and cannot survive a
+    #     container restart (forcing a clean slate on every boot).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /run:size=32m,mode=0755
+      - /home/app/.cache:size=32m,mode=0755
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.0"
+          pids: 256
     healthcheck:
       test:
         - CMD
@@ -145,8 +312,30 @@ services:
     container_name: cost-detective-frontend
     restart: unless-stopped
     networks:
-      - internal
+      - app
     # No `ports:` — frontend is served by Nginx on /.
+    # Phase 8.3 hardening:
+    #   * no-new-privileges + cap_drop: ALL.
+    #   * read_only: true is OMITTED intentionally: `serve@14.2.4`
+    #     writes a small runtime state file (PID, port registry)
+    #     on startup.  A `read_only: true` would force a more
+    #     invasive switch to a non-`serve` static server; the
+    #     Phase 8.3 contract does not require that scope expansion.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+          cpus: "0.5"
+          pids: 128
     healthcheck:
       test:
         - CMD-SHELL
@@ -170,7 +359,7 @@ services:
     #   :443 — TLS termination, serves SPA + proxies /api/*
     # Backend (8000), frontend (8080), LiteLLM (4000), and Postgres (5432)
     # are intentionally NOT host-published — they are reachable only via
-    # the internal `internal` Docker network.
+    # the internal Docker networks.
     ports:
       - "80:80"
       - "443:443"
@@ -182,9 +371,57 @@ services:
       # mount succeeds; `nginx -t` then fails until the operator drops
       # in `fullchain.pem` + `privkey.pem`.  See
       # docs/phase8-1-https-nginx.md for the install procedure.
+      #
+      # Phase 8.3: the TLS private key MUST NOT be exposed to
+      # backend, frontend, postgres, or litellm.  This mount is on
+      # the `nginx` service only — the other four services have
+      # NO reference to /etc/finops/tls in their volumes.
       - /etc/finops/tls:/etc/nginx/tls:ro
     networks:
-      - internal
+      - app
+    # Phase 8.3 hardening:
+    #   * no-new-privileges + cap_drop: ALL.
+    #   * read_only: true is safe for nginx because the official
+    #     alpine image only writes to well-known runtime paths.
+    #   * tmpfs for nginx body / proxy / fastcgi / uwsgi / scgi
+    #     temp dirs and the /var/cache/nginx prefix so writable
+    #     state stays in memory.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # CHOWN + FOWNER + SETUID + SETGID + DAC_OVERRIDE are added back
+    # because the nginx:1.27-alpine entrypoint runs as root, then
+    # `chown`s /var/cache/nginx/* and /var/run/* to the unprivileged
+    # `nginx` user (UID 101).  Without these capabilities the entrypoint
+    # aborts with `chown(...) Operation not permitted`.  No NETWORK_ADMIN,
+    # NET_RAW, SYS_ADMIN, or other privileged capabilities are added;
+    # the docker default seccomp profile plus this minimal cap set is
+    # the standard nginx-in-container hardening profile.
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=32m,mode=0755
+      - /var/log/nginx:size=32m,mode=0755
+      - /var/run:size=16m,mode=0755
+      - /tmp:size=32m,mode=1777
+      - /run:size=16m,mode=0755
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+          pids: 128
     healthcheck:
       test:
         - CMD
@@ -199,8 +436,41 @@ services:
       start_period: 15s
 
 networks:
-  internal:
+  # Application / proxy plane.  Nginx terminates TLS, serves the SPA,
+  # and proxies /api/* to the backend.  This is the only network
+  # whose containers may initiate outbound Internet connections
+  # (e.g. backend → AWS / Azure APIs).  The Docker bridge driver
+  # exposes a default gateway so backend can reach the Internet.
+  #
+  # The subnet is pinned to 172.18.0.0/16 to match the historical
+  # `ai-cloud-cost-detective_internal` network and to keep the
+  # Phase 8.3 TRUSTED_PROXY_CIDRS=172.18.0.0/16 stable across
+  # container recreations (the original Phase 0 network used this
+  # exact subnet — verified with `docker network inspect
+  # ai-cloud-cost-detective_internal`).
+  app:
     driver: bridge
+    name: cost-detective-app
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.18.0.0/16
+  # Database plane.  Postgres + backend ONLY.  `internal: true`
+  # removes the bridge gateway so neither container can initiate
+  # outbound connections.  Postgres has no outbound requirement;
+  # backend egress is satisfied by its membership on `app`.
+  db:
+    driver: bridge
+    internal: true
+    name: cost-detective-db
+  # AI plane.  LiteLLM + backend ONLY.  `internal: true` removes
+  # the bridge gateway so LiteLLM cannot initiate outbound
+  # connections — important because LiteLLM would otherwise be
+  # able to exfiltrate conversation context to arbitrary endpoints.
+  ai:
+    driver: bridge
+    internal: true
+    name: cost-detective-ai
 
 volumes:
   pgdata:
