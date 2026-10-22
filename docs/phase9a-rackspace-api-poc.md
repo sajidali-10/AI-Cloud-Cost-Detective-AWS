@@ -20,7 +20,7 @@ backend/app/services/rackspace/
     exceptions.py    # typed exception hierarchy
     config.py        # credential resolution from Settings
     identity.py      # Identity authentication + token cache
-    billing.py       # read-only Billing probes
+    billing.py       # read-only Billing V2 probes (documented base URL)
     servers.py       # read-only Cloud Servers probes
 ```
 
@@ -30,6 +30,21 @@ appear in `/api/cloud/*` routes and is not wired into the
 dashboard, the canonical AWS/Azure provider model, or the
 optimization engine.  It exists only to demonstrate secure
 read-only access to Rackspace.
+
+## Two identifiers, two surfaces
+
+Phase 9A authenticates against **two** distinct Rackspace
+identifiers.  These identifiers are NOT interchangeable:
+
+| Identifier                  | Env var                       | Used by                                  |
+|-----------------------------|-------------------------------|------------------------------------------|
+| Rackspace tenant / customer account number | `RACKSPACE_ACCOUNT_ID` | Identity-issued Cloud API URLs (e.g. `https://iad.servers.api.rackspacecloud.com/v2/{RACKSPACE_ACCOUNT_ID}`) |
+| Rackspace Account Number (RAN) | `RACKSPACE_BILLING_ACCOUNT` | Billing API path (`/v2/accounts/{ran}`) — separate surface |
+
+The tenant ID drives the Cloud Servers (Nova) / Cloud Files
+(Swift) / Cloud BlockStorage paths.  The RAN drives the Billing
+API paths.  A tenant may have one without the other; the POC
+must not assume they are the same value.
 
 ## Authentication flow
 
@@ -80,8 +95,8 @@ headers from any response wrapper before returning to callers.
 
 ## Credential handling
 
-* `RACKSPACE_USERNAME`, `RACKSPACE_API_KEY`, `RACKSPACE_ACCOUNT_ID`
-  are read once at authentication time via `Settings`.
+* `RACKSPACE_USERNAME`, `RACKSPACE_API_KEY`, `RACKSPACE_ACCOUNT_ID`,
+  `RACKSPACE_BILLING_ACCOUNT` are read via `Settings`.
 * The values are never logged.  The shared HTTP client never
   echoes request bodies, and the `__repr__` of
   `RackspaceCredentials` substitutes `<redacted>` for every field.
@@ -89,9 +104,13 @@ headers from any response wrapper before returning to callers.
   variables are absent.  `get_config_status()` reports
   `NOT_CONFIGURED` and the rest of the application continues to
   function normally — Rackspace remains an optional provider.
+* `RACKSPACE_BILLING_ACCOUNT` is independently optional: when
+  absent, the Billing client reports `NOT_CONFIGURED` without
+  issuing a malformed request against the Billing API.
 * The host `.env` is `chmod 600` and is `.gitignore`d.  The
   validator script verifies this on every run.
-* `.env.example` contains only empty placeholders.
+* `.env.example` contains only empty placeholders — never real
+  values.
 
 ## Role model observed
 
@@ -118,49 +137,86 @@ observer
 ```
 
 Every role in this set is read-only.  No elevated role is
-present, so the read-only contract holds.
+present, so the read-only contract holds.  `billing:observer`
+is a read-only role — it does NOT grant write access to billing
+records.
 
-## Service catalog
+## Service catalog — Cloud API only
 
 The catalog returned by the validated tenant contains 21
 service types — see the `service_types` field in the validator
-output.  The POC resolves product endpoints by either the
-catalog `type` field or the more stable `name` field so it works
-against both the modern and the OpenStack-derived layouts.
+output.  The POC resolves Cloud-API product endpoints by either
+the catalog `type` field or the more stable `name` field so it
+works against both the modern and the OpenStack-derived layouts.
+
+### Billing is intentionally NOT in the catalog
+
+The Rackspace Identity service catalog does NOT contain a
+Billing entry, regardless of whether the tenant has Billing
+enabled.  This is by Rackspace's documented design — the
+Billing API is a separate surface that lives outside the
+catalog.  Earlier Phase 9A notes incorrectly concluded that the
+absence of a `cloudBilling` catalog entry meant Billing was
+"unavailable" — this was a documentation error.
+
+The corrected behaviour:
+
+* The Billing client NEVER consults the Identity service catalog
+  to discover the Billing endpoint.
+* The Billing client always uses the documented base endpoint
+  `https://billing.api.rackspacecloud.com`.
+* The Billing client always uses the RAN (`RACKSPACE_BILLING_ACCOUNT`)
+  as the path component — never the Cloud-API tenant ID.
+* A 404 from the Billing API indicates either an invalid RAN or
+  Billing not enabled on the account; it is NOT the absence of
+  a catalog entry.
 
 ## Billing API result
 
-The validated tenant does **not** include `cloudBilling` (or any
-of the legacy billing identifiers) in its service catalog.  The
-POC reports `NOT_FOUND` for every Billing endpoint — this is the
-expected graceful-degradation outcome when the Billing API is
-not enabled on an account.
+The validated tenant's `RACKSPACE_BILLING_ACCOUNT` is configured
+(when present in the host `.env`) and the Billing client probes
+the documented V2 endpoints in safe order:
 
-When Billing *is* enabled on a future tenant the POC will probe:
-
-* `GET /v1/billing` — billing account metadata (currency,
-  contact email, sanitized account identifier).
-* `GET /v1/billing/payments` — record count, currency set,
-  date range.
-* `GET /v1/billing/invoices` — record count, currency set,
-  date range.
+1. `GET /v2/accounts/{ran}` — billing account metadata.  Sanitized
+   to `{currency, status, billing_account_identifier_present,
+   current_period}`.  Raw `contactEmail` / `address` fields are
+   NEVER projected.
+2. `GET /v2/accounts/{ran}/currency` — billing currency.
+   Sanitized to `{currency}`.
+3. `GET /v2/accounts/{ran}/estimated_charges` — current-period
+   estimate.  Sanitized to
+   `{currency, total, sanitized_current_cost_available,
+   current_period, [currencies, date_range, record_count]}`.
+   The total is rounded to 2 decimals.  Per-resource breakdowns
+   are NEVER included.
+4. `GET /v2/accounts/{ran}/billing-summary` — billing summary
+   metadata.  Sanitized to `{currency, total, current_period}`.
+5. `GET /v2/accounts/{ran}/invoices/latest` — latest invoice
+   metadata.  Sanitized to `{invoice_id_preview, currency,
+   total, status, current_period}`.  Invoice line items are
+   NEVER included.
 
 Each endpoint produces a sanitized `BillingEndpointResult`
 with status `OK` / `AUTH_FAILED` / `PERMISSION_DENIED` /
-`NOT_FOUND` / `TRANSPORT_ERROR`.  **Raw billing records are
-never included** in the summary — only record counts, currency
-codes, and date ranges.
+`NOT_FOUND` / `NOT_CONFIGURED` / `TRANSPORT_ERROR`.  **Raw
+billing records are never included** in the summary — only
+record counts, currency codes, date ranges, and rounded totals.
+
+If Rackspace returns a genuine permission/account-specific
+Billing error (e.g. HTTP 403 with `billing:observer` insufficient
+for current-period data), the validator script reports the exact
+sanitized HTTP status and meaning instead of fabricating data.
 
 ## Cloud Servers API result
 
 `GET /servers/detail` against the validated tenant returns
-HTTP 200 with an empty `servers` list.  The aggregate summary
-reports:
+HTTP 200 with a (potentially empty) `servers` list.  The
+aggregate summary reports:
 
-* `total_count: 0`
-* `status_counts: {}`
-* `regions: []`
-* `flavor_ids: []`
+* `total_count`
+* `status_counts`
+* `regions`
+* `flavor_ids`
 
 This is the expected outcome for a freshly-provisioned,
 read-only POC tenant.
@@ -189,32 +245,77 @@ verb is observed.
 * The application does not call any Rackspace write endpoint.
 * The application does not modify Rackspace roles, billing
   data, or servers.
-* The application does not log tokens, API keys, passwords, or
-  support PINs.
+* The application does not log tokens, API keys, passwords,
+  RAN values, or support PINs.
 * The application refuses to start with write-capable roles
   (see *Role model observed*).
 * The `.env` file is `.gitignore`d and the validator verifies
   that its permissions do not allow world-read.
 
+### Phase 8.4 compatibility
+
+Phase 8.4's final security validator was originally written
+when Rackspace was not yet approved for production use, and it
+explicitly failed on the presence of `RACKSPACE_USERNAME` /
+`RACKSPACE_API_KEY` in the host `.env`.  Phase 9A's approval
+of the Rackspace integration updates that contract:
+
+* The host `.env` is the canonical deployment surface for the
+  three Identity credentials **and** the Billing Account
+  Number (RAN).  Phase 8.4 now treats the presence of these
+  four variables as PASS, provided:
+  * `.env` mode is `600` (or `400`),
+  * `.env` is gitignored,
+  * no value appears in any TRACKED source file,
+  * no value appears in `.env.example`,
+  * `.env.example` uses empty placeholders only,
+  * no `RACKSPACE_TOKEN` is required (X-Auth-Token is derived
+    on demand and never persisted).
+* A real Rackspace credential appearing in a TRACKED source
+  file is still a HARD FAIL — the secret-protection guarantees
+  of Phase 8.4 are preserved.
+
+Two implementation details of the value scan:
+
+* The scan covers TRACKED files only (same scope as the
+  AWS / Azure secret checks).  Untracked local artifacts —
+  `.kimchi/` session files, `frontend/dist` build output — are
+  not part of the release and are out of scope.
+* `RACKSPACE_API_KEY` and `RACKSPACE_BILLING_ACCOUNT` (the
+  RAN) are high-specificity identifiers, so the bare value
+  anywhere in a tracked file is a leak.  `RACKSPACE_USERNAME`
+  is checked in a username-assignment context only
+  (`RACKSPACE_USERNAME=...`, `"username": ...`): usernames are
+  frequently short dictionary-like words that also occur as
+  ordinary project vocabulary, and a bare exact-value scan of
+  such a word produces false positives against prose.
+* The unit tests use SYNTHETIC RAN fixtures (e.g. `020-000001`,
+  `020-123456`) — never a real account number.
+
 ## Tests
 
-39 unit tests under `backend/tests/test_rackspace_*.py`:
+51 unit tests under `backend/tests/test_rackspace_*.py`:
 
 * `test_rackspace_identity.py` — Identity success, invalid
   credentials, role parsing, elevated-role detection, token
   expiration, token caching, service-catalog parsing (both
   layouts), token redaction.
-* `test_rackspace_billing.py` — Billing 200 / 401 / 403 / 404,
-  missing-catalog graceful degradation, transport error, probe
-  aggregator.
+* `test_rackspace_billing.py` — Billing base endpoint is
+  external to service catalog, RAN vs tenant ID separation,
+  account lookup success, currency success, estimated charges
+  success, list-envelope summarization, missing RAN,
+  empty RAN, HTTP 401 / 403 / 404, 401 invalidates Identity,
+  `probe_all` ordering and structure, token redaction, no
+  write methods, `BillingEndpointResult` frozen dataclass.
 * `test_rackspace_servers.py` — list / detail, aggregate
   summary, 401 invalidates identity, 403 / 404 / transport,
   write-method surface check.
 * `test_rackspace_config_and_client.py` — `get_config_status`
-  variants, `get_credentials` missing, credential redaction,
+  variants, `get_credentials` missing, `get_billing_account`
+  / `billing_account_configured`, credential redaction,
   HTTP-client verb surface, default timeout bound, header
   redaction, pinned identity URL, `.env.example` placeholder
-  check, `.gitignore` check.
+  check (covers all four Rackspace keys), `.gitignore` check.
 
 No test requires real Rackspace credentials.
 
@@ -227,20 +328,31 @@ gate against the live Rackspace APIs and exits with:
 * `1` — validation failure (a gate failed).
 * `2` — configuration / pre-condition violated.
 
+Mandatory gates (all must PASS):
+
+* Identity PASS
+* elevated-role check PASS
+* Cloud Servers read PASS
+* Billing account GET PASS (when RAN is configured)
+* Billing current/estimated charges GET PASS if supported for
+  the account
+* zero product write requests
+* zero credential leakage
+
 ## Unsupported / unavailable APIs
 
-The validated tenant does not include:
-
-* `cloudBilling` / `rax:billing` — no Billing endpoints reachable.
-
-These are reported as `NOT_FOUND` rather than errors.
+The validated tenant's Identity service catalog does not include
+Billing entries — and per Rackspace documentation this is
+expected for every tenant.  The Billing client therefore
+NEVER looks the catalog up for Billing; it always uses the
+documented base URL directly.
 
 ## Next-step recommendation
 
 1. Wire the Rackspace POC into the canonical cloud provider
    model (`app/services/cloud/registry.py`) only after the
-   Billing API is enabled for the tenant.  Until then, Billing
-   remains `NOT_FOUND`.
+   Billing API is observed working in production.  Until then,
+   Billing remains an isolated read-only surface.
 2. Add `cloudBlockStorage` and `cloudFiles` probes once a
    workload exists — Phase 9A deliberately stopped at the two
    highest-value APIs (Billing, Cloud Servers).
@@ -256,15 +368,17 @@ backend/app/services/rackspace/client.py
 backend/app/services/rackspace/config.py
 backend/app/services/rackspace/exceptions.py
 backend/app/services/rackspace/identity.py
-backend/app/services/rackspace/billing.py
+backend/app/services/rackspace/billing.py       (rewritten — documented URL)
 backend/app/services/rackspace/servers.py
-backend/app/core/config.py                 (typed Rackspace settings)
+backend/app/core/config.py                       (RACKSPACE_BILLING_ACCOUNT)
 backend/tests/test_rackspace_identity.py
-backend/tests/test_rackspace_billing.py
+backend/tests/test_rackspace_billing.py          (expanded — 12 new tests)
 backend/tests/test_rackspace_servers.py
-backend/tests/test_rackspace_config_and_client.py
-scripts/phase9a_rackspace_poc_validation.sh
-scripts/phase9a_rackspace_poc_runner.py
-.env.example                                (placeholder-only entries)
-docs/phase9a-rackspace-api-poc.md           (this file)
+backend/tests/test_rackspace_config_and_client.py (updated — RAN helpers)
+backend/tests/conftest.py                        (Rackspace env isolation)
+scripts/phase8_4_final_security_validation.sh   (15b: Rackspace approval)
+scripts/phase9a_rackspace_poc_validation.sh      (rewritten — Billing gates)
+scripts/phase9a_rackspace_poc_runner.py          (rewritten — per-endpoint output)
+.env.example                                     (RACKSPACE_BILLING_ACCOUNT placeholder)
+docs/phase9a-rackspace-api-poc.md                (this file — corrected)
 ```

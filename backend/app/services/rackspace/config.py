@@ -19,7 +19,13 @@ canonical Rackspace Identity URL is pinned in
 :data:`RACKSPACE_IDENTITY_URL` and is used as the entry point for
 authentication.  Once authenticated, the rest of the endpoints are
 resolved from the Identity service catalog so no endpoint URLs
-need to be hard-coded in this codebase.
+need to be hard-coded in this codebase.  The Billing API is a
+special case: per Rackspace documentation the Billing endpoint is
+intentionally NOT in the Identity service catalog — the
+:mod:`app.services.rackspace.billing` client uses the documented
+Billing base URL directly and the ``RACKSPACE_BILLING_ACCOUNT``
+identifier (the RAN) which is *separate* from the Cloud-API
+tenant ID.
 """
 
 from __future__ import annotations
@@ -125,6 +131,18 @@ def get_config_status(settings: Settings | None = None) -> RackspaceConfigStatus
 
     Never raises.  The returned object never contains credential
     values — only the names of missing variables.
+
+    The required-for-Identity variables are::
+
+        RACKSPACE_USERNAME
+        RACKSPACE_API_KEY
+        RACKSPACE_ACCOUNT_ID
+
+    ``RACKSPACE_BILLING_ACCOUNT`` (the RAN) is OPTIONAL and
+    listed separately so a tenant without Billing access still
+    satisfies the *Identity* configuration requirement.  The
+    Billing client returns ``NOT_CONFIGURED`` when the RAN is
+    absent instead of issuing a request with an empty path.
     """
 
     settings = settings or get_settings()
@@ -138,10 +156,39 @@ def get_config_status(settings: Settings | None = None) -> RackspaceConfigStatus
     return RackspaceConfigStatus(configured=not missing, missing=missing)
 
 
+def get_billing_account(settings: Settings | None = None) -> str:
+    """Return the Rackspace Billing Account Number (RAN).
+
+    The RAN is read from the ``RACKSPACE_BILLING_ACCOUNT``
+    environment variable (typed setting
+    ``rackspace_billing_account``).  The Billing client uses
+    this value as the ``{ran}`` path component on the documented
+    Billing base URL.  Returns an empty string when the value
+    is absent — the Billing client translates that into a
+    ``NOT_CONFIGURED`` result rather than issuing a malformed
+    request.
+
+    The function never logs the value.  Callers that surface
+    it (e.g. a one-line "RAN configured: yes/no" diagnostic)
+    must NEVER print the value itself.
+    """
+
+    settings = settings or get_settings()
+    return _read_setting(settings, "rackspace_billing_account")
+
+
+def billing_account_configured(settings: Settings | None = None) -> bool:
+    """Return True when a non-empty RAN is present in settings."""
+
+    return bool(get_billing_account(settings=settings))
+
+
 __all__ = [
     "RACKSPACE_IDENTITY_URL",
     "RackspaceConfigStatus",
     "RackspaceCredentials",
+    "billing_account_configured",
+    "get_billing_account",
     "get_config_status",
     "get_credentials",
 ]

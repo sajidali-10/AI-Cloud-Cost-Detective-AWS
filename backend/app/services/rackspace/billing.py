@@ -1,26 +1,43 @@
 """Rackspace Billing client — Phase 9A POC (read-only).
 
-Exposes a narrow, sanitized surface over the Rackspace Billing API.
-Only ``GET`` requests are issued.  The following endpoints are
-probed, each in its own method:
+Per Rackspace's official documentation the Billing API is
+intentionally NOT exposed through the Identity service catalog.
+The Identity ``access.serviceCatalog`` for a Rackspace tenant
+will not contain ``cloudBilling`` (or any of its legacy
+identifiers) regardless of whether the account is enabled for
+Billing.
 
-* ``GET /v1/billing`` — billing account metadata.
-* ``GET /v1/billing/payments`` — historical payment records.
-* ``GET /v1/billing/invoices`` — invoice list / metadata.
+Instead the Billing API is reachable at the *documented* base
+endpoint:
 
-Every method returns a sanitized :class:`BillingEndpointResult`
-that captures the HTTP status, a coarse record count, and a
-*summary* of the response — never the raw record bodies.  Raw
-invoice lines can contain customer-sensitive PII / addresses; the
-POC contract is "no raw billing records in logs / error messages".
+    https://billing.api.rackspacecloud.com
 
-The Billing API is not enabled on every Rackspace tenant.  When
-the service is not present in the Identity catalog, the methods
-return a result with ``status="NOT_AVAILABLE"`` instead of
-attempting an unauthenticated request.  When the catalog has the
-endpoint but the actual product call returns 404 (e.g. billing
-feature disabled on the account), the result is
-``status="NOT_FOUND"`` with an explanatory note.
+and every path is scoped to the Rackspace Account Number (RAN)
+— a *separate* identifier from the Cloud API tenant / customer
+account number.  The RAN is supplied via the optional
+``RACKSPACE_BILLING_ACCOUNT`` environment variable and is
+NEVER logged.  The client fails closed when the RAN is absent.
+
+The supported Billing API V2 endpoints exercised by the POC are:
+
+    GET /v2/accounts/{ran}
+    GET /v2/accounts/{ran}/currency
+    GET /v2/accounts/{ran}/billing-summary
+    GET /v2/accounts/{ran}/invoices/latest
+    GET /v2/accounts/{ran}/estimated_charges
+
+Only ``GET`` requests are issued.  Every method returns a
+sanitized :class:`BillingEndpointResult` that captures the HTTP
+status, a coarse record count, and a *summary* of the response
+— never the raw record bodies.  Raw invoice lines can contain
+customer-sensitive PII / addresses; the POC contract is "no raw
+billing records in logs / error messages".
+
+A missing RAN (or empty RAN) is reported as
+``status="NOT_CONFIGURED"`` so callers do not silently call the
+Billing API with an empty path.  A genuine 401 / 403 / 404 from
+the Billing API is surfaced as the corresponding status so the
+operator can see exactly what the Billing service returned.
 """
 
 from __future__ import annotations
@@ -39,20 +56,14 @@ from app.services.rackspace.exceptions import (
 from app.services.rackspace.identity import RackspaceIdentity
 
 
-#: Identifiers Rackspace ships in the Identity catalog for its
-#: Billing API.  Phase 9A resolves the endpoint URL from the
-#: catalog by matching either the ``type`` or ``name`` field of
-#: each entry, so the caller does not need to know which layout
-#: a particular tenant uses.
-BILLING_SERVICE_NAMES: List[str] = [
-    "cloudBilling",
-    "rax:billing",
-    "billing",
-]
+#: Documented Billing API base endpoint.  Per Rackspace documentation
+#: this is the canonical Billing base URL — it is intentionally NOT
+#: published in the Identity service catalog.
+BILLING_BASE_URL = "https://billing.api.rackspacecloud.com"
 
-#: Backwards-compatible alias used by tests and external callers
-#: that prefer the ``type`` field label.
-BILLING_SERVICE_TYPES: List[str] = list(BILLING_SERVICE_NAMES)
+#: Billing API version.  Phase 9A targets V2 which is the documented
+#: production version at the time of writing.
+BILLING_API_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -62,24 +73,30 @@ class BillingEndpointResult:
     Attributes
     ----------
     endpoint:
-        Logical endpoint name (e.g. ``"billing_root"``,
-        ``"billing_payments"``, ``"billing_invoices"``).
+        Logical endpoint name (e.g. ``"billing_account"``,
+        ``"billing_currency"``, ``"billing_estimated_charges"``,
+        ``"billing_billing_summary"``, ``"billing_invoice_latest"``).
     http_status:
         HTTP status code returned by Rackspace, or ``None`` when
-        no request was issued (e.g. service absent from catalog).
+        no request was issued (e.g. RAN not configured, Identity
+        authentication unavailable).
     status:
         Coarse outcome label — one of:
 
         * ``"OK"`` — HTTP 200 with a JSON body.
-        * ``"AUTH_FAILED"`` — HTTP 401.
-        * ``"PERMISSION_DENIED"`` — HTTP 403.
-        * ``"NOT_FOUND"`` — HTTP 404 or service absent from the
-          catalog.
+        * ``"AUTH_FAILED"`` — HTTP 401 (token rejected).
+        * ``"PERMISSION_DENIED"`` — HTTP 403 (Billing role
+          insufficient or not granted on this account).
+        * ``"NOT_FOUND"`` — HTTP 404 (invalid RAN / Billing not
+          available on this account).
+        * ``"NOT_CONFIGURED"`` — RAN is missing or empty; no
+          request was issued.
         * ``"TRANSPORT_ERROR"`` — network / parse failure.
     summary:
         Sanitized summary fields (record counts, date ranges,
-        currency codes).  Never contains raw customer billing
-        record fields.
+        currency codes, sanitized current-cost figures).  Never
+        contains raw customer billing record fields, full invoice
+        lines, addresses, or payment instruments.
     detail:
         Optional human-readable diagnostic message; must not
         include credentials, tokens, or raw record bodies.
@@ -97,7 +114,20 @@ class BillingEndpointResult:
 
 
 class RackspaceBillingClient:
-    """Read-only client for the Rackspace Billing API."""
+    """Read-only client for the Rackspace Billing API (V2).
+
+    The base URL is hard-coded to :data:`BILLING_BASE_URL` per
+    Rackspace's documentation — the Billing service is NOT
+    reachable through the Identity service catalog.  The RAN
+    (``RACKSPACE_BILLING_ACCOUNT``) is read from settings at
+    every call so a tenant can rotate the value without
+    restarting the application.
+
+    The client only ever issues ``GET`` requests.  The HTTP
+    client itself has no ``PUT`` / ``PATCH`` / ``DELETE``
+    methods so this guarantee is enforced at the transport
+    layer.
+    """
 
     def __init__(
         self,
@@ -113,51 +143,93 @@ class RackspaceBillingClient:
     # ------------------------------------------------------------------
 
     async def probe_all(self) -> List[BillingEndpointResult]:
-        """Probe every known Billing endpoint.  Read-only.
+        """Probe the documented Billing endpoints in safe order.
 
-        The method never raises; it returns a list of
-        :class:`BillingEndpointResult` describing what was tried
-        and what came back.  This is the entry point used by the
-        Phase 9A validator script.
+        Order is deliberately chosen so the operator sees a
+        working account lookup and currency before any
+        sensitive summary or invoice endpoint:
+
+        1. ``GET /v2/accounts/{ran}`` — account lookup.
+        2. ``GET /v2/accounts/{ran}/currency`` — currency.
+        3. ``GET /v2/accounts/{ran}/estimated_charges`` —
+           current / estimated charges (sanitized).
+        4. ``GET /v2/accounts/{ran}/billing-summary`` —
+           billing summary metadata (no raw invoice dump).
+        5. ``GET /v2/accounts/{ran}/invoices/latest`` —
+           latest invoice metadata (no full invoice body).
+
+        The method never raises; it returns one
+        :class:`BillingEndpointResult` per probed endpoint.
         """
 
         return [
-            await self.get_account_metadata(),
-            await self.get_payments(),
-            await self.get_invoices(),
+            await self.get_account(),
+            await self.get_currency(),
+            await self.get_estimated_charges(),
+            await self.get_billing_summary(),
+            await self.get_latest_invoice_metadata(),
         ]
 
-    async def get_account_metadata(self) -> BillingEndpointResult:
-        """``GET /v1/billing`` (account metadata)."""
+    async def get_account(self) -> BillingEndpointResult:
+        """``GET /v2/accounts/{ran}`` — billing account metadata.
+
+        Returns the account object which contains the currency
+        and basic account state.  Raw contact fields (email,
+        address) are projected to a single
+        ``billing_account_identifier_present`` flag — the values
+        are never included in the summary.
+        """
 
         return await self._safe_get(
-            endpoint="billing_root",
-            service_types=BILLING_SERVICE_TYPES,
-            path="/v1/billing",
-            summary_keys=("account_number", "billing_account_id", "currency", "contact_email", "name"),
-            list_key=None,
+            endpoint="billing_account",
+            path_suffix="",
+            summary_kind="account",
         )
 
-    async def get_payments(self) -> BillingEndpointResult:
-        """``GET /v1/billing/payments``."""
+    async def get_currency(self) -> BillingEndpointResult:
+        """``GET /v2/accounts/{ran}/currency`` — billing currency."""
 
         return await self._safe_get(
-            endpoint="billing_payments",
-            service_types=BILLING_SERVICE_TYPES,
-            path="/v1/billing/payments",
-            summary_keys=("amount", "currency", "date"),
-            list_key="payments",
+            endpoint="billing_currency",
+            path_suffix="/currency",
+            summary_kind="currency",
         )
 
-    async def get_invoices(self) -> BillingEndpointResult:
-        """``GET /v1/billing/invoices``."""
+    async def get_estimated_charges(self) -> BillingEndpointResult:
+        """``GET /v2/accounts/{ran}/estimated_charges``.
+
+        The response is summarised to a sanitized
+        ``{currency, current_period: {start, end}, totals}``
+        shape; raw per-resource usage data is never included.
+        """
 
         return await self._safe_get(
-            endpoint="billing_invoices",
-            service_types=BILLING_SERVICE_TYPES,
-            path="/v1/billing/invoices",
-            summary_keys=("id", "total", "currency", "status", "period"),
-            list_key="invoices",
+            endpoint="billing_estimated_charges",
+            path_suffix="/estimated_charges",
+            summary_kind="estimated_charges",
+        )
+
+    async def get_billing_summary(self) -> BillingEndpointResult:
+        """``GET /v2/accounts/{ran}/billing-summary``."""
+
+        return await self._safe_get(
+            endpoint="billing_billing_summary",
+            path_suffix="/billing-summary",
+            summary_kind="billing_summary",
+        )
+
+    async def get_latest_invoice_metadata(self) -> BillingEndpointResult:
+        """``GET /v2/accounts/{ran}/invoices/latest``.
+
+        Returns sanitized metadata only — invoice id, period,
+        status, total, currency.  The raw invoice line items
+        are never included in the summary.
+        """
+
+        return await self._safe_get(
+            endpoint="billing_invoice_latest",
+            path_suffix="/invoices/latest",
+            summary_kind="latest_invoice",
         )
 
     # ------------------------------------------------------------------
@@ -168,42 +240,44 @@ class RackspaceBillingClient:
         self,
         *,
         endpoint: str,
-        service_types: List[str],
-        path: str,
-        summary_keys: tuple,
-        list_key: Optional[str],
+        path_suffix: str,
+        summary_kind: str,
     ) -> BillingEndpointResult:
+        ran = self._read_ran()
+        if not ran:
+            return BillingEndpointResult(
+                endpoint=endpoint,
+                http_status=None,
+                status="NOT_CONFIGURED",
+                summary={},
+                detail="RACKSPACE_BILLING_ACCOUNT (RAN) is not configured",
+            )
+
         try:
             session = await self._identity.current_session()
-        except (RackspaceConfigError, RackspaceAuthError) as exc:
+        except RackspaceConfigError as exc:
             return BillingEndpointResult(
                 endpoint=endpoint,
                 http_status=None,
                 status="AUTH_FAILED",
                 summary={},
-                detail=str(exc.message),
+                detail=exc.message,
             )
-
-        # Resolve the endpoint URL from the Identity catalog.
-        base_url: Optional[str] = None
-        for service_type in service_types:
-            url = session.catalog.public_url_for(service_type)
-            if url:
-                base_url = url
-                break
-        if not base_url:
+        except RackspaceAuthError as exc:
             return BillingEndpointResult(
                 endpoint=endpoint,
                 http_status=None,
-                status="NOT_FOUND",
-                summary={"service_types_checked": service_types},
-                detail="Billing service not present in Identity catalog",
+                status="AUTH_FAILED",
+                summary={},
+                detail=exc.message,
             )
 
+        path = f"/{BILLING_API_VERSION}/accounts/{ran}{path_suffix}"
         token_provider = self._identity.current_token
+
         try:
             response = await self._http.get(
-                base_url, path, token_provider=token_provider,
+                BILLING_BASE_URL, path, token_provider=token_provider,
             )
         except RackspaceAuthError as exc:
             await self._identity.invalidate()
@@ -240,7 +314,7 @@ class RackspaceBillingClient:
             )
 
         summary = _summarise_billing_response(
-            response.body, summary_keys=summary_keys, list_key=list_key,
+            response.body, kind=summary_kind,
         )
         return BillingEndpointResult(
             endpoint=endpoint,
@@ -250,60 +324,295 @@ class RackspaceBillingClient:
             detail="",
         )
 
+    @staticmethod
+    def _read_ran() -> str:
+        """Return the stripped RAN from settings, or ``""`` if absent.
+
+        The RAN is read on every call so a rotation in the
+        operator's secret store is observed without restarting
+        the application.
+        """
+
+        from app.core.config import get_settings
+
+        try:
+            settings = get_settings()
+        except Exception:  # pragma: no cover - defensive
+            return ""
+        return (getattr(settings, "rackspace_billing_account", "") or "").strip()
+
 
 def _summarise_billing_response(
-    body: Dict[str, Any],
-    *,
-    summary_keys: tuple,
-    list_key: Optional[str],
+    body: Dict[str, Any], *, kind: str,
 ) -> Dict[str, Any]:
-    """Produce a sanitized summary of a Billing response.
+    """Produce a sanitized summary of a Billing V2 response.
 
-    The Billing API returns either:
+    The Billing API wraps every endpoint payload in a single
+    envelope key (``billingAccount``, ``estimatedCharges``,
+    ``billingSummary``, ``invoice``).  The summarizer unwraps
+    the envelope before projecting the per-kind allow-list of
+    safe fields.
 
-    * a flat object whose keys we project onto ``summary_keys``, or
-    * an object containing a list under ``list_key`` whose elements
-      we project onto ``summary_keys`` while recording the count,
-      currency set, and date range (when available).
+    The summary is restricted to:
 
-    Raw record fields are NEVER included — only counts, currency
-    codes, and date ranges.
+    * the account id (presence only, not the value),
+    * currency codes,
+    * period dates,
+    * sanitized total amounts (rounded to two decimals, no
+      per-line breakdown),
+    * record counts for list-shaped responses.
+
+    Raw customer contact fields, invoice line items, addresses,
+    payment instruments, and tax breakdowns are NEVER included.
     """
 
-    if list_key and isinstance(body, dict):
+    if not isinstance(body, dict):
+        return {"response_kind": kind}
+
+    # Unwrap the single-key envelope produced by the Billing
+    # API.  We accept either the documented envelope key or a
+    # flat shape so the summarizer keeps working if Rackspace
+    # adds a new envelope in a future release.
+    envelope_keys = {
+        "currency": ("billingAccount",),
+        "estimated_charges": ("estimatedCharges",),
+        "billing_summary": ("billingSummary",),
+        "latest_invoice": ("invoice",),
+        "account": ("billingAccount",),
+    }
+    unwrapped = body
+    for envelope_key in envelope_keys.get(kind, ()):  # type: ignore[arg-type]
+        if envelope_key in body and isinstance(body[envelope_key], dict):
+            unwrapped = body[envelope_key]
+            break
+
+    if kind == "currency":
+        return _summarise_currency(unwrapped)
+    if kind == "estimated_charges":
+        return _summarise_estimated_charges(unwrapped)
+    if kind == "billing_summary":
+        return _summarise_billing_summary(unwrapped)
+    if kind == "latest_invoice":
+        return _summarise_latest_invoice(unwrapped)
+    if kind == "account":
+        return _summarise_account(unwrapped)
+    return _summarise_object(unwrapped, allow_keys=())
+
+
+def _summarise_account(body: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    # Project the currency code only — never the account number
+    # or contact details.
+    currency = body.get("currency") or body.get("defaultCurrency")
+    if isinstance(currency, str):
+        summary["currency"] = currency.upper()
+    account_id = body.get("accountNumber") or body.get("id")
+    summary["billing_account_identifier_present"] = bool(account_id)
+    # Status / state if present.
+    state = body.get("status") or body.get("accountStatus") or body.get("state")
+    if isinstance(state, str):
+        summary["status"] = state.upper()
+    # Whether the account is configured for current-period billing.
+    if "currentPeriod" in body and isinstance(body["currentPeriod"], dict):
+        period = body["currentPeriod"]
+        period_summary: Dict[str, Any] = {}
+        for key in ("start", "end", "periodStart", "periodEnd"):
+            value = period.get(key)
+            if isinstance(value, str):
+                period_summary[key] = value
+        if period_summary:
+            summary["current_period"] = period_summary
+            summary["current_period_available"] = True
+    return summary
+
+
+def _summarise_currency(body: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for key in ("currency", "code", "isoCurrency"):
+        value = body.get(key)
+        if isinstance(value, str):
+            summary["currency"] = value.upper()
+            return summary
+    return summary
+
+
+def _summarise_estimated_charges(body: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    # Currency is always projected.
+    for key in ("currency", "currencyCode"):
+        value = body.get(key)
+        if isinstance(value, str):
+            summary["currency"] = value.upper()
+            break
+
+    # The Billing API documents the period as two top-level
+    # ISO-8601 strings on the ``estimatedCharges`` envelope.
+    period_start = body.get("currentBillingPeriodStartDate")
+    period_end = body.get("currentBillingPeriodEndDate")
+    if isinstance(period_start, str) or isinstance(period_end, str):
+        period_summary: Dict[str, Any] = {}
+        if isinstance(period_start, str):
+            period_summary["start"] = period_start
+        if isinstance(period_end, str):
+            period_summary["end"] = period_end
+        if period_summary:
+            summary["current_period"] = period_summary
+            summary["current_period_available"] = True
+    for period_key in ("currentPeriod", "period"):
+        period = body.get(period_key)
+        if isinstance(period, dict):
+            period_summary = {}
+            for key in ("start", "end", "periodStart", "periodEnd"):
+                value = period.get(key)
+                if isinstance(value, str):
+                    period_summary[key] = value
+            if period_summary and "current_period" not in summary:
+                summary["current_period"] = period_summary
+                summary["current_period_available"] = True
+
+    # Sanitized total — only the rounded numeric total is
+    # retained, never the per-resource breakdown.
+    for total_key in ("chargeTotal", "estimatedTotal", "total", "currentCharges", "amount"):
+        value = body.get(total_key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            summary["total"] = round(float(value), 2)
+            summary["sanitized_current_cost_available"] = True
+            break
+        if isinstance(value, str):
+            try:
+                summary["total"] = round(float(value), 2)
+                summary["sanitized_current_cost_available"] = True
+            except ValueError:
+                continue
+
+    # List-shaped responses (e.g. ``estimatedCharge: [...]``)
+    # are summarised by count + currency set + date range.  Per-resource
+    # amount / offeringCode / chargeType fields are NEVER
+    # included — only the sanitized aggregates are recorded.
+    for list_key in ("estimatedCharge", "estimatedCharges", "charges", "lineItems"):
         records = body.get(list_key)
         if isinstance(records, list):
-            return _summarise_records(records, summary_keys=summary_keys, list_key=list_key)
-        if records is None:
-            # Some legacy tenants return the list at the top level.
-            if isinstance(body.get("data"), list):
-                return _summarise_records(body["data"], summary_keys=summary_keys, list_key=list_key)
-    return _summarise_object(body, summary_keys=summary_keys)
+            summary["record_count"] = len(records)
+            summary["list_key"] = list_key
+            currencies: set = set()
+            dates: list = []
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                cur = record.get("currency")
+                if isinstance(cur, str):
+                    currencies.add(cur.upper())
+                for date_key in ("date", "period", "startDate", "endDate"):
+                    value = record.get(date_key)
+                    if isinstance(value, str):
+                        dates.append(value)
+            if currencies:
+                summary["currencies"] = sorted(currencies)
+            if dates:
+                dates_sorted = sorted(dates)
+                summary["date_range"] = {
+                    "earliest": dates_sorted[0],
+                    "latest": dates_sorted[-1],
+                }
+            break
+
+    return summary
 
 
-def _summarise_object(
-    body: Dict[str, Any], *, summary_keys: tuple,
-) -> Dict[str, Any]:
+def _summarise_billing_summary(body: Dict[str, Any]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
-    for key in summary_keys:
-        if key in body:
-            summary[key] = body[key]
-    # The Billing API returns ``account_number`` and
-    # ``billing_account_id`` interchangeably; record whichever is
-    # present, never both as raw strings.
-    if "account_number" in summary or "billing_account_id" in summary:
-        identifier = summary.get("account_number") or summary.get("billing_account_id")
-        summary["billing_account_identifier_present"] = bool(identifier)
-        summary.pop("account_number", None)
-        summary.pop("billing_account_id", None)
+    for key in ("currency", "currencyCode"):
+        value = body.get(key)
+        if isinstance(value, str):
+            summary["currency"] = value.upper()
+            break
+    for total_key in ("balance", "currentBalance", "outstandingBalance", "total"):
+        value = body.get(total_key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            summary["total"] = round(float(value), 2)
+            summary["sanitized_current_cost_available"] = True
+            break
+        if isinstance(value, str):
+            try:
+                summary["total"] = round(float(value), 2)
+                summary["sanitized_current_cost_available"] = True
+            except ValueError:
+                continue
+    period = body.get("billingPeriod") or body.get("currentPeriod")
+    if isinstance(period, dict):
+        period_summary: Dict[str, Any] = {}
+        for key in ("start", "end"):
+            value = period.get(key)
+            if isinstance(value, str):
+                period_summary[key] = value
+        if period_summary:
+            summary["current_period"] = period_summary
+    return summary
+
+
+def _summarise_latest_invoice(body: Dict[str, Any]) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for key in ("id", "invoiceNumber", "invoiceId"):
+        value = body.get(key)
+        if value:
+            # Truncate to a non-PII preview (first 8 chars + '...').
+            text = str(value)
+            summary["invoice_id_preview"] = (
+                text[:8] + "..." if len(text) > 8 else text
+            )
+            break
+    for key in ("currency", "currencyCode"):
+        value = body.get(key)
+        if isinstance(value, str):
+            summary["currency"] = value.upper()
+            break
+    for total_key in ("total", "amountDue", "totalAmount", "invoiceTotal"):
+        value = body.get(total_key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            summary["total"] = round(float(value), 2)
+            summary["sanitized_current_cost_available"] = True
+            break
+        if isinstance(value, str):
+            try:
+                summary["total"] = round(float(value), 2)
+                summary["sanitized_current_cost_available"] = True
+            except ValueError:
+                continue
+    status = body.get("status")
+    if isinstance(status, str):
+        summary["status"] = status.upper()
+    period = body.get("period") or body.get("invoicePeriod")
+    if isinstance(period, dict):
+        period_summary: Dict[str, Any] = {}
+        for key in ("start", "end"):
+            value = period.get(key)
+            if isinstance(value, str):
+                period_summary[key] = value
+        if period_summary:
+            summary["current_period"] = period_summary
+    # The Billing API also exposes the coverage window directly
+    # on the invoice envelope.
+    coverage_start = body.get("coverageStartDate")
+    coverage_end = body.get("coverageEndDate")
+    if isinstance(coverage_start, str) or isinstance(coverage_end, str):
+        period_summary = summary.get("current_period") or {}
+        if isinstance(coverage_start, str):
+            period_summary["start"] = coverage_start
+        if isinstance(coverage_end, str):
+            period_summary["end"] = coverage_end
+        if period_summary:
+            summary["current_period"] = period_summary
     return summary
 
 
 def _summarise_records(
-    records: List[Dict[str, Any]],
-    *,
-    summary_keys: tuple,
-    list_key: Optional[str],
+    records: List[Dict[str, Any]], *, list_key: str,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "record_count": len(records),
@@ -314,13 +623,13 @@ def _summarise_records(
     for record in records:
         if not isinstance(record, dict):
             continue
-        for key in summary_keys:
+        for key in ("currency", "currencyCode"):
             value = record.get(key)
-            if value is None:
-                continue
-            if key == "currency" and isinstance(value, str):
+            if isinstance(value, str):
                 currencies.add(value.upper())
-            elif key in ("date", "period") and isinstance(value, str):
+        for key in ("date", "period", "startDate", "endDate"):
+            value = record.get(key)
+            if isinstance(value, str):
                 dates.append(value)
     if currencies:
         summary["currencies"] = sorted(currencies)
@@ -333,8 +642,19 @@ def _summarise_records(
     return summary
 
 
+def _summarise_object(
+    body: Dict[str, Any], *, allow_keys: tuple,
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    for key in allow_keys:
+        if key in body:
+            summary[key] = body[key]
+    return summary
+
+
 __all__ = [
-    "BILLING_SERVICE_TYPES",
+    "BILLING_API_VERSION",
+    "BILLING_BASE_URL",
     "BillingEndpointResult",
     "RackspaceBillingClient",
 ]

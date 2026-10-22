@@ -396,14 +396,94 @@ for bad in AZURE_CLIENT_SECRET AZURE_PASSWORD AZURE_TENANT_SECRET; do
     fi
 done
 
-# Rackspace: out of scope for Phase 8.4 but we still verify absent.
-for bad in RACKSPACE_USERNAME RACKSPACE_API_KEY RACKSPACE_TOKEN; do
-    if grep -q "^${bad}=" .env 2>/dev/null; then
-        log_fail ".env contains $bad (Rackspace integration out of scope)"
+# ---------------------------------------------------------------------------
+# 15b. Rackspace secrets — protected .env only (Phase 9A approval)
+# ---------------------------------------------------------------------------
+
+banner "15b. Rackspace secrets (Phase 9A approved)"
+# Phase 9A integration is now approved.  The host .env is the
+# canonical, protected deployment surface for the three Identity
+# credentials and the Billing Account Number (RAN).  A real
+# credential appearing in any TRACKED source file is still a
+# hard failure.  Values are NEVER printed.
+RS_ID_OK=1
+for rs in RACKSPACE_USERNAME RACKSPACE_API_KEY RACKSPACE_BILLING_ACCOUNT; do
+    # The value must be non-empty in .env when present (presence
+    # alone is acceptable — absence means "Rackspace disabled").
+    if grep -qE "^${rs}=[^[:space:]](.*[^[:space:]])?$" .env 2>/dev/null; then
+        log_pass ".env has non-empty ${rs} (value redacted)"
     else
-        log_pass ".env does NOT contain $bad"
+        log_warn ".env has empty ${rs} (Rackspace integration disabled)"
+    fi
+    # CRITICAL: the credential value must NOT appear in any
+    # TRACKED source file (the documented Phase 9A contract —
+    # same scope as the AWS/Azure checks above; untracked local
+    # artifacts such as .kimchi/ session files and frontend/dist
+    # build output are not part of the release).  We grep the
+    # *value*, not just the key name, so a stray copy-paste of
+    # an actual credential into source is still caught.
+    RS_VAL="$(awk -F= -v k="$rs" '$1==k {print substr($0, length(k)+2)}' .env 2>/dev/null | tr -d '\r\n' || true)"
+    # Strip optional surrounding quotes so a quoted .env value is
+    # also checked in its bare form.
+    RS_VAL="${RS_VAL%\"}"; RS_VAL="${RS_VAL#\"}"
+    RS_VAL="${RS_VAL%\'}"; RS_VAL="${RS_VAL#\'}"
+    if [[ -n "$RS_VAL" ]]; then
+        # Tracked files that contain the raw value at all.
+        RS_CAND="$(git ls-files -z | xargs -0 grep -IlF -- "$RS_VAL" 2>/dev/null || true)"
+        RS_LEAKS=""
+        if [[ -n "$RS_CAND" ]]; then
+            if [[ "$rs" == "RACKSPACE_USERNAME" ]]; then
+                # Usernames are frequently short dictionary-like words
+                # that also occur as ordinary project vocabulary, so a
+                # bare exact-value scan is meaningless for USERNAME
+                # (the project domain term appears in dozens of tracked
+                # files as prose).  The genuine leak pattern is the
+                # value ASSIGNED to a username key, so a file is only
+                # flagged when the value appears on a line that also
+                # carries a username-assignment context
+                # (RACKSPACE_USERNAME=..., "username": ..., ...).
+                while IFS= read -r rf; do
+                    [[ -n "$rf" ]] || continue
+                    if grep -iEn "username[\"']?[[:space:]]*[=:]" "$rf" 2>/dev/null \
+                        | grep -qF -- "$RS_VAL"; then
+                        RS_LEAKS="${RS_LEAKS:+$RS_LEAKS }$rf"
+                    fi
+                done <<< "$RS_CAND"
+            else
+                # API keys and the RAN are high-specificity
+                # identifiers: the bare value anywhere in a tracked
+                # file is a leak.
+                RS_LEAKS="$RS_CAND"
+            fi
+        fi
+        if [[ -n "$RS_LEAKS" ]]; then
+            log_fail "Rackspace credential value for ${rs} leaks outside .env into: ${RS_LEAKS}"
+            RS_ID_OK=0
+        else
+            log_pass "Rackspace credential value for ${rs} is confined to .env (tracked tree)"
+        fi
+        # Scrub the local variables so we never expose them via
+        # shell introspection.
+        unset RS_VAL RS_CAND RS_LEAKS rf
     fi
 done
+# The RACKSPACE_TOKEN variable is intentionally NEVER used by
+# the application — Phase 9A derives the X-Auth-Token from the
+# Identity service on demand and never persists it.  If it
+# appears in .env we flag a warning (it should not be needed).
+if grep -q "^RACKSPACE_TOKEN=" .env 2>/dev/null; then
+    log_warn ".env contains RACKSPACE_TOKEN (not used by Phase 9A — X-Auth-Token is derived per-call)"
+fi
+
+# Verify the .env.example uses empty placeholders only — no
+# real values must have leaked into the example template.
+ENV_EXAMPLE_BAD="$(grep -E '^RACKSPACE_(USERNAME|API_KEY|BILLING_ACCOUNT|ACCOUNT_ID)=[^[:space:]]' .env.example 2>/dev/null | grep -vE '=$' || true)"
+if [[ -n "$ENV_EXAMPLE_BAD" ]]; then
+    log_fail ".env.example has non-empty Rackspace value(s): ${ENV_EXAMPLE_BAD}"
+    RS_ID_OK=0
+else
+    log_pass ".env.example has empty Rackspace placeholders only"
+fi
 
 # ---------------------------------------------------------------------------
 # 16. IMDSv2 required

@@ -18,9 +18,21 @@ schema:
       "roles": list[str] | None,
       "elevated_roles_present": list[str] | None,
       "service_types": list[str] | None,
-      "billing_root": "OK" | "AUTH_FAILED" | ...,
-      "billing_payments": ...,
-      "billing_invoices": ...,
+
+      "ran_configured": bool,             # RAN present in env
+      "billing_account":                  # /v2/accounts/{ran}
+          "OK" | "AUTH_FAILED" | "PERMISSION_DENIED"
+          | "NOT_FOUND" | "NOT_CONFIGURED" | "TRANSPORT_ERROR",
+      "billing_account_summary": dict,
+      "billing_currency": ...,            # /v2/accounts/{ran}/currency
+      "billing_currency_summary": dict,
+      "billing_estimated_charges": ...,   # /v2/accounts/{ran}/estimated_charges
+      "billing_estimated_charges_summary": dict,
+      "billing_billing_summary": ...,     # /v2/accounts/{ran}/billing-summary
+      "billing_billing_summary_summary": dict,
+      "billing_invoice_latest": ...,      # /v2/accounts/{ran}/invoices/latest
+      "billing_invoice_latest_summary": dict,
+
       "servers_status": ...,
       "servers_total": int | None,
       "servers_regions": list[str] | None,
@@ -31,8 +43,9 @@ schema:
     }
 
 Exit code 0 on success (even when individual product endpoints
-return non-OK — the validator decides what to warn vs fail).  Non-zero
-exit on a fatal transport failure that prevents reporting.
+return non-OK — the validator decides what to warn vs fail).
+Non-zero exit on a fatal transport failure that prevents
+reporting.
 """
 
 from __future__ import annotations
@@ -59,6 +72,10 @@ from app.services.rackspace import (  # noqa: E402
     RackspaceIdentity,
     RackspaceServersClient,
 )
+from app.services.rackspace.billing import BILLING_BASE_URL  # noqa: E402
+from app.services.rackspace.config import (  # noqa: E402
+    billing_account_configured,
+)
 
 
 # Tokens we must never leak into the output.  We grep the rendered
@@ -69,7 +86,18 @@ SENTINEL_SECRET = "RACKSPACE_API_KEY_VALUE_SENTINEL"
 # variable.  Any inadvertent leak of the API key will fail the
 # token-redaction check.
 _API_KEY_VALUE = os.environ.get("RACKSPACE_API_KEY", "")
-SENTINEL_VALUES = [v for v in (_API_KEY_VALUE, SENTINEL_SECRET) if v]
+_RAN_VALUE = os.environ.get("RACKSPACE_BILLING_ACCOUNT", "")
+_ACCOUNT_ID_VALUE = os.environ.get("RACKSPACE_ACCOUNT_ID", "")
+_USERNAME_VALUE = os.environ.get("RACKSPACE_USERNAME", "")
+SENTINEL_VALUES = [
+    v for v in (
+        _API_KEY_VALUE,
+        _RAN_VALUE,
+        _ACCOUNT_ID_VALUE,
+        _USERNAME_VALUE,
+        SENTINEL_SECRET,
+    ) if v
+]
 
 
 def _safe_str(value: Any) -> str:
@@ -96,7 +124,26 @@ def _public_verbs() -> List[str]:
 def _public_methods(client: Any) -> List[str]:
     """Return the public (non-underscore) methods on a client."""
 
-    return [name for name in dir(client) if not name.startswith("_") and callable(getattr(client, name))]
+    return [
+        name for name in dir(client)
+        if not name.startswith("_") and callable(getattr(client, name))
+    ]
+
+
+def _sanitize_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip any sensitive substrings from a summary dict."""
+
+    cleaned: Dict[str, Any] = {}
+    for key, value in summary.items():
+        if isinstance(value, str):
+            cleaned[key] = _safe_str(value)
+        elif isinstance(value, dict):
+            cleaned[key] = _sanitize_summary(value)
+        elif isinstance(value, list):
+            cleaned[key] = [_safe_str(item) if isinstance(item, str) else item for item in value]
+        else:
+            cleaned[key] = value
+    return cleaned
 
 
 async def _run() -> Dict[str, Any]:
@@ -110,9 +157,18 @@ async def _run() -> Dict[str, Any]:
         "roles": None,
         "elevated_roles_present": None,
         "service_types": None,
-        "billing_root": None,
-        "billing_payments": None,
-        "billing_invoices": None,
+        "ran_configured": billing_account_configured(),
+        "billing_base_url": BILLING_BASE_URL,
+        "billing_account": None,
+        "billing_account_summary": {},
+        "billing_currency": None,
+        "billing_currency_summary": {},
+        "billing_estimated_charges": None,
+        "billing_estimated_charges_summary": {},
+        "billing_billing_summary": None,
+        "billing_billing_summary_summary": {},
+        "billing_invoice_latest": None,
+        "billing_invoice_latest_summary": {},
         "servers_status": None,
         "servers_total": None,
         "servers_regions": None,
@@ -123,8 +179,12 @@ async def _run() -> Dict[str, Any]:
     }
 
     identity = RackspaceIdentity(http_client=RackspaceHttpClient())
-    billing = RackspaceBillingClient(http_client=identity._http, identity=identity)  # type: ignore[attr-defined]
-    servers = RackspaceServersClient(http_client=identity._http, identity=identity)  # type: ignore[attr-defined]
+    billing = RackspaceBillingClient(
+        http_client=identity._http, identity=identity,  # type: ignore[attr-defined]
+    )
+    servers = RackspaceServersClient(
+        http_client=identity._http, identity=identity,  # type: ignore[attr-defined]
+    )
 
     # 1) Identity authentication.
     try:
@@ -144,15 +204,20 @@ async def _run() -> Dict[str, Any]:
     output["elevated_roles_present"] = session.elevated_roles_present
     output["service_types"] = session.catalog.discovered_service_types()
 
-    # 2) Billing probes.
+    # 2) Billing probes — safe order, per-endpoint status + summary.
     try:
         billing_results = await billing.probe_all()
         for result in billing_results:
-            output[result.endpoint] = result.status
+            key = result.endpoint  # e.g. ``billing_account``
+            output[key] = result.status
+            output[f"{key}_summary"] = _sanitize_summary(dict(result.summary))
     except Exception as exc:  # noqa: BLE001
-        output["billing_root"] = "TRANSPORT_ERROR"
-        output["billing_payments"] = "TRANSPORT_ERROR"
-        output["billing_invoices"] = "TRANSPORT_ERROR"
+        for key in (
+            "billing_account", "billing_currency",
+            "billing_estimated_charges", "billing_billing_summary",
+            "billing_invoice_latest",
+        ):
+            output[key] = "TRANSPORT_ERROR"
         output["billing_error"] = type(exc).__name__
 
     # 3) Cloud Servers probes.
@@ -172,7 +237,9 @@ async def _run() -> Dict[str, Any]:
             output["servers_status"] = "OK"
             output["servers_total"] = summary.total_count
             output["servers_regions"] = sorted(summary.regions)
-            output["servers_status_counts"] = dict(sorted(summary.status_counts.items()))
+            output["servers_status_counts"] = dict(
+                sorted(summary.status_counts.items()),
+            )
             output["servers_flavor_ids"] = sorted(set(summary.flavor_ids))
     except Exception as exc:  # noqa: BLE001
         output["servers_status"] = "TRANSPORT_ERROR"
@@ -215,11 +282,12 @@ def main() -> int:
     # rendered JSON.  This is a belt-and-braces check; ``_safe_str``
     # already removed anything that matched.
     rendered = json.dumps(output, sort_keys=True)
-    if _API_KEY_VALUE and _API_KEY_VALUE in rendered:
-        output["no_token_in_output"] = False
-        rendered = rendered.replace(_API_KEY_VALUE, "<redacted>")
-    else:
-        output["no_token_in_output"] = True
+    leak_found = False
+    for sentinel in SENTINEL_VALUES:
+        if sentinel and sentinel in rendered:
+            leak_found = True
+            rendered = rendered.replace(sentinel, "<redacted>")
+    output["no_token_in_output"] = not leak_found
 
     sys.stdout.write(rendered)
     sys.stdout.write("\n")

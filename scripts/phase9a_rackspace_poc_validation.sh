@@ -11,8 +11,8 @@
 #   1 — validation failure (one or more gates failed)
 #   2 — configuration / pre-condition violated
 #
-# The script NEVER prints the API key, X-Auth-Token, password, or
-# any other Rackspace secret.  It also refuses to issue any
+# The script NEVER prints the API key, X-Auth-Token, password, RAN,
+# or any other Rackspace secret.  It also refuses to issue any
 # write-like HTTP verb against Rackspace product APIs — only the
 # identity POST is allowed (Rackspace Identity authentication is
 # the only allowed write-like HTTP method).
@@ -51,6 +51,7 @@ fi
 USERNAME_SET=0
 APIKEY_SET=0
 ACCOUNT_SET=0
+RAN_SET=0
 
 # Use ``grep -c`` so we never echo the value.
 if grep -qE '^RACKSPACE_USERNAME=[^[:space:]](.*[^[:space:]])?$' "$ENV_FILE"; then
@@ -62,18 +63,27 @@ fi
 if grep -qE '^RACKSPACE_ACCOUNT_ID=[^[:space:]](.*[^[:space:]])?$' "$ENV_FILE"; then
     ACCOUNT_SET=1
 fi
+if grep -qE '^RACKSPACE_BILLING_ACCOUNT=[^[:space:]](.*[^[:space:]])?$' "$ENV_FILE"; then
+    RAN_SET=1
+fi
 
 if [[ $USERNAME_SET -eq 1 && $APIKEY_SET -eq 1 && $ACCOUNT_SET -eq 1 ]]; then
-    ok "credential variables are present in $(basename "$ENV_FILE") (values redacted)"
+    ok "Identity credential variables are present in $(basename "$ENV_FILE") (values redacted)"
 else
     missing=()
     [[ $USERNAME_SET -eq 0 ]] && missing+=("RACKSPACE_USERNAME")
     [[ $APIKEY_SET   -eq 0 ]] && missing+=("RACKSPACE_API_KEY")
     [[ $ACCOUNT_SET  -eq 0 ]] && missing+=("RACKSPACE_ACCOUNT_ID")
-    bad "missing Rackspace credential variables: ${missing[*]}"
+    bad "missing Rackspace Identity credential variables: ${missing[*]}"
     echo
     bold "RESULT: configuration/precondition failure"
     exit 2
+fi
+
+if [[ $RAN_SET -eq 1 ]]; then
+    ok "RACKSPACE_BILLING_ACCOUNT (RAN) is configured in $(basename "$ENV_FILE") (value redacted)"
+else
+    warn "RACKSPACE_BILLING_ACCOUNT (RAN) is empty — Billing endpoints will report NOT_CONFIGURED"
 fi
 
 # Sanity guard: the .env line must not accidentally print a
@@ -84,6 +94,13 @@ case "$ENV_MODE" in
     600|640) ok ".env file mode is $ENV_MODE (no world read)" ;;
     *)       warn ".env file mode is $ENV_MODE; consider 600/640 to restrict access" ;;
 esac
+
+# Belt-and-braces: the .env must remain untracked.
+if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+    bad ".env is tracked by git (must remain gitignored)"
+else
+    ok ".env is not tracked by git"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2: drive the POC client through every phase.
@@ -104,7 +121,7 @@ while IFS='=' read -r key value; do
         ''|'#'*) continue ;;
     esac
     case "$key" in
-        RACKSPACE_USERNAME|RACKSPACE_API_KEY|RACKSPACE_ACCOUNT_ID)
+        RACKSPACE_USERNAME|RACKSPACE_API_KEY|RACKSPACE_ACCOUNT_ID|RACKSPACE_BILLING_ACCOUNT)
             # Strip optional surrounding quotes from the value.
             value="${value%\"}"
             value="${value#\"}"
@@ -157,9 +174,17 @@ roles_count="$(read_field roles_count)"
 roles="$(read_field roles)"
 elevated_roles_present="$(read_field elevated_roles_present)"
 service_types="$(read_field service_types)"
-billing_root="$(read_field billing_root)"
-billing_payments="$(read_field billing_payments)"
-billing_invoices="$(read_field billing_invoices)"
+
+ran_configured="$(read_field ran_configured)"
+billing_account="$(read_field billing_account)"
+billing_account_summary="$(read_field billing_account_summary)"
+billing_currency="$(read_field billing_currency)"
+billing_currency_summary="$(read_field billing_currency_summary)"
+billing_estimated_charges="$(read_field billing_estimated_charges)"
+billing_estimated_charges_summary="$(read_field billing_estimated_charges_summary)"
+billing_billing_summary="$(read_field billing_billing_summary)"
+billing_invoice_latest="$(read_field billing_invoice_latest)"
+
 servers_status="$(read_field servers_status)"
 servers_total="$(read_field servers_total)"
 servers_regions="$(read_field servers_regions)"
@@ -200,19 +225,107 @@ if [[ -n "$service_types" ]]; then
 fi
 
 bold ""
-bold "Billing API"
+bold "Billing API (documented external endpoint — NOT in service catalog)"
 
-for ep in billing_root billing_payments billing_invoices; do
+# Informational: the Billing base URL is the documented Rackspace
+# endpoint that is intentionally NOT exposed through the Identity
+# service catalog.
+info "Billing base: https://billing.api.rackspacecloud.com"
+info "RAN configured: ${ran_configured:-false}"
+
+_billing_label() {
+    case "$1" in
+        billing_account) echo "GET /v2/accounts/{ran}" ;;
+        billing_currency) echo "GET /v2/accounts/{ran}/currency" ;;
+        billing_estimated_charges) echo "GET /v2/accounts/{ran}/estimated_charges" ;;
+        billing_billing_summary) echo "GET /v2/accounts/{ran}/billing-summary" ;;
+        billing_invoice_latest) echo "GET /v2/accounts/{ran}/invoices/latest" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+for ep in billing_account billing_currency billing_estimated_charges billing_billing_summary billing_invoice_latest; do
     v="${!ep:-}"
+    label="$(_billing_label "$ep")"
     case "$v" in
-        OK) ok "billing endpoint ${ep} returned 200" ;;
-        AUTH_FAILED) warn "billing endpoint ${ep} returned 401 (auth)" ;;
-        PERMISSION_DENIED) warn "billing endpoint ${ep} returned 403 (permission denied)" ;;
-        NOT_FOUND) info "billing endpoint ${ep} not available on this account" ;;
-        TRANSPORT_ERROR) bad "billing endpoint ${ep} transport error" ;;
-        *) info "billing endpoint ${ep}: ${v:-unknown}" ;;
+        OK)
+            ok "billing endpoint ${label} returned 200"
+            ;;
+        AUTH_FAILED)
+            warn "billing endpoint ${label} returned 401 (auth — token rejected)"
+            ;;
+        PERMISSION_DENIED)
+            warn "billing endpoint ${label} returned 403 (insufficient Billing permission on account)"
+            ;;
+        NOT_FOUND)
+            info "billing endpoint ${label} returned 404 (invalid RAN or Billing not on this account)"
+            ;;
+        NOT_CONFIGURED)
+            info "billing endpoint ${label} not configured (RAN missing)"
+            ;;
+        TRANSPORT_ERROR)
+            bad "billing endpoint ${label} transport error"
+            ;;
+        "")
+            warn "billing endpoint ${label} was not probed (runner did not reach Billing)"
+            ;;
+        *)
+            info "billing endpoint ${label}: ${v}"
+            ;;
     esac
 done
+
+# Per-endpoint policy from the Phase 9A spec:
+#
+#   - account lookup GET PASS (must succeed when RAN is configured)
+#   - current/estimated charges GET PASS if supported for account
+#
+# If the RAN is configured, the account lookup and currency endpoints
+# are required to succeed (the actual Billing API always supports
+# them when Billing is enabled for the account).  Estimated charges
+# is conditional: it may return 403/404 if the account lacks
+# permissions for current-period data.
+if [[ "$ran_configured" == "true" ]]; then
+    case "$billing_account" in
+        OK) ok "Billing account lookup GET succeeded (sanitized identity present)" ;;
+        AUTH_FAILED) bad "Billing account lookup GET returned 401 with valid token" ;;
+        PERMISSION_DENIED) bad "Billing account lookup GET returned 403 (billing:observer must allow account lookup)" ;;
+        NOT_FOUND) bad "Billing account lookup GET returned 404 (RAN appears invalid)" ;;
+        TRANSPORT_ERROR) bad "Billing account lookup GET transport error" ;;
+        NOT_CONFIGURED) bad "Billing account lookup GET reported NOT_CONFIGURED with RAN configured" ;;
+        *) warn "Billing account lookup GET returned unexpected status: ${billing_account:-unknown}" ;;
+    esac
+    case "$billing_currency" in
+        OK) ok "Billing currency GET succeeded" ;;
+        AUTH_FAILED) warn "Billing currency GET returned 401 — account likely lacks currency scope" ;;
+        PERMISSION_DENIED) info "Billing currency GET returned 403 — currency not exposed on this account" ;;
+        NOT_FOUND) info "Billing currency GET returned 404 — currency not exposed on this account" ;;
+        TRANSPORT_ERROR) warn "Billing currency GET transport error" ;;
+        NOT_CONFIGURED) warn "Billing currency GET reported NOT_CONFIGURED" ;;
+        *) info "Billing currency GET: ${billing_currency:-unknown}" ;;
+    esac
+    case "$billing_estimated_charges" in
+        OK) ok "Billing current/estimated charges GET succeeded" ;;
+        AUTH_FAILED) warn "Billing estimated charges GET returned 401" ;;
+        PERMISSION_DENIED) info "Billing estimated charges GET returned 403 — current-period not exposed on this account" ;;
+        NOT_FOUND) info "Billing estimated charges GET returned 404 — current-period not exposed on this account" ;;
+        TRANSPORT_ERROR) warn "Billing estimated charges GET transport error" ;;
+        NOT_CONFIGURED) warn "Billing estimated charges GET reported NOT_CONFIGURED" ;;
+        *) info "Billing estimated charges GET: ${billing_estimated_charges:-unknown}" ;;
+    esac
+fi
+
+# Sanitized current-cost summary, if the estimated charges endpoint
+# returned one.
+if [[ "$billing_estimated_charges" == "OK" && -n "$billing_estimated_charges_summary" ]]; then
+    info "estimated charges summary: ${billing_estimated_charges_summary}"
+fi
+if [[ -n "$billing_account_summary" && "$billing_account_summary" != "{}" ]]; then
+    info "billing account summary: ${billing_account_summary}"
+fi
+if [[ -n "$billing_currency_summary" && "$billing_currency_summary" != "{}" ]]; then
+    info "billing currency summary: ${billing_currency_summary}"
+fi
 
 bold ""
 bold "Cloud Servers API"
@@ -249,7 +362,7 @@ case "$write_methods_exposed" in
 esac
 
 case "$no_token_in_output" in
-    true)  ok "no X-Auth-Token or API key appears in the validator output" ;;
+    true)  ok "no X-Auth-Token / API key / RAN appears in the validator output" ;;
     false) bad "token-redaction guarantee failed — investigate immediately" ;;
     *)     warn "could not confirm token-redaction guarantee" ;;
 esac

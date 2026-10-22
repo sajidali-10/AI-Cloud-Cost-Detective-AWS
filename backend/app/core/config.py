@@ -91,9 +91,28 @@ class Settings(BaseSettings):
     # intentionally empty by default so the application starts
     # cleanly when Rackspace is not wired up.  Application
     # startup MUST NOT fail when these are unset.
+    #
+    # Two distinct identifiers are required for the POC:
+    #
+    # * ``rackspace_username`` / ``rackspace_api_key`` /
+    #   ``rackspace_account_id`` — used by Identity authentication
+    #   and the Cloud Servers (Nova) / Cloud Files / Cloud
+    #   BlockStorage product APIs.  ``rackspace_account_id`` is
+    #   the *tenant* / customer account number used as the path
+    #   component of those product URLs.
+    #
+    # * ``rackspace_billing_account`` — the Rackspace Billing
+    #   Account Number (RAN) used by the Billing API.  Per
+    #   Rackspace documentation the Billing API is intentionally
+    #   NOT exposed through the Identity service catalog; the
+    #   Billing base endpoint is the documented URL
+    #   ``https://billing.api.rackspacecloud.com`` and the path
+    #   uses the RAN — *not* the Cloud-API tenant ID.  These
+    #   identifiers are NOT interchangeable.
     rackspace_username: str = Field(default="")
     rackspace_api_key: str = Field(default="")
     rackspace_account_id: str = Field(default="")
+    rackspace_billing_account: str = Field(default="")
 
     # --- Phase 4: AI Cost Analyst (LiteLLM Gateway) ---
     # Master switch. When False, every /api/ai/* generation endpoint
