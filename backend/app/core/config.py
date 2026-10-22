@@ -85,6 +85,16 @@ class Settings(BaseSettings):
         default="https://management.azure.com/.default"
     )
 
+    # --- Phase 9A: Rackspace Cloud (optional read-only POC) ---
+    # These are typed entries for the Rackspace POC.  The values
+    # are READ by :mod:`app.services.rackspace.config` and are
+    # intentionally empty by default so the application starts
+    # cleanly when Rackspace is not wired up.  Application
+    # startup MUST NOT fail when these are unset.
+    rackspace_username: str = Field(default="")
+    rackspace_api_key: str = Field(default="")
+    rackspace_account_id: str = Field(default="")
+
     # --- Phase 4: AI Cost Analyst (LiteLLM Gateway) ---
     # Master switch. When False, every /api/ai/* generation endpoint
     # returns a controlled "AI_DISABLED" response without contacting
