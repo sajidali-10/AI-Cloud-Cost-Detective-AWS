@@ -67,6 +67,22 @@ _TEST_JWT_SECRET = (
 os.environ["AUTH_ENABLED"] = "false"
 os.environ.setdefault("JWT_SECRET", _TEST_JWT_SECRET)
 
+# Phase 9A — ensure Rackspace env vars are explicitly empty
+# during tests so the operator's host ``.env`` (read by
+# pydantic-settings) cannot leak real credentials into the test
+# settings.  We SET to an empty string rather than pop so
+# pydantic-settings treats the var as authoritative (env vars
+# override .env file values even when empty).  Tests that
+# exercise Rackspace paths explicitly ``monkeypatch.setenv``
+# the values they need.
+for _rs in (
+    "RACKSPACE_USERNAME",
+    "RACKSPACE_API_KEY",
+    "RACKSPACE_ACCOUNT_ID",
+    "RACKSPACE_BILLING_ACCOUNT",
+):
+    os.environ[_rs] = ""
+
 
 # ---------------------------------------------------------------------------
 # Test isolation: reset cached settings + monkyepatched env vars after
@@ -95,12 +111,35 @@ def _reset_phase5a_settings():
     os.environ["APP_ENV"] = "development"
     os.environ["CORS_ALLOWED_ORIGINS"] = "http://localhost"
     os.environ["AUTH_ENABLED"] = "false"
+    # Phase 9A — force Rackspace env vars to empty strings so
+    # pydantic-settings does not pick them up from the host
+    # ``.env``.  Tests that need real values use ``monkeypatch``.
+    for _rs in (
+        "RACKSPACE_USERNAME",
+        "RACKSPACE_API_KEY",
+        "RACKSPACE_ACCOUNT_ID",
+        "RACKSPACE_BILLING_ACCOUNT",
+    ):
+        os.environ[_rs] = ""
     get_settings.cache_clear()  # type: ignore[attr-defined]
     yield
     # Restore the default env vars that Phase 5A tests may have
-    # monkey-patched.
+    # monkey-patched.  monkeypatch handles the per-test env vars
+    # itself; we just clear the cached settings so the next test
+    # observes the restored defaults.
     os.environ["AUTH_ENABLED"] = "false"
     os.environ["JWT_SECRET"] = _TEST_JWT_SECRET
+    # Belt-and-braces: a test that mutated ``os.environ``
+    # directly (without ``monkeypatch``) would otherwise leak
+    # into the next test.  We re-pin the Rackspace vars so the
+    # suite always starts from "not configured".
+    for _rs in (
+        "RACKSPACE_USERNAME",
+        "RACKSPACE_API_KEY",
+        "RACKSPACE_ACCOUNT_ID",
+        "RACKSPACE_BILLING_ACCOUNT",
+    ):
+        os.environ[_rs] = ""
     get_settings.cache_clear()  # type: ignore[attr-defined]
     reset_security_core_for_tests()
     # Phase 8.2 — drop the auth rate-limiter singleton so a test
