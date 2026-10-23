@@ -236,6 +236,14 @@ services:
       AZURE_SUBSCRIPTION_1_DISPLAY_NAME: ${AZURE_SUBSCRIPTION_1_DISPLAY_NAME:-}
       AZURE_SUBSCRIPTION_2_ID: ${AZURE_SUBSCRIPTION_2_ID:-}
       AZURE_SUBSCRIPTION_2_DISPLAY_NAME: ${AZURE_SUBSCRIPTION_2_DISPLAY_NAME:-}
+      # --- Phase 9B.1: Rackspace canonical costs (read-only) ---
+      # Secrets stay in the protected host .env; the backend only
+      # receives them as process environment (never PostgreSQL).
+      RACKSPACE_USERNAME: ${RACKSPACE_USERNAME:-}
+      RACKSPACE_API_KEY: ${RACKSPACE_API_KEY:-}
+      RACKSPACE_ACCOUNT_ID: ${RACKSPACE_ACCOUNT_ID:-}
+      RACKSPACE_BILLING_ACCOUNT: ${RACKSPACE_BILLING_ACCOUNT:-}
+      RACKSPACE_ACCOUNT_DISPLAY_NAME: ${RACKSPACE_ACCOUNT_DISPLAY_NAME:-}
       # --- Phase 4: AI Cost Analyst (LiteLLM Gateway) ---
       AI_ENABLED: ${AI_ENABLED}
       LITELLM_BASE_URL: ${LITELLM_BASE_URL}

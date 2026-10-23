@@ -504,8 +504,18 @@ async def get_or_refresh_azure_canonical(
     db: Optional["object"] = None,
     fresh_ttl_seconds: Optional[int] = None,
     stale_ttl_seconds: Optional[int] = None,
+    cache_namespace: str = CACHE_NAMESPACE,
+    storage_account_id: Optional[str] = None,
 ) -> AzureCacheEntry:
-    """Read-through cache lookup with FRESH + STALE-LKG semantics."""
+    """Read-through cache lookup with FRESH + STALE-LKG semantics.
+
+    Phase 9B.1 generalization: ``cache_namespace`` and
+    ``storage_account_id`` are optional overrides so a second
+    provider (Rackspace) can reuse this exact FRESH / STALE-LKG /
+    single-flight machinery under its own namespace without
+    duplicating the logic.  The defaults preserve the original
+    Azure behavior byte-for-byte.
+    """
     fresh = fresh_ttl_seconds if fresh_ttl_seconds is not None else _fresh_ttl_seconds()
     stale = stale_ttl_seconds if stale_ttl_seconds is not None else _stale_ttl_seconds()
     cache_key = build_azure_cache_key(
@@ -515,8 +525,9 @@ async def get_or_refresh_azure_canonical(
         kind=kind,
         signature=signature,
     )
-    storage_account_id = build_azure_storage_account_id(scope)
-    lock = await _lock_for(CACHE_NAMESPACE, storage_account_id, cache_key)
+    if storage_account_id is None:
+        storage_account_id = build_azure_storage_account_id(scope)
+    lock = await _lock_for(cache_namespace, storage_account_id, cache_key)
 
     async with lock:
         own_session = db is None
@@ -532,7 +543,7 @@ async def get_or_refresh_azure_canonical(
             try:
                 row = _read_row(
                     session,
-                    cache_namespace=CACHE_NAMESPACE,
+                    cache_namespace=cache_namespace,
                     storage_account_id=storage_account_id,
                     cache_key=cache_key,
                 )
@@ -574,7 +585,7 @@ async def get_or_refresh_azure_canonical(
             ):
                 logger.info(
                     "azure.cost.cache HIT key=%s namespace=%s",
-                    cache_key, CACHE_NAMESPACE,
+                    cache_key, cache_namespace,
                 )
                 return AzureCacheEntry(
                     payload=row["payload"],
@@ -687,7 +698,7 @@ async def get_or_refresh_azure_canonical(
                 _write_row(
                     session,
                     row=row,
-                    cache_namespace=CACHE_NAMESPACE,
+                    cache_namespace=cache_namespace,
                     storage_account_id=storage_account_id,
                     cache_key=cache_key,
                     payload=cached_payload,

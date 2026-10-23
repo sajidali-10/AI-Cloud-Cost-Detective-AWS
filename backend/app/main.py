@@ -207,6 +207,35 @@ def _phase7c2a_bootstrap_azure_subscriptions() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 9B.1: bootstrap the configured Rackspace account.
+#
+# The single Rackspace Cloud tenant (``RACKSPACE_ACCOUNT_ID``) is
+# derived from runtime configuration and inserted idempotently on
+# first boot so the canonical cost route can select it without any
+# manual database setup.  Only non-secret account metadata is
+# stored — the Billing Account Number (RAN) and every credential
+# stay in the protected host ``.env``.  When Rackspace is not
+# configured the bootstrap is a silent no-op.
+# ---------------------------------------------------------------------------
+
+
+@app.on_event("startup")
+def _phase9b1_bootstrap_rackspace_account() -> None:
+    """Idempotently register the configured Rackspace account."""
+    try:
+        from app.services.cloud.rackspace.adapter import (
+            bootstrap_rackspace_account_once,
+        )
+
+        bootstrap_rackspace_account_once()
+    except Exception as exc:  # noqa: BLE001 — bootstrap must never block startup
+        logger.warning(
+            "phase9b1 bootstrap_rackspace_account failed: %s",
+            type(exc).__name__,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Flatten HTTPException ``detail`` dicts into the top-level response
 # body so auth/RBAC errors share the same envelope as the rest of
 # the API (``{status, error_code, message, ...}``).

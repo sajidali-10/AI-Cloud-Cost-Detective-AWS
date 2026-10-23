@@ -25,8 +25,7 @@ Architectural notes
 Selection semantics
 -------------------
 
-* ``provider`` — required, one of ``AWS`` / ``AZURE`` (future
-  ``RACKSPACE``).
+* ``provider`` — required, one of ``AWS`` / ``AZURE`` / ``RACKSPACE``.
 * ``account_id`` (optional) — ``"all"`` (default), ``"acct:<id>"``
   for AWS, ``"sub:<id>"`` for Azure, or a bare numeric row id.
 
@@ -304,7 +303,11 @@ def _resolve_rows(
     cleaned = selection
     if provider == CloudProviderKind.AZURE and cleaned.startswith("sub:"):
         cleaned = cleaned[len("sub:"):]
-    elif provider == CloudProviderKind.AWS and cleaned.startswith("acct:"):
+    elif cleaned.startswith("acct:"):
+        # Phase 9B.1 — strip the ``acct:`` prefix for every non-Azure
+        # provider (AWS and RACKSPACE both scope accounts this way;
+        # Azure subscription GUIDs can never collide with the
+        # prefix, so Azure behaviour is unchanged).
         cleaned = cleaned[len("acct:"):]
     row = None
     if cleaned.isdigit():
@@ -642,7 +645,7 @@ def _build_azure_envelope(
     summary="Provider-neutral cost report for the selected provider and account context.",
 )
 async def get_cloud_costs(
-    provider: str = Query(..., description="AWS | AZURE (Rackspace in a future phase)"),
+    provider: str = Query(..., description="AWS | AZURE | RACKSPACE"),
     days: Optional[int] = Query(default=None),
     month: Optional[str] = Query(default=None),
     start_date: Optional[date] = Query(default=None),
@@ -867,6 +870,113 @@ async def get_cloud_costs(
             _ops["cache_status"] = response_dict.get("cache_status", "")
         return response_dict
 
+    if kind == CloudProviderKind.RACKSPACE:
+        # Phase 9B.1 — Rackspace routes through the same shared
+        # FRESH / STALE-LKG cache machinery under its own namespace.
+        # The Billing source answers only for the current billing
+        # cycle; the adapter enforces the period-overlap rule and
+        # exposes the ACTUAL source period in the envelope.
+        from app.services.cloud.cost_envelope import build_rackspace_envelope
+        from app.services.cloud.rackspace.cost_cache import (
+            get_or_refresh_rackspace_canonical,
+        )
+        from app.services.cloud.rackspace.costs import RackspaceCostError
+
+        async def _rackspace_loader():
+            summary = await adapter.get_cost_summary(
+                accounts=rows,
+                period_start=period.start,
+                period_end=period.end,
+                previous_period_start=prev.start,
+                previous_period_end=prev.end,
+                region=effective_region or None,
+            )
+            envelope = build_rackspace_envelope(
+                summary, rows=rows, scope=scope,
+            )
+            envelope_payload = envelope.model_dump(mode="json")
+            envelope_payload["successful_accounts"] = (
+                envelope.successful_accounts or 0
+            )
+            envelope_payload["failed_accounts"] = envelope.failed_accounts or 0
+            return envelope_payload
+
+        try:
+            entry = await get_or_refresh_rackspace_canonical(
+                scope=scope,
+                region=effective_region or "",
+                kind=cache_kind,
+                signature=cache_signature,
+                loader=_rackspace_loader,
+            )
+        except RackspaceCostError as exc:
+            return _rackspace_error_response(exc)
+        except Exception as exc:  # noqa: BLE001 — sanitised
+            logger.warning(
+                "cloud.costs.upstream_failed provider=RACKSPACE code=%s",
+                type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "error_code": type(exc).__name__,
+                    "message": "upstream cost provider failed",
+                },
+            )
+
+        # Rehydrate the cached envelope dict into a CloudCostReport.
+        try:
+            envelope = CloudCostReport.model_validate(entry.payload)
+        except Exception as exc:  # noqa: BLE001 — corrupted cache row
+            logger.warning(
+                "cloud.costs.cache.corrupt_payload key=%s code=%s",
+                entry.cache_key, type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "error_code": "CorruptCachePayload",
+                    "message": "cached envelope failed validation; please retry",
+                },
+            )
+
+        from app.services.cloud.azure.cost_cache import AzureDataFreshness
+
+        cache_status_mapping = {
+            AzureDataFreshness.LIVE: CacheStatus.REFRESHED,
+            AzureDataFreshness.CACHED: CacheStatus.HIT,
+            AzureDataFreshness.STALE: CacheStatus.STALE,
+            AzureDataFreshness.UNAVAILABLE: CacheStatus.MISS,
+        }
+        cache_status = cache_status_mapping.get(
+            entry.data_freshness, CacheStatus.REFRESHED
+        )
+        data_freshness_value = entry.data_freshness.value
+        if entry.data_freshness == AzureDataFreshness.STALE:
+            expires_at = entry.last_successful_at or datetime.now(timezone.utc)
+        else:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=300)
+
+        response = CloudCostReportResponse(
+            report=envelope,
+            cache_status=cache_status,
+            cached_at=entry.last_successful_at,
+            expires_at=expires_at,
+            data_freshness=data_freshness_value,
+            last_successful_at=entry.last_successful_at,
+        )
+        response_dict = response.model_dump(mode="json")
+        # Phase 7D.5 — structured operational log.  NEVER logs secrets.
+        from app.services.observability import operation_timer
+        with operation_timer("cloud.costs") as _ops:
+            _ops["provider"] = "RACKSPACE"
+            _ops["scope_kind"] = response_dict.get("report", {}).get("scope_kind", "")
+            _ops["freshness"] = response_dict.get("data_freshness", "")
+            _ops["cache_status"] = response_dict.get("cache_status", "")
+        return response_dict
+
     # AZURE — route through the new cache layer.
     from app.services.cloud.azure.cost_cache import (
         AzureCacheStatus,
@@ -977,6 +1087,59 @@ async def get_cloud_costs(
         _ops["cache_status"] = response_dict.get("cache_status", "")
         _ops["upstream_call_count"] = response_dict.get("azure_post_count", 0)
     return response_dict
+
+
+def _rackspace_error_response(exc) -> JSONResponse:
+    """Translate a :class:`RackspaceCostError` into a sanitised HTTP envelope.
+
+    Follows the same vocabulary as the Azure error mapping so the
+    front-end can reuse its status handling.  The message bodies are
+    stable category semantics — they never contain credentials,
+    X-Auth-Token values, the RAN, or raw Rackspace payloads.
+    """
+    from app.services.cloud.rackspace.costs import RackspaceCostErrorCategory
+
+    mapping = {
+        RackspaceCostErrorCategory.NOT_CONFIGURED: (
+            status.HTTP_503_SERVICE_UNAVAILABLE, "NOT_CONFIGURED",
+        ),
+        RackspaceCostErrorCategory.AUTH_FAILED: (
+            status.HTTP_401_UNAUTHORIZED, "AUTH_FAILED",
+        ),
+        RackspaceCostErrorCategory.ACCESS_DENIED: (
+            status.HTTP_403_FORBIDDEN, "ACCESS_DENIED",
+        ),
+        RackspaceCostErrorCategory.NOT_FOUND: (
+            status.HTTP_404_NOT_FOUND, "NOT_FOUND",
+        ),
+        RackspaceCostErrorCategory.THROTTLED: (
+            status.HTTP_429_TOO_MANY_REQUESTS, "THROTTLED",
+        ),
+        RackspaceCostErrorCategory.NETWORK_ERROR: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceCostErrorCategory.INVALID_RESPONSE: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceCostErrorCategory.PERIOD_UNSUPPORTED: (
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "PERIOD_UNSUPPORTED",
+        ),
+    }
+    http_status, public_code = mapping.get(
+        exc.category, (status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR")
+    )
+    headers: dict = {}
+    if exc.retry_after is not None:
+        headers["Retry-After"] = str(int(exc.retry_after))
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "status": "error",
+            "error_code": public_code,
+            "category": exc.category.value,
+        },
+        headers=headers,
+    )
 
 
 def _azure_error_response(exc: AzureCostError) -> JSONResponse:
