@@ -228,6 +228,10 @@ def _register_known_providers(registry: ProviderRegistry) -> None:
     from app.services.cloud.aws import adapter as _aws_adapter_module  # noqa: F401
     # Phase 7C.2A — Azure adapter.  Importing is enough to wire it.
     from app.services.cloud.azure import adapter as _azure_adapter_module  # noqa: F401
+    # Phase 9B.1 — Rackspace adapter (canonical costs).  Importing
+    # is enough to wire it; runtime-config checks inside the adapter
+    # short-circuit to NOT_CONFIGURED when Rackspace is absent.
+    from app.services.cloud.rackspace import adapter as _rackspace_adapter_module  # noqa: F401
 
 
 __all__ = [

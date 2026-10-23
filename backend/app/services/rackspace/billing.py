@@ -233,6 +233,68 @@ class RackspaceBillingClient:
         )
 
     # ------------------------------------------------------------------
+    # Phase 9B.1 — canonical cost path
+    # ------------------------------------------------------------------
+
+    async def fetch_estimated_charges(self) -> Dict[str, Any]:
+        """``GET /v2/accounts/{ran}/estimated_charges`` — raw payload.
+
+        Unlike the Phase 9A probe methods (which return sanitized
+        :class:`BillingEndpointResult` summaries), this method returns
+        the *parsed JSON body* so the canonical cost layer can
+        normalise real charge records into the provider-neutral cost
+        envelope.  The body never contains credentials — it is the
+        Rackspace charge data itself.
+
+        Failure semantics (typed, never swallowed):
+
+        * :class:`RackspaceConfigError` — the RAN is missing.
+        * :class:`RackspaceAuthError` — Identity rejected the
+          credentials / token (one re-authentication retry is
+          performed on HTTP 401 before giving up).
+        * :class:`RackspacePermissionError` — HTTP 403.
+        * :class:`RackspaceNotFoundError` — HTTP 404 (invalid or
+          inaccessible Billing Account / RAN).
+        * :class:`RackspaceThrottledError` — HTTP 429 (carries
+          ``retry_after`` when Rackspace sent a usable header).
+        * :class:`RackspaceTransportError` — timeout, network
+          failure, 5xx, or a non-JSON body.
+
+        This method NEVER fabricates data: an empty ``{}`` body with
+        HTTP 200 is returned verbatim for the normalizer to classify.
+        """
+
+        ran = self._read_ran()
+        if not ran:
+            raise RackspaceConfigError(
+                "RACKSPACE_BILLING_ACCOUNT (RAN) is not configured"
+            )
+
+        path = f"/{BILLING_API_VERSION}/accounts/{ran}/estimated_charges"
+
+        # A 401 from the Billing API may mean the cached token
+        # expired between the Identity check and the product call.
+        # Drop the cached session and retry exactly ONCE with a fresh
+        # token before surfacing the authentication failure.
+        for attempt in range(2):
+            try:
+                response = await self._http.get(
+                    BILLING_BASE_URL,
+                    path,
+                    token_provider=self._identity.current_token,
+                )
+                return response.body
+            except RackspaceAuthError:
+                if attempt == 0:
+                    await self._identity.invalidate()
+                    continue
+                raise
+        # Unreachable — the loop either returns or raises.
+        raise RackspaceTransportError(  # pragma: no cover - defensive
+            "estimated_charges fetch exhausted retries"
+        )
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 

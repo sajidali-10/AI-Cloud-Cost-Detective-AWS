@@ -290,6 +290,19 @@ class FinOpsContextBuilder:
 
         if adapter is None:
             return None
+        from app.services.cloud.models import CloudProviderKind  # lazy — mirrors build()
+
+        if kind == CloudProviderKind.RACKSPACE:
+            # Phase 9B.1 — Rackspace AI FinOps is explicitly out of
+            # scope.  The ``FinOpsAIProvider`` schema enum already
+            # refuses RACKSPACE upstream; this guard keeps the cost
+            # slice from ever mis-routing through the Azure envelope
+            # branch if that enum grows a RACKSPACE member later
+            # without a matching context builder.
+            logger.info(
+                "cloud_ai.context.cost_skipped reason=rackspace_out_of_scope_9b1"
+            )
+            return None
         try:
             summary = await adapter.get_cost_summary(
                 accounts=rows,

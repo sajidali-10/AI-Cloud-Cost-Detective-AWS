@@ -39,9 +39,13 @@ def test_list_cloud_providers_includes_aws_and_azure(client):
     # "configured / not configured" instead of "reserved".
     assert by_kind["AZURE"]["is_registered"] is True
     assert by_kind["AZURE"]["status"] in ("OK", "NO_CAPABILITIES", "ERROR")
-    # RACKSPACE remains a reserved provider (Phase 7C.3).
-    assert by_kind["RACKSPACE"]["is_registered"] is False
-    assert by_kind["RACKSPACE"]["status"] == "NOT_REGISTERED"
+    # Phase 9B.1 — Rackspace is now a registered provider (the
+    # canonical cost adapter is wired in and self-registers at
+    # process boot).  Whether it is *usable* in this deployment is
+    # runtime-config dependent (the capability layer reports
+    # NOT_CONFIGURED when RACKSPACE_* variables are missing).
+    assert by_kind["RACKSPACE"]["is_registered"] is True
+    assert by_kind["RACKSPACE"]["status"] in ("OK", "NO_CAPABILITIES", "ERROR")
 
 
 def test_list_cloud_providers_aws_capabilities_include_supported(client):
@@ -109,14 +113,25 @@ def test_selectable_for_azure_returns_200_when_adapter_registered(client):
     assert body["count"] == len(body["items"])
 
 
-def test_selectable_for_rackspace_returns_404_until_adapter_registered(client):
-    """RACKSPACE is reserved for Phase 7C.3 — the adapter is not
-    wired yet.  The route must explicitly 404 (NOT_REGISTERED) so
-    the frontend can render a meaningful state rather than 500.
+def test_selectable_for_rackspace_reports_provider_state(client, monkeypatch):
+    """Phase 9B.1 — the Rackspace adapter IS registered.
+
+    The selectable-accounts route no longer 404s with
+    ProviderNotRegistered; it resolves the provider and reports the
+    (possibly empty) account list.  ``list_accounts`` is patched so
+    the assertion is deterministic regardless of database
+    availability.
     """
+    from app.api import cloud_providers as cloud_providers_module
+
+    monkeypatch.setattr(
+        cloud_providers_module, "list_accounts",
+        lambda db, provider="AWS", enabled_only=True: [],
+    )
     r = client.get("/cloud/accounts/selectable/RACKSPACE")
-    assert r.status_code == 404
-    assert r.json()["error_code"] == "ProviderNotRegistered"
+    assert r.status_code == 200
+    assert "items" in r.json()
+    assert r.json()["count"] == 0
 
 
 def test_selectable_for_aws_case_insensitive(client):

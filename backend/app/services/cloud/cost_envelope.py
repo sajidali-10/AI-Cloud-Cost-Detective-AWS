@@ -278,7 +278,110 @@ def build_azure_envelope(
     )
 
 
+def build_rackspace_envelope(
+    summary,
+    *,
+    rows: List[Any],
+    scope: str,
+) -> CloudCostReport:
+    """Translate a Rackspace adapter summary into the canonical envelope.
+
+    Phase 9B.1 — Rackspace Billing V2 semantics:
+
+    * ``period`` is the ACTUAL source billing cycle returned by the
+      Rackspace ``estimated_charges`` endpoint (never the requested
+      window).  The end date is exclusive — the live cycle
+      ``2026-10-19`` → ``2026-11-19`` spans exactly one month (31
+      days) — matching the canonical ``CostPeriod`` convention
+      (``start`` inclusive, ``end`` exclusive).
+    * ``previous_period_cost`` / ``change_amount`` /
+      ``change_percent`` are ``None`` and
+      ``previous_period_unavailable`` is ``True`` — historical
+      totals are a documented Phase 9B follow-up and are NEVER
+      fabricated.
+    * ``daily_trend`` and ``by_region`` are empty — the source has
+      no reliable per-day or per-region granularity.
+    * ``estimated`` is ``True`` — the source is the current-cycle
+      estimated-charge snapshot.
+    * A true ``$0`` total is a legitimate SUCCESS, not an
+      unavailable state.
+    """
+    from decimal import Decimal
+
+    account_id = _account_id_value(rows, scope)
+    display_name = _display_name(rows, scope)
+    extensions = summary.extensions or {}
+    # The Rackspace billing-cycle end date is EXCLUSIVE (the live
+    # cycle ``2026-10-19`` → ``2026-11-19`` spans exactly one month
+    # = 31 days), which matches the canonical ``CostPeriod``
+    # convention: ``start`` inclusive, ``end`` exclusive.
+    period_days = (summary.period_end - summary.period_start).days
+    period = CostPeriod(
+        start=summary.period_start,
+        end=summary.period_end,
+        days=max(1, min(period_days, 365)),
+    )
+    prev_start, prev_end = _previous_period_bounds(
+        summary.period_start, summary.period_end
+    )
+    previous_period = CostPeriod(
+        start=prev_start,
+        end=prev_end,
+        days=period.days,
+    )
+    by_account_extensions = extensions.get("by_account", []) or []
+    by_account = [
+        CloudCostAccountShare(
+            account_id=item["account_id"],
+            display_name=item["display_name"],
+            amount=Decimal(str(item["amount"])),
+            currency=summary.currency,
+        )
+        for item in by_account_extensions
+    ]
+    account_errors = []  # failures surface as typed errors, not rows
+    successful_count = len(by_account)
+    failed_count = 0
+    warnings = list(extensions.get("warnings", []) or [])
+    if extensions.get("period_adjusted"):
+        warnings.append(
+            "period_adjusted_to_source_billing_cycle"
+        )
+    return CloudCostReport(
+        provider="RACKSPACE",
+        scope=scope,
+        scope_kind="all" if scope == "all" else "single",
+        status=extensions.get("status", "SUCCESS"),
+        currency_status=extensions.get("currency_status", "OK"),
+        account_id=account_id,
+        account_display_name=display_name,
+        period=period,
+        previous_period=previous_period,
+        currency=summary.currency,
+        total_cost=summary.current_total,
+        previous_period_cost=None,
+        change_amount=None,
+        change_percent=None,
+        estimated=summary.estimated,
+        daily_trend=[],
+        by_service=[
+            ServiceCost(service=item.service, amount=item.amount, unit=item.currency)
+            for item in summary.by_service
+        ],
+        by_region=[],
+        by_account=by_account,
+        account_errors=account_errors,
+        source="RACKSPACE_BILLING",
+        successful_accounts=successful_count,
+        failed_accounts=failed_count,
+        previous_period_unavailable=True,
+    )
+
+
 __all__ = [
     "build_aws_envelope",
     "build_azure_envelope",
+    "build_rackspace_envelope",
 ]
+
+

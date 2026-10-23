@@ -35,6 +35,8 @@ other secrets.
 
 from __future__ import annotations
 
+from typing import Optional
+
 
 class RackspaceError(Exception):
     """Base class for every Rackspace exception."""
@@ -89,12 +91,33 @@ class RackspaceTransportError(RackspaceError):
     code = "rackspace_transport_error"
 
 
+class RackspaceThrottledError(RackspaceTransportError):
+    """Rackspace throttled the request (HTTP 429).
+
+    Phase 9B.1 — introduced so the canonical cost layer can
+    distinguish throttling from generic transport failures while
+    remaining a subclass of :class:`RackspaceTransportError`
+    (Phase 9A catch-blocks that handle transport errors keep
+    working unchanged).
+    """
+
+    code = "rackspace_throttled"
+
+    def __init__(self, message: str = "", retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        #: Seconds Rackspace asked us to wait (parsed from the
+        #: ``Retry-After`` header when present).  ``None`` when the
+        #: response did not carry a usable value.
+        self.retry_after = retry_after
+
+
 __all__ = [
-    "RackspaceError",
-    "RackspaceConfigError",
     "RackspaceAuthError",
-    "RackspacePermissionError",
-    "RackspaceNotFoundError",
+    "RackspaceConfigError",
     "RackspaceElevatedRoleError",
+    "RackspaceError",
+    "RackspaceNotFoundError",
+    "RackspacePermissionError",
+    "RackspaceThrottledError",
     "RackspaceTransportError",
 ]

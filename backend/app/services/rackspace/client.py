@@ -50,6 +50,7 @@ from app.services.rackspace.exceptions import (
     RackspaceAuthError,
     RackspaceNotFoundError,
     RackspacePermissionError,
+    RackspaceThrottledError,
     RackspaceTransportError,
 )
 
@@ -269,6 +270,23 @@ def _parse_response(response: httpx.Response) -> RackspaceResponse:
     if status == 404:
         raise RackspaceNotFoundError(
             f"Rackspace endpoint not available (HTTP 404) at {response.url}"
+        )
+    if status == 429:
+        # Phase 9B.1 — surface throttling as a distinct typed error so
+        # the canonical cost layer can translate it into HTTP 429 with a
+        # ``Retry-After`` hint instead of a generic 502.  Subclasses
+        # ``RackspaceTransportError`` so the Phase 9A POC error
+        # handling (which catches transport errors) keeps working.
+        retry_after: Optional[float] = None
+        raw_retry_after = response.headers.get("Retry-After")
+        if raw_retry_after:
+            try:
+                retry_after = float(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after = None
+        raise RackspaceThrottledError(
+            f"Rackspace throttled the request (HTTP 429) at {response.url}",
+            retry_after=retry_after,
         )
     if status >= 500:
         raise RackspaceTransportError(
