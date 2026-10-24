@@ -123,7 +123,7 @@ class TestCapabilities:
 
         assert caps[CloudCapability.COSTS] == CloudCapabilityState.NOT_CONFIGURED
         assert caps[CloudCapability.AUTHENTICATION] == CloudCapabilityState.NOT_CONFIGURED
-        assert caps[CloudCapability.RESOURCES] == CloudCapabilityState.UNSUPPORTED
+        assert caps[CloudCapability.RESOURCES] == CloudCapabilityState.NOT_CONFIGURED
         assert caps[CloudCapability.OPTIMIZATION] == CloudCapabilityState.UNSUPPORTED
 
     def test_configured_reports_costs_supported(self, monkeypatch):
@@ -135,7 +135,12 @@ class TestCapabilities:
         assert status.has(CloudCapability.COSTS)
         assert status.has(CloudCapability.BILLING)
         assert status.has(CloudCapability.AUTHENTICATION)
+        # Phase 9B.2 — resources are now a supported capability when
+        # the Identity credentials are configured.
         assert caps_state(status, CloudCapability.RESOURCES) == (
+            CloudCapabilityState.SUPPORTED
+        )
+        assert caps_state(status, CloudCapability.OPTIMIZATION) == (
             CloudCapabilityState.UNSUPPORTED
         )
 
@@ -328,10 +333,47 @@ class TestCostSummary:
 
 class TestReadOnlySurface:
     @pytest.mark.asyncio
-    async def test_resources_not_implemented(self):
+    async def test_resources_delegate_to_canonical_aggregation(self, monkeypatch):
+        # Phase 9B.2 — get_resources now delegates to the canonical
+        # aggregation instead of raising NotImplementedError.
+        from app.services.cloud.models import CloudResource
+
+        resource = CloudResource(
+            provider=CloudProviderKind.RACKSPACE,
+            account_id="8675309",
+            region="DFW",
+            resource_type="SERVER",
+            resource_id="srv-1",
+            service="Cloud Servers",
+            name="web-1",
+            state="ACTIVE",
+            composite_id="RACKSPACE|8675309|DFW|SERVER|srv-1",
+            metadata={},
+        )
+
+        async def fake_aggregate(*, rows, inventory_client=None):
+            from app.services.cloud.models import CloudResourceSummary
+
+            summary = CloudResourceSummary(
+                provider=CloudProviderKind.RACKSPACE,
+                account_id="8675309",
+                scope="acct:8675309",
+                region=None,
+                services={},
+                totals_by_account=[],
+                extensions={"status": "SUCCESS", "total_resources": 1},
+            )
+            return summary, [resource], []
+
+        monkeypatch.setattr(
+            rackspace_adapter_module, "aggregate_rackspace_resources", fake_aggregate
+        )
         adapter = RackspaceCloudProvider()
-        with pytest.raises(NotImplementedError):
-            await adapter.get_resources(accounts=[_Row()])  # type: ignore[arg-type]
+        result = await adapter.get_resources(accounts=[_Row()])  # type: ignore[arg-type]
+        assert result == [resource]
+        summary = await adapter.get_resource_summary(accounts=[_Row()])  # type: ignore[arg-type]
+        assert summary.extensions["status"] == "SUCCESS"
+        assert summary.extensions["total_resources"] == 1
 
     @pytest.mark.asyncio
     async def test_recommendations_not_implemented(self):

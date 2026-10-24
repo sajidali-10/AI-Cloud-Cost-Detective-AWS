@@ -23,7 +23,7 @@ Architectural notes
 Selection semantics
 -------------------
 
-* ``provider`` — required, one of ``AWS`` / ``AZURE``.
+* ``provider`` — required, one of ``AWS`` / ``AZURE`` / ``RACKSPACE``.
 * ``account_id`` (optional) — ``"all"`` (default),
   ``"acct:<id>"`` / ``"sub:<id>"``, or a bare numeric row id.
 
@@ -81,6 +81,11 @@ from app.services.cloud.azure.resource_aggregator import (
 from app.services.cloud.azure.resource_graph import (
     AzureResourceGraphError,
     AzureResourceGraphErrorCategory,
+)
+from app.services.cloud.rackspace.resources import (
+    RackspaceResourceError,
+    RackspaceResourceErrorCategory,
+    aggregate_rackspace_resources,
 )
 from sqlalchemy.orm import Session
 
@@ -154,7 +159,10 @@ def _resolve_rows(
     cleaned = selection
     if provider == CloudProviderKind.AZURE and cleaned.startswith("sub:"):
         cleaned = cleaned[len("sub:"):]
-    elif provider == CloudProviderKind.AWS and cleaned.startswith("acct:"):
+    elif (
+        provider in (CloudProviderKind.AWS, CloudProviderKind.RACKSPACE)
+        and cleaned.startswith("acct:")
+    ):
         cleaned = cleaned[len("acct:"):]
     from sqlalchemy import select
     from app.db.models import CloudAccount as _CloudAccountRow
@@ -425,6 +433,85 @@ def _build_azure_envelope(
     return CloudResourceListResponse(summary=summary_envelope, resources=items)
 
 
+def _build_rackspace_envelope(
+    summary, *, resources, rows, scope, failures
+) -> CloudResourceListResponse:
+    """Translate Rackspace adapter output into the canonical envelope.
+
+    Mirrors the Azure builder: breakdowns come from the aggregator's
+    extensions (derived from the normalised resources, never
+    fabricated).  Per-service failures surface through the canonical
+    ``subscription_errors`` slot — the scope id is the safe Cloud
+    tenant and the label names the service that failed.
+    """
+    extensions = summary.extensions or {}
+    by_type = [
+        CloudResourceGroupCount(key=item["key"], count=item["count"])
+        for item in extensions.get("by_type", [])
+    ]
+    by_location = [
+        CloudResourceGroupCount(key=item["key"], count=item["count"])
+        for item in extensions.get("by_location", [])
+    ]
+    by_subscription = [
+        CloudResourceSubscriptionShare(
+            subscription_id=item["subscription_id"],
+            display_name=item.get("display_name", item["subscription_id"]),
+            count=item["count"],
+        )
+        for item in extensions.get("by_subscription", [])
+    ]
+    raw_errors = list(extensions.get("subscription_errors", []))
+    for failure in failures:
+        raw_errors.append(
+            {
+                "subscription_id": rows[0].account_id if rows else "",
+                "display_name": failure.service,
+                "code": failure.category.value,
+                "message": failure.message,
+            }
+        )
+    subscription_errors = [
+        CloudResourceSubscriptionError(
+            subscription_id=item.get("subscription_id", ""),
+            display_name=item.get("display_name", ""),
+            code=item.get("code", "ERROR"),
+            message=item.get("message", ""),
+        )
+        for item in raw_errors
+    ]
+    total_resources = extensions.get("total_resources", len(resources))
+    summary_envelope = CloudResourceSummaryEnvelope(
+        provider="RACKSPACE",
+        scope=scope,
+        scope_kind="all" if scope == "all" else "single",
+        status=extensions.get("status", "SUCCESS"),
+        total_resources=total_resources,
+        by_type=by_type,
+        by_location=by_location,
+        by_resource_group=[],
+        by_subscription=by_subscription,
+        subscription_errors=subscription_errors,
+        source="RACKSPACE_CLOUD_API",
+    )
+    items = [
+        CloudResourceItem(
+            provider="RACKSPACE",
+            account_id=resource.account_id,
+            region=resource.region,
+            resource_type=resource.resource_type,
+            resource_id=resource.resource_id,
+            service=resource.service,
+            name=resource.name,
+            state=resource.state,
+            composite_id=resource.composite_id,
+            metadata=dict(resource.metadata) if resource.metadata else {},
+        )
+        for resource in resources
+    ]
+    return CloudResourceListResponse(summary=summary_envelope, resources=items)
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
@@ -435,12 +522,13 @@ def _build_azure_envelope(
     summary="Provider-neutral resource inventory for the selected provider and account context.",
 )
 async def get_cloud_resources(
-    provider: str = Query(..., description="AWS | AZURE (Rackspace in a future phase)"),
+    provider: str = Query(..., description="AWS | AZURE | RACKSPACE"),
     account_id: Optional[str] = Query(
         default=None,
         description=(
             "Default 'all'.  For AWS: 'acct:<id>' or a registry row id.  "
-            "For Azure: 'sub:<id>' or a registry row id."
+            "For Azure: 'sub:<id>' or a registry row id.  "
+            "For Rackspace: 'acct:<tenant id>' or a registry row id."
         ),
     ),
     user: AppUser = Depends(get_current_user),
@@ -500,6 +588,17 @@ async def get_cloud_resources(
                 scope=scope,
                 failures=failures,
             )
+        elif kind == CloudProviderKind.RACKSPACE:
+            summary, resources, failures = await aggregate_rackspace_resources(
+                rows=rows
+            )
+            envelope = _build_rackspace_envelope(
+                summary,
+                resources=resources,
+                rows=rows,
+                scope=scope,
+                failures=failures,
+            )
         else:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -511,6 +610,8 @@ async def get_cloud_resources(
             )
     except AzureResourceGraphError as exc:
         return _azure_error_response(exc)
+    except RackspaceResourceError as exc:
+        return _rackspace_resource_error_response(exc)
     except Exception as exc:  # noqa: BLE001 - sanitised
         logger.warning(
             "cloud.resources.upstream_failed provider=%s code=%s",
@@ -526,6 +627,57 @@ async def get_cloud_resources(
         )
 
     return envelope.model_dump(mode="json")
+
+
+def _rackspace_resource_error_response(exc: RackspaceResourceError) -> JSONResponse:
+    """Translate a :class:`RackspaceResourceError` into a sanitised envelope.
+
+    Follows the same vocabulary as the Azure and Rackspace cost error
+    mappings so the front-end can reuse its status handling.  The
+    message bodies are stable category semantics — they never contain
+    credentials, X-Auth-Token values, the RAN, or raw payloads.
+    """
+    mapping = {
+        RackspaceResourceErrorCategory.NOT_CONFIGURED: (
+            status.HTTP_503_SERVICE_UNAVAILABLE, "NOT_CONFIGURED",
+        ),
+        RackspaceResourceErrorCategory.AUTH_FAILED: (
+            status.HTTP_401_UNAUTHORIZED, "AUTH_FAILED",
+        ),
+        RackspaceResourceErrorCategory.ACCESS_DENIED: (
+            status.HTTP_403_FORBIDDEN, "ACCESS_DENIED",
+        ),
+        RackspaceResourceErrorCategory.NOT_FOUND: (
+            status.HTTP_404_NOT_FOUND, "NOT_FOUND",
+        ),
+        RackspaceResourceErrorCategory.THROTTLED: (
+            status.HTTP_429_TOO_MANY_REQUESTS, "THROTTLED",
+        ),
+        RackspaceResourceErrorCategory.NETWORK_ERROR: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceResourceErrorCategory.INVALID_RESPONSE: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceResourceErrorCategory.UNSUPPORTED: (
+            status.HTTP_502_BAD_GATEWAY, "UNSUPPORTED",
+        ),
+    }
+    http_status, public_code = mapping.get(
+        exc.category, (status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR")
+    )
+    headers: dict = {}
+    if exc.retry_after is not None:
+        headers["Retry-After"] = str(int(exc.retry_after))
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "status": "error",
+            "error_code": public_code,
+            "category": exc.category.value,
+        },
+        headers=headers,
+    )
 
 
 def _azure_error_response(exc: AzureResourceGraphError) -> JSONResponse:
