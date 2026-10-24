@@ -84,6 +84,11 @@ from app.services.cloud.rackspace.costs import (
     assert_period_overlap,
     fetch_cost_snapshot,
 )
+from app.services.cloud.rackspace.resources import (
+    RACKSPACE_RESOURCE_SOURCE,
+    RackspaceResourceError,
+    aggregate_rackspace_resources,
+)
 from app.services.rackspace import get_billing_client
 from app.services.rackspace.config import (
     billing_account_configured,
@@ -194,9 +199,10 @@ class RackspaceCloudProvider(CloudProvider):
         """Return the Rackspace capability snapshot.
 
         Phase 9B.1: ``AUTHENTICATION`` + ``COSTS`` + ``BILLING``.
-        RESOURCES / OPTIMIZATION are explicitly UNSUPPORTED (Phase
-        9B.2 and later); METRICS / ADVISOR / AI_EVIDENCE remain
-        UNSUPPORTED.
+        Phase 9B.2: ``RESOURCES`` (catalog-driven read-only inventory
+        of Cloud Servers / Block Storage / Load Balancers).
+        OPTIMIZATION is explicitly deferred (Phase 9C); METRICS /
+        ADVISOR / AI_EVIDENCE remain UNSUPPORTED.
         """
         identity_ok = _identity_configured()
         costs_ok = _costs_configured()
@@ -212,7 +218,7 @@ class RackspaceCloudProvider(CloudProvider):
             CloudCapability.AUTHENTICATION: _state(identity_ok),
             CloudCapability.COSTS: _state(costs_ok),
             CloudCapability.BILLING: _state(costs_ok),
-            CloudCapability.RESOURCES: CloudCapabilityState.UNSUPPORTED,
+            CloudCapability.RESOURCES: _state(identity_ok),
             CloudCapability.OPTIMIZATION: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.METRICS: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.ADVISOR: CloudCapabilityState.UNSUPPORTED,
@@ -255,7 +261,27 @@ class RackspaceCloudProvider(CloudProvider):
                 "read_only": True,
                 "configured": costs_ok,
             },
-            CloudCapability.RESOURCES: {"phase": "9B.2", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.RESOURCES: {
+                "phase": "9B.2",
+                "status": (
+                    "SUPPORTED" if identity_ok else "NOT_CONFIGURED"
+                ),
+                "source": RACKSPACE_RESOURCE_SOURCE,
+                "resource_types": [
+                    "SERVER",
+                    "VOLUME",
+                    "LOAD_BALANCER",
+                ],
+                "services": [
+                    "Cloud Servers",
+                    "Cloud Block Storage",
+                    "Cloud Load Balancers",
+                ],
+                "catalog_resolved": True,
+                "multi_region": True,
+                "read_only": True,
+                "configured": identity_ok,
+            },
             CloudCapability.OPTIMIZATION: {"phase": "future", "status": "NOT_IMPLEMENTED"},
             CloudCapability.METRICS: {"phase": "future", "status": "NOT_IMPLEMENTED"},
             CloudCapability.ADVISOR: {"phase": "future", "status": "NOT_IMPLEMENTED"},
@@ -533,7 +559,7 @@ class RackspaceCloudProvider(CloudProvider):
         )
         return list(summary.by_service)
 
-    # ---- Resources / recommendations (Phase 9B.2 — NOT this phase) ---------
+    # ---- Resources (Phase 9B.2) --------------------------------------------
 
     async def get_resources(
         self,
@@ -541,10 +567,21 @@ class RackspaceCloudProvider(CloudProvider):
         accounts: Sequence[_CloudAccountRow],
         region: Optional[str] = None,
     ) -> List[CloudResource]:
-        raise NotImplementedError(
-            "Rackspace resources are out of scope for Phase 9B.1 "
-            "(planned for Phase 9B.2)"
+        """Return the canonical Rackspace resource inventory.
+
+        Delegates to :func:`aggregate_rackspace_resources` — the same
+        catalog-driven, multi-region, failure-isolated aggregation the
+        canonical route uses — and returns only the normalised
+        resources.  Raises :class:`RackspaceResourceError` on total
+        failure so callers can distinguish a failed inventory from a
+        legitimately empty one.  The ``region`` argument is accepted
+        for contract parity but not filtered on: Rackspace discovery
+        enumerates every authorized region from the Identity catalog.
+        """
+        _summary, resources, _failures = await aggregate_rackspace_resources(
+            rows=accounts,
         )
+        return resources
 
     async def get_resource_summary(
         self,
@@ -552,10 +589,16 @@ class RackspaceCloudProvider(CloudProvider):
         accounts: Sequence[_CloudAccountRow],
         region: Optional[str] = None,
     ) -> CloudResourceSummary:
-        raise NotImplementedError(
-            "Rackspace resources are out of scope for Phase 9B.1 "
-            "(planned for Phase 9B.2)"
+        """Return the grouped Rackspace inventory suitable for the UI.
+
+        Empty-success semantics: a tenant with zero servers, volumes
+        and load balancers yields ``status=SUCCESS`` with an empty
+        resource list — never an error.
+        """
+        summary, _resources, _failures = await aggregate_rackspace_resources(
+            rows=accounts,
         )
+        return summary
 
     async def get_recommendations(
         self,

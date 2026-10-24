@@ -28,6 +28,7 @@ from typing import Optional
 from app.services.rackspace.billing import RackspaceBillingClient
 from app.services.rackspace.client import RackspaceHttpClient
 from app.services.rackspace.identity import RackspaceIdentity
+from app.services.rackspace.inventory import RackspaceInventoryClient
 from app.services.rackspace.servers import RackspaceServersClient
 
 
@@ -35,6 +36,7 @@ _identity: Optional[RackspaceIdentity] = None
 _http: Optional[RackspaceHttpClient] = None
 _billing: Optional[RackspaceBillingClient] = None
 _servers: Optional[RackspaceServersClient] = None
+_inventory: Optional[RackspaceInventoryClient] = None
 
 
 def _get_http() -> RackspaceHttpClient:
@@ -77,23 +79,43 @@ def get_servers_client() -> RackspaceServersClient:
     return _servers
 
 
+def get_inventory_client() -> RackspaceInventoryClient:
+    """Return the process-wide multi-region inventory client (Phase 9B.2).
+
+    Shares the SAME HTTP transport and Identity token cache as the
+    Phase 9A product clients — there is exactly one Rackspace
+    authentication implementation in this codebase.
+    """
+
+    global _inventory
+    if _inventory is None:
+        _inventory = RackspaceInventoryClient(
+            http_client=_get_http(),
+            identity=get_identity_client(),
+        )
+    return _inventory
+
+
 def reset_for_tests() -> None:
     """Drop every cached singleton.  Tests only."""
 
-    global _identity, _http, _billing, _servers
+    global _identity, _http, _billing, _servers, _inventory
     _identity = None
     _http = None
     _billing = None
     _servers = None
+    _inventory = None
 
 
 __all__ = [
     "RackspaceBillingClient",
     "RackspaceHttpClient",
     "RackspaceIdentity",
+    "RackspaceInventoryClient",
     "RackspaceServersClient",
     "get_billing_client",
     "get_identity_client",
+    "get_inventory_client",
     "get_servers_client",
     "reset_for_tests",
 ]

@@ -9,10 +9,11 @@ provider-neutral envelope.
 Provider-neutral contract
 -------------------------
 
-* ``provider`` — ``"AWS"`` or ``"AZURE"`` (Rackspace reserved for a
-  future phase).
-* ``scope`` — ``"all"``, ``"acct:<id>"`` (AWS), or ``"sub:<id>"``
-  (Azure).
+* ``provider`` — ``"AWS"``, ``"AZURE"``, or ``"RACKSPACE"``
+  (Phase 9B.2).
+* ``scope`` — ``"all"``, ``"acct:<id>"`` (AWS), ``"sub:<id>"``
+  (Azure), or ``"acct:<id>"`` (Rackspace — the safe Cloud tenant
+  id, never the Billing RAN).
 * ``status`` — ``SUCCESS`` / ``PARTIAL_SUCCESS`` / ``NO_DATA`` /
   ``ERROR`` — the same vocabulary Phase 7C.2B introduced for the
   cost surface.
