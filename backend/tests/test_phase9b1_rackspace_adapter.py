@@ -124,7 +124,11 @@ class TestCapabilities:
         assert caps[CloudCapability.COSTS] == CloudCapabilityState.NOT_CONFIGURED
         assert caps[CloudCapability.AUTHENTICATION] == CloudCapabilityState.NOT_CONFIGURED
         assert caps[CloudCapability.RESOURCES] == CloudCapabilityState.NOT_CONFIGURED
-        assert caps[CloudCapability.OPTIMIZATION] == CloudCapabilityState.UNSUPPORTED
+        # Phase 9C.2 — OPTIMIZATION is wired (identity-gated): without
+        # credentials it reports NOT_CONFIGURED, never UNSUPPORTED.
+        assert caps[CloudCapability.OPTIMIZATION] == (
+            CloudCapabilityState.NOT_CONFIGURED
+        )
 
     def test_configured_reports_costs_supported(self, monkeypatch):
         _configured(monkeypatch)
@@ -140,8 +144,9 @@ class TestCapabilities:
         assert caps_state(status, CloudCapability.RESOURCES) == (
             CloudCapabilityState.SUPPORTED
         )
+        # Phase 9C.2 — canonical recommendations now supported.
         assert caps_state(status, CloudCapability.OPTIMIZATION) == (
-            CloudCapabilityState.UNSUPPORTED
+            CloudCapabilityState.SUPPORTED
         )
 
     def test_regions_listed(self):
@@ -376,10 +381,29 @@ class TestReadOnlySurface:
         assert summary.extensions["total_resources"] == 1
 
     @pytest.mark.asyncio
-    async def test_recommendations_not_implemented(self):
+    async def test_recommendations_delegate_to_canonical_aggregator(
+        self, monkeypatch
+    ):
+        # Phase 9C.2 — the adapter no longer raises; it delegates to
+        # the canonical recommendation aggregation (deterministic
+        # engine behind /api/cloud/recommendations?provider=RACKSPACE).
+        from app.services.cloud.rackspace import adapter as adapter_module
+
+        captured: dict = {}
+
+        async def fake_aggregate(*, rows, region=None, days=None):
+            captured["rows"] = list(rows)
+            return [], None, []
+
+        monkeypatch.setattr(
+            adapter_module,
+            "aggregate_rackspace_recommendations_for_account",
+            fake_aggregate,
+        )
         adapter = RackspaceCloudProvider()
-        with pytest.raises(NotImplementedError):
-            await adapter.get_recommendations(accounts=[_Row()])  # type: ignore[arg-type]
+        out = await adapter.get_recommendations(accounts=[_Row()])  # type: ignore[arg-type]
+        assert out == []
+        assert len(captured["rows"]) == 1
 
     def test_transport_exposes_no_product_write_verbs(self):
         from app.services.rackspace.client import RackspaceHttpClient

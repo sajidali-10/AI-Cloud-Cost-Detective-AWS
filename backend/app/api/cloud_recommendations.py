@@ -86,6 +86,15 @@ from app.services.cloud.aws.recommendation_aggregator import (
     AwsRecommendationRollup,
     aggregate_aws_recommendations_for_accounts,
 )
+from app.services.cloud.rackspace.recommendations import (
+    RACKSPACE_RECOMMENDATION_SOURCE,
+    RackspaceRecommendationRollup,
+    aggregate_rackspace_recommendations_for_account,
+)
+from app.services.cloud.rackspace.resources import (
+    RackspaceResourceError,
+    RackspaceResourceErrorCategory,
+)
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("cost-detective-backend.cloud_recommendations")
@@ -142,6 +151,7 @@ def _build_recommendation_cache_key(
 _SELECTOR_PREFIX_BY_PROVIDER = {
     CloudProviderKind.AWS: "acct:",
     CloudProviderKind.AZURE: "sub:",
+    CloudProviderKind.RACKSPACE: "acct:",
 }
 
 
@@ -176,8 +186,14 @@ def _resolve_rows(
 
     # Phase 7D.1 — provider-specific selector coercion.  Reject a
     # selector minted for the *other* provider explicitly so it is
-    # never misinterpreted as a provider-native id.
-    other_prefix = "sub:" if provider == CloudProviderKind.AWS else "acct:"
+    # never misinterpreted as a provider-native id.  Rackspace
+    # scopes accounts the AWS way (``acct:<tenant id>``) so both
+    # kinds reject Azure ``sub:`` selectors.
+    other_prefix = (
+        "sub:"
+        if provider in (CloudProviderKind.AWS, CloudProviderKind.RACKSPACE)
+        else "acct:"
+    )
     if selection.startswith(other_prefix):
         return None, "invalid", JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -195,7 +211,10 @@ def _resolve_rows(
     cleaned = selection
     if provider == CloudProviderKind.AZURE and cleaned.startswith("sub:"):
         cleaned = cleaned[len("sub:"):]
-    elif provider == CloudProviderKind.AWS and cleaned.startswith("acct:"):
+    elif (
+        provider in (CloudProviderKind.AWS, CloudProviderKind.RACKSPACE)
+        and cleaned.startswith("acct:")
+    ):
         cleaned = cleaned[len("acct:"):]
     from sqlalchemy import select
     from app.db.models import CloudAccount as _CloudAccountRow
@@ -458,6 +477,88 @@ def _build_aws_envelope(
     return CloudRecommendationListResponse(summary=summary_envelope, recommendations=items)
 
 
+def _build_rackspace_envelope(
+    flat_recommendations,
+    rollup: RackspaceRecommendationRollup,
+    *,
+    scope: str,
+) -> CloudRecommendationListResponse:
+    """Translate the Rackspace rollup into the canonical envelope.
+
+    Mirrors :func:`_build_aws_envelope`.  Savings are MONTHLY-period
+    by convention but currently UNKNOWN for every 9C.1/9C.2 finding:
+    ``savings_status="EMPTY"`` with ``potential_savings=None`` —
+    unknown savings are never reported as ``$0``.  Per-service
+    resource failures surface through the provider-neutral
+    ``account_errors`` slot (the account id is the safe Cloud tenant;
+    the display name names the Rackspace service that failed).
+    """
+    savings_by_currency = [
+        CloudRecommendationCurrencyTotal(currency=currency, amount=amount)
+        for currency, amount in sorted(rollup.savings_by_currency.items())
+    ]
+    account_errors = [
+        CloudRecommendationAccountError(
+            account_id=e.account_id,
+            display_name=e.display_name,
+            code=e.code,
+            message=e.message,
+        )
+        for e in rollup.account_errors
+    ]
+    summary_envelope = CloudRecommendationSummaryEnvelope(
+        provider="RACKSPACE",
+        scope=scope,
+        scope_kind="all" if scope == "all" else "single",
+        status=rollup.status,
+        savings_status=rollup.savings_status,
+        currency=rollup.currency,
+        total_recommendations=rollup.total_recommendations,
+        recommendations_with_savings=rollup.recommendations_with_savings,
+        recommendations_without_savings=rollup.recommendations_without_savings,
+        potential_annual_savings=None,
+        potential_savings=rollup.potential_savings,
+        savings_period=rollup.savings_period,
+        savings_by_currency=savings_by_currency,
+        by_impact=_group_counts(rollup.by_impact),
+        by_resource_type=_group_counts(rollup.by_resource_type),
+        by_subscription=[],
+        by_resource_group=[],
+        by_type=[],
+        by_subcategory=[],
+        subscription_errors=[],
+        by_account=_group_counts(rollup.by_account),
+        by_source=_group_counts(rollup.by_source),
+        by_action=_group_counts(rollup.by_action),
+        account_errors=account_errors,
+        source=RACKSPACE_RECOMMENDATION_SOURCE,
+    )
+    items = [
+        CloudRecommendationItem(
+            provider="RACKSPACE",
+            account_id=rec.account_id,
+            region=rec.region,
+            recommendation_id=rec.recommendation_id,
+            resource_id=rec.resource_id,
+            resource_type=rec.resource_type,
+            service=rec.service,
+            action=rec.action,
+            title=rec.title,
+            category=rec.category,
+            impact=rec.impact,
+            description=rec.description,
+            estimated_savings=rec.estimated_savings,
+            # "" means "no currency claim accompanies an unknown
+            # savings figure" — rendered as None on the wire.
+            currency=rec.currency or None,
+            source=rec.source,
+            extensions=dict(rec.extensions) if rec.extensions else {},
+        )
+        for rec in flat_recommendations
+    ]
+    return CloudRecommendationListResponse(summary=summary_envelope, recommendations=items)
+
+
 # ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
@@ -586,9 +687,39 @@ async def get_cloud_recommendations(
         )
         return envelope.model_dump(mode="json")
 
+    if kind == CloudProviderKind.RACKSPACE:
+        # Phase 9C.2 — the deterministic Rackspace engine behind the
+        # same canonical envelope.  ``region`` / ``days`` are ignored
+        # (multi-region discovery; no historical lookback) exactly
+        # the way Azure ignores ``days``.
+        try:
+            flat, rollup, _failures = (
+                await aggregate_rackspace_recommendations_for_account(
+                    rows=rows, region=region, days=days,
+                )
+            )
+        except RackspaceResourceError as exc:
+            return _rackspace_error_response(exc)
+        except Exception as exc:  # noqa: BLE001 - sanitised
+            logger.warning(
+                "cloud.recommendations.upstream_failed provider=%s code=%s",
+                kind.value, type(exc).__name__,
+            )
+            return JSONResponse(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                content={
+                    "status": "error",
+                    "error_code": "UPSTREAM_ERROR",
+                    "message": "upstream recommendations provider failed",
+                },
+            )
+        envelope = _build_rackspace_envelope(flat, rollup, scope=scope)
+        return envelope.model_dump(mode="json")
+
     # Any other (future) provider kind is not wired for the canonical
     # recommendation contract yet.  AWS and Azure are both served
-    # above; this is a defensive guard for RACKSPACE and beyond.
+    # above; this is a defensive guard for providers beyond
+    # RACKSPACE.
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={
@@ -599,6 +730,56 @@ async def get_cloud_recommendations(
                 f"provider={kind.value}"
             ),
         },
+    )
+
+
+def _rackspace_error_response(exc: RackspaceResourceError) -> JSONResponse:
+    """Translate a :class:`RackspaceResourceError` into a sanitised envelope.
+
+    Follows the vocabulary used by the canonical resources route so
+    the front-end can reuse its status handling.  A failed resource
+    inventory is NEVER converted into a zero-recommendation success.
+    """
+    mapping = {
+        RackspaceResourceErrorCategory.NOT_CONFIGURED: (
+            status.HTTP_503_SERVICE_UNAVAILABLE, "NOT_CONFIGURED",
+        ),
+        RackspaceResourceErrorCategory.AUTH_FAILED: (
+            status.HTTP_401_UNAUTHORIZED, "AUTH_FAILED",
+        ),
+        RackspaceResourceErrorCategory.ACCESS_DENIED: (
+            status.HTTP_403_FORBIDDEN, "ACCESS_DENIED",
+        ),
+        RackspaceResourceErrorCategory.NOT_FOUND: (
+            status.HTTP_404_NOT_FOUND, "NOT_FOUND",
+        ),
+        RackspaceResourceErrorCategory.THROTTLED: (
+            status.HTTP_429_TOO_MANY_REQUESTS, "THROTTLED",
+        ),
+        RackspaceResourceErrorCategory.NETWORK_ERROR: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceResourceErrorCategory.INVALID_RESPONSE: (
+            status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR",
+        ),
+        RackspaceResourceErrorCategory.UNSUPPORTED: (
+            status.HTTP_502_BAD_GATEWAY, "UNSUPPORTED",
+        ),
+    }
+    http_status, public_code = mapping.get(
+        exc.category, (status.HTTP_502_BAD_GATEWAY, "UPSTREAM_ERROR")
+    )
+    headers: dict = {}
+    if exc.retry_after is not None:
+        headers["Retry-After"] = str(int(exc.retry_after))
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "status": "error",
+            "error_code": public_code,
+            "category": exc.category.value,
+        },
+        headers=headers,
     )
 
 
