@@ -259,6 +259,18 @@ def test_detached_volume_severity_escalates_for_large_volumes():
     assert small[0].severity == RackspaceFindingSeverity.MEDIUM
 
 
+def test_detached_volume_boundary_size_100_is_medium():
+    """size_gb == 100 is the inclusive upper boundary for MEDIUM."""
+    f = rule_rs_vol_001_detached([_vol(volume_id="boundary-100", size_gb=100)])[0]
+    assert f.severity == RackspaceFindingSeverity.MEDIUM
+
+
+def test_detached_volume_boundary_size_101_is_high():
+    """size_gb == 101 crosses the > 100 threshold into HIGH."""
+    f = rule_rs_vol_001_detached([_vol(volume_id="boundary-101", size_gb=101)])[0]
+    assert f.severity == RackspaceFindingSeverity.HIGH
+
+
 def test_detached_volume_size_region_created_preserved_in_evidence():
     vol = _vol(
         volume_id="vol-1",
