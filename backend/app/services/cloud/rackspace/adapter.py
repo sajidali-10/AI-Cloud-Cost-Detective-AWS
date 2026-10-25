@@ -84,6 +84,10 @@ from app.services.cloud.rackspace.costs import (
     assert_period_overlap,
     fetch_cost_snapshot,
 )
+from app.services.cloud.rackspace.recommendations import (
+    RACKSPACE_RECOMMENDATION_SOURCE,
+    aggregate_rackspace_recommendations_for_account,
+)
 from app.services.cloud.rackspace.resources import (
     RACKSPACE_RESOURCE_SOURCE,
     RackspaceResourceError,
@@ -201,8 +205,9 @@ class RackspaceCloudProvider(CloudProvider):
         Phase 9B.1: ``AUTHENTICATION`` + ``COSTS`` + ``BILLING``.
         Phase 9B.2: ``RESOURCES`` (catalog-driven read-only inventory
         of Cloud Servers / Block Storage / Load Balancers).
-        OPTIMIZATION is explicitly deferred (Phase 9C); METRICS /
-        ADVISOR / AI_EVIDENCE remain UNSUPPORTED.
+        Phase 9C.2: ``OPTIMIZATION`` — the Phase 9C.1 deterministic
+        engine exposed through the canonical recommendation surface.
+        METRICS / ADVISOR / AI_EVIDENCE remain UNSUPPORTED.
         """
         identity_ok = _identity_configured()
         costs_ok = _costs_configured()
@@ -219,7 +224,7 @@ class RackspaceCloudProvider(CloudProvider):
             CloudCapability.COSTS: _state(costs_ok),
             CloudCapability.BILLING: _state(costs_ok),
             CloudCapability.RESOURCES: _state(identity_ok),
-            CloudCapability.OPTIMIZATION: CloudCapabilityState.UNSUPPORTED,
+            CloudCapability.OPTIMIZATION: _state(identity_ok),
             CloudCapability.METRICS: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.ADVISOR: CloudCapabilityState.UNSUPPORTED,
             CloudCapability.AI_EVIDENCE: CloudCapabilityState.UNSUPPORTED,
@@ -282,7 +287,25 @@ class RackspaceCloudProvider(CloudProvider):
                 "read_only": True,
                 "configured": identity_ok,
             },
-            CloudCapability.OPTIMIZATION: {"phase": "future", "status": "NOT_IMPLEMENTED"},
+            CloudCapability.OPTIMIZATION: {
+                "phase": "9C.2",
+                "status": (
+                    "SUPPORTED" if identity_ok else "NOT_CONFIGURED"
+                ),
+                "source": RACKSPACE_RECOMMENDATION_SOURCE,
+                "engine": "deterministic (Phase 9C.1)",
+                "rules": [
+                    "RS-VOL-001",
+                    "RS-SRV-001",
+                    "RS-LB-001",
+                ],
+                "rightsizing_evidence_status": "DEFERRED",
+                "savings_semantics": (
+                    "unknown savings are null, never zero"
+                ),
+                "read_only": True,
+                "configured": identity_ok,
+            },
             CloudCapability.METRICS: {"phase": "future", "status": "NOT_IMPLEMENTED"},
             CloudCapability.ADVISOR: {"phase": "future", "status": "NOT_IMPLEMENTED"},
             CloudCapability.AI_EVIDENCE: {"phase": "future", "status": "NOT_IMPLEMENTED"},
@@ -607,9 +630,22 @@ class RackspaceCloudProvider(CloudProvider):
         days: int = 90,
         region: Optional[str] = None,
     ) -> List[CloudRecommendation]:
-        raise NotImplementedError(
-            "Rackspace optimization is out of scope for Phase 9B.1"
+        """Return the canonical Rackspace recommendation list (Phase 9C.2).
+
+        Delegates to
+        :func:`app.services.cloud.rackspace.recommendations.aggregate_rackspace_recommendations_for_account`
+        — the same canonical aggregation the
+        ``/api/cloud/recommendations?provider=RACKSPACE`` route serves —
+        and returns only the normalised recommendations (the rollup /
+        per-service failures stay internal to the route envelope).
+
+        Read-only and deterministic: the Phase 9C.1 engine never issues
+        a Rackspace product write, and unknown savings stay ``None``.
+        """
+        flat, _rollup, _failures = await aggregate_rackspace_recommendations_for_account(
+            rows=accounts, region=region, days=days,
         )
+        return flat
 
 
 # ---------------------------------------------------------------------------
