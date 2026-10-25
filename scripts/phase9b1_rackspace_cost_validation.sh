@@ -11,7 +11,10 @@
 #   * Billing account GET + estimated_charges GET succeed
 #   * the canonical API surface answers provider=RACKSPACE with
 #     currency / period / total / (optional) service breakdown
-#   * the service breakdown reconciles with the total (when present)
+#   * RECONCILIATION (Phase 9B closure): the raw sanitized Billing
+#     total equals the canonical Rackspace total, and the service
+#     breakdown sums exactly to the canonical total — obtained in
+#     the SAME run, Decimal-safe
 #   * zero product write actions (GET only; the single identity
 #     POST is the documented authentication verb)
 #   * zero secret leakage (no API key / X-Auth-Token / RAN in any
@@ -413,7 +416,10 @@ else
     bad "canonical response carries no cache envelope"
 fi
 
-# Service breakdown + reconciliation (when present).
+# Service breakdown + reconciliation (when present).  The breakdown
+# must sum to the canonical total EXACTLY (Decimal-safe — no cent
+# drift, no tolerance): an empty breakdown only reconciles with a
+# zero total.
 BREAKDOWN_INFO="$(echo "$CANON_JSON" | "$PYBIN" -c "
 import json, sys
 from decimal import Decimal
@@ -426,9 +432,8 @@ try:
         print('EMPTY breakdown_total=' + str(total))
         sys.exit(0)
     ssum = sum((Decimal(str(i.get('amount'))) for i in services), Decimal('0'))
-    drift = abs(ssum - Decimal(str(total)))
-    ok = 'OK' if drift <= Decimal('0.01') else 'MISMATCH'
-    print(f'{ok} services={len(services)} sum={ssum} total={total} drift={drift}')
+    ok = 'OK' if ssum == Decimal(str(total)) else 'MISMATCH'
+    print(f'{ok} services={len(services)} sum={ssum} total={total}')
 except Exception as exc:
     print('PARSE_ERROR ' + type(exc).__name__)
 " 2>/dev/null)"
@@ -436,12 +441,63 @@ except Exception as exc:
 if [[ "$BREAKDOWN_INFO" == PARSE_ERROR* ]]; then
     bad "unable to parse the service breakdown from the canonical response"
 elif [[ "$BREAKDOWN_INFO" == EMPTY* ]]; then
-    info "service breakdown is empty in this response ($BREAKDOWN_INFO) — a valid zero/empty result is legitimate"
-    ok "service breakdown absent is a valid state (empty is not an error)"
+    # An empty breakdown only reconciles with a canonical total of
+    # exactly zero — anything else is a reconciliation failure.
+    EMPTY_OK="$(printf '%s' "$canon_total" | "$PYBIN" -c "
+import sys
+from decimal import Decimal
+try:
+    print('OK' if Decimal(sys.stdin.read().strip()) == 0 else 'MISMATCH')
+except Exception:
+    print('PARSE_ERROR')
+" 2>/dev/null)"
+    if [[ "$EMPTY_OK" == "OK" ]]; then
+        ok "service breakdown is empty and the canonical total is zero (0 == 0 — reconciles)"
+    else
+        bad "service breakdown is empty but the canonical total is non-zero ($canon_total) — the breakdown must reconcile with the total"
+    fi
 elif [[ "$BREAKDOWN_INFO" == OK* ]]; then
-    ok "service breakdown reconciles with the total ($BREAKDOWN_INFO)"
+    ok "service breakdown reconciles exactly with the total ($BREAKDOWN_INFO)"
 else
     bad "service breakdown does NOT reconcile with the total ($BREAKDOWN_INFO)"
+fi
+
+# Raw ↔ canonical reconciliation (Phase 9B closure invariant).
+# The sanitized Billing total extracted from the LIVE
+# ``estimated_charges`` response in the SAME run (the POC summary
+# prefers the authoritative envelope ``total`` field, mirroring the
+# canonical normalizer's precedence) must equal the canonical
+# Rackspace total EXACTLY — Decimal-safe, no tolerance.  A genuine
+# authoritative $0 reconciles as 0 == 0; the invariant holds for
+# whatever the authoritative value happens to be.
+RAW_VS_CANON="$(echo "$POC_JSON" | "$PYBIN" -c "
+import json, sys
+from decimal import Decimal
+try:
+    canon_raw = '''$canon_total'''
+    poc = json.load(sys.stdin)
+    summary = poc.get('billing_estimated_charges_summary') or {}
+    raw = summary.get('total')
+    if raw is None:
+        print('RAW_MISSING sanitized_current_cost_available=%s' % summary.get('sanitized_current_cost_available'))
+    else:
+        raw_d = Decimal(str(raw))
+        canon_d = Decimal(canon_raw)
+        if raw_d == canon_d:
+            print('OK raw=%s canon=%s' % (raw_d, canon_d))
+        else:
+            print('MISMATCH raw=%s canon=%s' % (raw_d, canon_d))
+except Exception as exc:
+    print('PARSE_ERROR ' + type(exc).__name__)
+" 2>/dev/null)"
+if [[ "$RAW_VS_CANON" == OK* ]]; then
+    ok "raw Billing total == canonical Rackspace total ($RAW_VS_CANON)"
+elif [[ "$RAW_VS_CANON" == RAW_MISSING* ]]; then
+    bad "the raw sanitized Billing summary carries no total — raw↔canonical reconciliation impossible ($RAW_VS_CANON)"
+elif [[ "$RAW_VS_CANON" == PARSE_ERROR* ]]; then
+    bad "unable to compare the raw Billing total with the canonical total ($RAW_VS_CANON)"
+else
+    bad "raw Billing total does NOT reconcile with the canonical Rackspace total ($RAW_VS_CANON)"
 fi
 
 # Daily trend / region are unsupported dimensions — they must be

@@ -532,9 +532,13 @@ def _summarise_estimated_charges(body: Dict[str, Any]) -> Dict[str, Any]:
                 summary["current_period"] = period_summary
                 summary["current_period_available"] = True
 
-    # Sanitized total — only the rounded numeric total is
-    # retained, never the per-resource breakdown.
-    for total_key in ("chargeTotal", "estimatedTotal", "total", "currentCharges", "amount"):
+    # Sanitized total — the authoritative envelope ``total`` first
+    # (the documented bottom-line estimated total of the current
+    # cycle), then the component totals.  Deterministic: the FIRST
+    # parseable key wins, mirroring the canonical normalizer's
+    # :data:`_TOTAL_FIELD_KEYS` precedence.  Only the rounded numeric
+    # total is retained, never the per-resource breakdown.
+    for total_key in ("total", "chargeTotal", "estimatedTotal", "currentCharges", "amount"):
         value = body.get(total_key)
         if value is None:
             continue
@@ -548,6 +552,7 @@ def _summarise_estimated_charges(body: Dict[str, Any]) -> Dict[str, Any]:
                 summary["sanitized_current_cost_available"] = True
             except ValueError:
                 continue
+            break
 
     # List-shaped responses (e.g. ``estimatedCharge: [...]``)
     # are summarised by count + currency set + date range.  Per-resource
