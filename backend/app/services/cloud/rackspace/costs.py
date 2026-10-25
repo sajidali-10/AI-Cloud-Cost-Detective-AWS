@@ -23,12 +23,24 @@ Money handling
 Every monetary value is parsed into :class:`decimal.Decimal` via
 ``Decimal(str(value))``.  Binary floats never accumulate: a JSON
 number such as ``1234.567`` is stringified first so the exact
-decimal literal is preserved.  The canonical total is the Decimal
-sum of the individual charge records whenever records are present,
-which guarantees the service breakdown reconciles to the total
-*exactly* (no cent-level drift).  The body-level total Rackspace
-reports is used as a cross-check: drift beyond one cent is surfaced
-as a warning — never silently absorbed and never fabricated.
+decimal literal is preserved.
+
+**Canonical total = the authoritative envelope total.**  The
+Billing V2 ``estimatedCharges`` envelope reports the bottom-line
+estimated total for the cycle in its ``total`` field (see the
+Rackspace Billing V2 "estimated charges operations" reference:
+``total`` alongside the component ``chargeSubTotal`` /
+``chargeTotal`` / ``discountTotal`` fields).  The normalizer uses
+that authoritative total whenever the envelope provides one
+(``total`` first, then the component totals as fallbacks), and the
+sum of the ``estimatedCharge`` records is treated as the
+*itemized* portion of it.  A charge that is part of the cycle
+total but NOT itemized in any record (e.g. a minimum / support
+charge) is carried by an explicit ``"Un-itemized charges"``
+service bucket, so the service breakdown reconciles to the total
+*exactly* (no cent-level drift) while no value is fabricated.
+When the envelope carries no total at all, the record sum is the
+canonical total (records are then the only source).
 
 Period semantics
 ----------------
@@ -99,6 +111,13 @@ _MAX_SERVICE_LABEL_LENGTH = 120
 #: product / offering / category field.  Explicit — never fabricated.
 UNCATEGORIZED_SERVICE = "Uncategorized"
 
+#: Bucket carrying the portion of the authoritative envelope total
+#: that is NOT itemized in any ``estimatedCharge`` record (e.g. a
+#: minimum / support charge).  Keeping it explicit (instead of
+#: silently dropping it or re-attributing it) is what makes the
+#: service breakdown reconcile with the canonical total EXACTLY.
+UNITEMIZED_SERVICE = "Un-itemized charges"
+
 
 class RackspaceCostErrorCategory(str, Enum):
     """Stable failure categories for the canonical Rackspace cost path."""
@@ -148,11 +167,17 @@ class RackspaceCostSnapshot:
 
     ``period_start`` / ``period_end`` are the ACTUAL source period
     dates as returned by the Rackspace Billing API (exposed verbatim
-    in the canonical envelope).  ``total`` is the Decimal sum of the
-    charge records when records were present (exact
-    reconciliation with ``by_service``), otherwise the body-level
-    total.  ``warnings`` carries sanitized, non-secret limitation
-    notes (uncategorized records, body-total drift, ...).
+    in the canonical envelope).  ``total`` is the AUTHORITATIVE
+    envelope total (``total`` field first — the documented
+    bottom-line estimated total of the cycle) whenever the envelope
+    provides one; the record sum is used only when it does not.
+    ``by_service`` always sums to ``total`` EXACTLY: itemized records
+    bucket per product / offering label, and any un-itemized
+    remainder (``total`` minus the record sum — e.g. a minimum /
+    support charge) is carried by the explicit
+    :data:`UNITEMIZED_SERVICE` bucket.  ``warnings`` carries
+    sanitized, non-secret limitation notes (uncategorized records,
+    un-itemized remainders, ...).
     """
 
     currency: str
@@ -240,11 +265,16 @@ _PRODUCT_FIELD_KEYS = (
     "offering",
 )
 
-#: Keys that carry the body-level total.
+#: Keys that carry the authoritative body-level total, in precedence
+#: order.  ``total`` is the documented bottom-line estimated total of
+#: the current cycle (the Billing V2 envelope reports it alongside the
+#: component ``chargeSubTotal`` / ``chargeTotal`` / ``discountTotal``
+#: fields); the others are component / legacy totals used only when
+#: ``total`` is absent.
 _TOTAL_FIELD_KEYS = (
+    "total",
     "chargeTotal",
     "estimatedTotal",
-    "total",
     "currentCharges",
     "amount",
 )
@@ -401,7 +431,12 @@ def _extract_currency(
 
 
 def _extract_body_total(scalar_source: Dict[str, Any]) -> Optional[Decimal]:
-    """Extract the body-level total, or ``None``."""
+    """Extract the authoritative envelope total, or ``None``.
+
+    ``total`` (the documented bottom-line estimated total of the
+    current billing cycle) takes precedence over the component
+    totals — see :data:`_TOTAL_FIELD_KEYS`.
+    """
 
     for key in _TOTAL_FIELD_KEYS:
         if key not in scalar_source:
@@ -500,59 +535,73 @@ def normalize_estimated_charges(body: Dict[str, Any]) -> RackspaceCostSnapshot:
         )
 
     # --- Service breakdown + canonical total --------------------------
+    # The authoritative envelope total (``total`` first — see
+    # :data:`_TOTAL_FIELD_KEYS`) IS the canonical total.  The record
+    # sum is the itemized portion; any difference is carried by an
+    # explicit un-itemized bucket so the breakdown reconciles
+    # exactly.
     warnings: List[str] = []
     body_total = _extract_body_total(scalar_source)
 
-    if record_count > 0:
-        service_totals: Dict[str, Decimal] = {}
-        uncategorized = 0
-        record_sum = Decimal("0")
-        for record in records:
-            amount = _record_amount(record)
-            record_sum += amount
-            label = _record_service_label(record)
-            if label is None:
-                label = UNCATEGORIZED_SERVICE
-                uncategorized += 1
-            service_totals[label] = service_totals.get(label, Decimal("0")) + amount
-        if uncategorized:
-            warnings.append(
-                f"uncategorized_charge_records={uncategorized}"
-            )
-        total = record_sum
-        if body_total is not None:
-            drift = abs(body_total - total)
-            if drift > TOTAL_RECONCILIATION_TOLERANCE:
-                warnings.append(
-                    f"body_total_mismatch={drift:.2f}"
-                )
-    else:
-        # No charge records.  The body-level total is the only source —
-        # a legitimate empty/zero result when the API reports one.
-        if body_total is None:
-            raise RackspaceCostError(
-                RackspaceCostErrorCategory.INVALID_RESPONSE,
-                "estimated_charges response has no records and no total",
-            )
+    service_totals: Dict[str, Decimal] = {}
+    uncategorized = 0
+    record_sum = Decimal("0")
+    for record in records:
+        amount = _record_amount(record)
+        record_sum += amount
+        label = _record_service_label(record)
+        if label is None:
+            label = UNCATEGORIZED_SERVICE
+            uncategorized += 1
+        service_totals[label] = service_totals.get(label, Decimal("0")) + amount
+    if uncategorized:
+        warnings.append(
+            f"uncategorized_charge_records={uncategorized}"
+        )
+
+    if body_total is not None:
+        # Authoritative envelope total — the canonical total.
         total = body_total
+    elif record_count > 0:
+        # No envelope total: the records are the only source.
+        total = record_sum
+    else:
+        raise RackspaceCostError(
+            RackspaceCostErrorCategory.INVALID_RESPONSE,
+            "estimated_charges response has no records and no total",
+        )
+
+    if record_count == 0:
         warnings.append("no_charge_records_total_from_body")
+
+    # Explicit un-itemized remainder — the portion of the
+    # authoritative total not itemized in any charge record (e.g.
+    # minimum / support charges).  Bucketed explicitly so the
+    # breakdown reconciles with the total EXACTLY; never silently
+    # dropped and never re-attributed to a real offering.
+    unitemized = total - record_sum
+    if unitemized != 0:
+        service_totals[UNITEMIZED_SERVICE] = (
+            service_totals.get(UNITEMIZED_SERVICE, Decimal("0")) + unitemized
+        )
+        if abs(unitemized) > TOTAL_RECONCILIATION_TOLERANCE:
+            warnings.append(f"unitemized_charges={unitemized:.2f}")
 
     by_service = tuple(
         RackspaceServiceCost(service=name, amount=amount)
         for name, amount in sorted(
             service_totals.items(), key=lambda kv: (-kv[1], kv[0])
         )
-    ) if record_count > 0 else tuple()
+    )
 
     # Guard: the breakdown must reconcile with the canonical total
-    # exactly whenever records were aggregated.
-    if record_count > 0:
-        breakdown_sum = sum((sc.amount for sc in by_service), Decimal("0"))
-        if breakdown_sum != total:
-            raise RackspaceCostError(
-                RackspaceCostErrorCategory.INVALID_RESPONSE,
-                "service breakdown does not reconcile with the canonical total",
-            )
+    # EXACTLY — with or without records.
+    breakdown_sum = sum((sc.amount for sc in by_service), Decimal("0"))
+    if breakdown_sum != total:
+        raise RackspaceCostError(
+            RackspaceCostErrorCategory.INVALID_RESPONSE,
+            "service breakdown does not reconcile with the canonical total",
+        )
 
     return RackspaceCostSnapshot(
         currency=currency,
@@ -567,6 +616,8 @@ def normalize_estimated_charges(body: Dict[str, Any]) -> RackspaceCostSnapshot:
         extensions={
             "source": RACKSPACE_COST_SOURCE,
             "has_records": record_count > 0,
+            "itemized_total": str(record_sum),
+            "unitemized_total": str(unitemized),
         },
     )
 

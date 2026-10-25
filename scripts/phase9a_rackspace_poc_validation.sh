@@ -341,7 +341,15 @@ case "$servers_status" in
 esac
 
 if [[ -n "$servers_total" && "$servers_status" == "OK" ]]; then
-    info "total servers: ${servers_total}"
+    # LIMITED POC RESOURCE CHECK — NOT the authoritative inventory.
+    # The Phase 9A POC client queries only the FIRST compute endpoint
+    # published by the Identity service catalog (a single, default
+    # regional endpoint), so this count can legitimately be lower
+    # than (or differ from) the complete catalog-driven multi-region
+    # discovery performed by Phase 9B.2 — which is the authoritative
+    # canonical inventory.
+    info "total servers (limited POC check — single/first catalog compute endpoint only): ${servers_total}"
+    info "NOTE: this is NOT the authoritative inventory — Phase 9B.2 performs complete catalog-driven multi-region discovery"
 fi
 if [[ -n "$servers_regions" && "$servers_status" == "OK" ]]; then
     info "regions discovered: ${servers_regions}"

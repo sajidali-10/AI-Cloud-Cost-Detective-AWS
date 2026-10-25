@@ -4,6 +4,8 @@ Covers the pure normalizer (:mod:`app.services.cloud.rackspace.costs`):
 
 * successful current-period normalization (currency / period / total /
   service breakdown / reconciliation)
+* the authoritative envelope total (``total`` field) drives the
+  canonical total; un-itemized remainders are bucketed explicitly
 * true-zero semantics (a valid ``$0`` is a SUCCESS, never unavailable)
 * currency propagation (never hardcoded USD)
 * period propagation (actual source period, verbatim)
@@ -116,28 +118,40 @@ class TestNormalizeSuccess:
         assert breakdown_sum == snapshot.total
 
     def test_body_total_mismatch_is_surfaced_not_hidden(self):
-        # The body-level total disagrees with the record sum by more
-        # than a cent: the canonical total stays the record sum (it
-        # MUST reconcile with the breakdown) and the drift is
-        # surfaced as a warning — never silently absorbed.
+        # The authoritative envelope total disagrees with the record
+        # sum by more than a cent: the canonical total IS the
+        # authoritative total, and the un-itemized remainder is
+        # carried by an explicit bucket + surfaced as a warning —
+        # never silently absorbed and never fabricated.
         body = _body(estimatedTotal="9999.99")
         snapshot = normalize_estimated_charges(body)
-        assert snapshot.total == Decimal("1250.50")
+        assert snapshot.total == Decimal("9999.99")
+        services = {s.service: s.amount for s in snapshot.by_service}
+        assert services["Un-itemized charges"] == Decimal("8749.49")
         assert any(
-            w.startswith("body_total_mismatch=") for w in snapshot.warnings
+            w.startswith("unitemized_charges=") for w in snapshot.warnings
+        )
+        # The breakdown still reconciles exactly with the total.
+        assert sum((s.amount for s in snapshot.by_service), Decimal("0")) == (
+            snapshot.total
         )
 
     def test_body_total_within_tolerance_no_warning(self):
         body = _body(estimatedTotal="1250.51")
         snapshot = normalize_estimated_charges(body)
-        assert snapshot.total == Decimal("1250.50")
+        assert snapshot.total == Decimal("1250.51")
+        # A cent-level remainder is still bucketed explicitly (exact
+        # reconciliation) but does not raise a warning.
+        services = {s.service: s.amount for s in snapshot.by_service}
+        assert services["Un-itemized charges"] == Decimal("0.01")
         assert not any(
-            w.startswith("body_total_mismatch=") for w in snapshot.warnings
+            w.startswith("unitemized_charges=") for w in snapshot.warnings
         )
 
     def test_currency_propagates_not_hardcoded_usd(self):
         body = _body(
             currency="EUR",
+            estimatedTotal="10.00",
             estimatedCharges=[
                 {"service": "Cloud Servers", "amount": "10.00", "currency": "EUR"},
             ],
@@ -189,6 +203,7 @@ class TestNormalizeSuccess:
 
     def test_numeric_amounts_parsed_via_decimal_not_float(self):
         body = _body(
+            estimatedTotal="0.3",
             estimatedCharges=[
                 {"service": "A", "amount": 0.1},
                 {"service": "B", "amount": 0.2},
@@ -201,6 +216,7 @@ class TestNormalizeSuccess:
 
     def test_records_without_product_field_bucketed_explicitly(self):
         body = _body(
+            estimatedTotal="15.00",
             estimatedCharges=[
                 {"amount": "10.00", "currency": "USD"},
                 {"service": "Cloud Servers", "amount": "5.00", "currency": "USD"},
@@ -228,7 +244,11 @@ class TestNormalizeSuccess:
         )
         snapshot = normalize_estimated_charges(body)
         assert snapshot.total == Decimal("77.00")
-        assert snapshot.by_service == ()
+        # The whole total is un-itemized — carried by the explicit
+        # bucket so the breakdown reconciles exactly.
+        assert [(s.service, s.amount) for s in snapshot.by_service] == [
+            ("Un-itemized charges", Decimal("77.00"))
+        ]
         assert snapshot.record_count == 0
         assert "no_charge_records_total_from_body" in snapshot.warnings
 
