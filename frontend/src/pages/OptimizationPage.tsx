@@ -29,6 +29,7 @@ import { ErrorState } from '../components/ErrorState'
 import { RefreshButton } from '../components/RefreshButton'
 import { PartialWarning } from '../components/PartialWarning'
 import { FilterBar, FilterSelect } from '../components/FilterBar'
+import { ConfidenceBadge } from '../components/RecommendationSourceBadge'
 import { HorizontalBarChart, type HorizontalBarRow } from '../components/HorizontalBarChart'
 import { useFinopsQuery } from '../lib/finops/store'
 import { invalidateFinopsCache } from '../lib/finops/store'
@@ -94,14 +95,26 @@ const PAGE_TEST_IDS = {
 // Subtitle / page copy is provider-aware but identical in shape for both.
 // ---------------------------------------------------------------------------
 
-function pageSubtitle(provider: 'AWS' | 'AZURE' | string): string {
+function pageSubtitle(provider: 'AWS' | 'AZURE' | 'RACKSPACE' | string): string {
   if (provider === 'AZURE') {
     return 'Identify cost-saving opportunities across your selected Azure scope'
   }
   if (provider === 'AWS') {
     return 'Identify cost-saving opportunities across your selected AWS scope'
   }
+  if (provider === 'RACKSPACE') {
+    return 'Identify review opportunities across your selected Rackspace scope'
+  }
   return 'Identify cost-saving opportunities across your selected cloud scope'
+}
+
+// Phase 9D.1 — advisory warning source label per provider (used by
+// the PartialWarning rows so a Rackspace service failure is never
+// attributed to an AWS pipeline).
+function advisorySourceLabel(provider: 'AWS' | 'AZURE' | 'RACKSPACE' | string): string {
+  if (provider === 'AZURE') return 'azure-advisor'
+  if (provider === 'RACKSPACE') return 'rackspace-optimization'
+  return 'aws-optimization'
 }
 
 function scopeDisplayLabel(
@@ -215,11 +228,18 @@ export function OptimizationPage() {
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS)
   const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT)
 
+  // Phase 9D.1 — selected recommendation row for the advisory
+  // detail panel.  Clicking a table row opens (or closes) its
+  // detail; narrowing the filters to exactly one row still shows
+  // that row's detail without a click (Phase 7D.2 behavior).
+  const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
+
   // Reset filters whenever the envelope shape changes (provider /
   // scope switch).  This prevents an Azure-only filter selection
   // (e.g. resource type "Microsoft.Compute/virtualMachines") from
   // lingering after switching to AWS where it would hide every
-  // row.
+  // row.  A provider / scope switch also clears the selected
+  // detail row so a stale selection cannot survive the switch.
   const envelopeIdRef = useRef<string | null>(null)
   useEffect(() => {
     if (!envelope) return
@@ -228,6 +248,7 @@ export function OptimizationPage() {
       envelopeIdRef.current = id
       setFilters(DEFAULT_FILTERS)
       setSortKey(DEFAULT_SORT)
+      setSelectedRowId(null)
     }
   }, [envelope])
 
@@ -238,6 +259,17 @@ export function OptimizationPage() {
   const filteredRows = useMemo(
     () => (envelope ? sortRows(applyFilters(envelope.rows, filters), sortKey) : []),
     [envelope, filters, sortKey],
+  )
+
+  // Phase 9D.1 — the advisory detail row: the clicked row, or the
+  // single remaining row after filtering (Phase 7D.2 behavior).
+  const detailRow = useMemo(
+    () =>
+      envelope
+        ? filteredRows.find((r) => r.id === selectedRowId) ??
+            (filteredRows.length === 1 ? filteredRows[0] : null)
+        : null,
+    [envelope, filteredRows, selectedRowId],
   )
 
   const selectedScopeLabel = scopeDisplayLabel(provider, selection, accountMap)
@@ -290,7 +322,7 @@ export function OptimizationPage() {
           <PartialWarning
             title="Partial data — some scopes were unavailable"
             warnings={envelope.partialErrors.map((e) => ({
-              source: provider === 'AZURE' ? 'azure-advisor' : 'aws-optimization',
+              source: advisorySourceLabel(provider),
               code: e.code,
               message: `${e.display_name}: ${e.message}`,
               region: null,
@@ -381,7 +413,9 @@ export function OptimizationPage() {
             description={
               provider === 'AZURE'
                 ? 'Per Azure subscription attribution'
-                : 'Per AWS account attribution'
+                : provider === 'RACKSPACE'
+                  ? 'Per Rackspace account attribution'
+                  : 'Per AWS account attribution'
             }
           >
             <BreakdownRows rows={accountBreakdown(envelope, accountMap)} />
@@ -503,15 +537,21 @@ export function OptimizationPage() {
                 rows={filteredRows}
                 rowKey={(r) => r.id}
                 caption={`${provider} optimization recommendations`}
+                onRowClick={(r) =>
+                  setSelectedRowId((current) => (current === r.id ? null : r.id))
+                }
+                isRowClickable={() => true}
               />
             </div>
           )
         )}
       </SectionCard>
 
-      {/* Detail panel — read-only, no remediation actions */}
-      {envelope && filteredRows.length === 1 && (
-        <DetailPanel row={filteredRows[0]} provider={provider} />
+      {/* Detail panel — read-only, no remediation actions.  Opens
+          for the clicked row, or automatically when the filters
+          narrow the list to exactly one row. */}
+      {envelope && detailRow && (
+        <DetailPanel row={detailRow} provider={provider} />
       )}
     </div>
   )
@@ -526,8 +566,18 @@ function DetailPanel({
   provider,
 }: {
   row: UnifiedRecommendationRow
-  provider: 'AWS' | 'AZURE' | string
+  provider: 'AWS' | 'AZURE' | 'RACKSPACE' | string
 }) {
+  // Phase 9D.1 — canonical advisory fields ride in the provider
+  // neutral ``extensions`` (Phase 9C.2 emits them for Rackspace).
+  // They are rendered verbatim — the frontend never reinterprets
+  // recommendation semantics, never upgrades advisory wording to
+  // deletion language, and never invents a savings figure.
+  const ext = (row.raw?.extensions ?? {}) as Record<string, unknown>
+  const confidence = extString(ext, 'confidence')
+  const recommendedAction = extString(ext, 'recommended_action')
+  const evidence = extEvidenceList(ext)
+  const limitations = extStringList(ext, 'limitations')
   return (
     <div data-testid={PAGE_TEST_IDS.detailPanel}>
     <SectionCard
@@ -545,6 +595,11 @@ function DetailPanel({
           </p>
           <p className="mt-0.5 text-xs text-fg-primary">
             <StatusBadge tone={impactToneFor(row.impact)}>{row.impact}</StatusBadge>
+            {confidence !== null && (
+              <span className="ml-2" data-testid="recommendation-confidence">
+                <ConfidenceBadge confidence={confidence} />
+              </span>
+            )}
           </p>
           <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
             Source
@@ -557,7 +612,7 @@ function DetailPanel({
         </div>
         <div>
           <h3 className="text-sm font-semibold text-fg-primary">Savings</h3>
-          <p className="mt-1 text-xs text-fg-secondary">
+          <p className="mt-1 text-xs text-fg-secondary" data-testid="recommendation-savings-detail">
             {row.estimatedMonthlySavings === null
               ? 'Not available'
               : `${formatCurrencyDecimal(row.estimatedMonthlySavings, row.currency ?? 'USD')} / mo`}
@@ -565,6 +620,12 @@ function DetailPanel({
               ? ` (annual: ${formatCurrencyDecimal(row.estimatedAnnualSavings, row.currency ?? 'USD')})`
               : ''}
           </p>
+          {row.estimatedMonthlySavings === null && (
+            <p className="mt-1 text-[10px] text-fg-muted">
+              Unknown savings are not reported as zero — no authoritative figure
+              exists for this finding.
+            </p>
+          )}
           <p className="mt-3 text-[10px] uppercase tracking-wider text-fg-muted">
             Resource
           </p>
@@ -577,11 +638,100 @@ function DetailPanel({
           <p className="mt-0.5 text-xs text-fg-primary">{row.action}</p>
         </div>
       </div>
+
+      {/* Phase 9D.1 — canonical advisory extension fields.  Rendered
+          verbatim when present; absent for providers that do not
+          emit them.  No frontend reinterpretation of semantics. */}
+      {recommendedAction !== null && (
+        <div className="mt-4" data-testid="recommendation-recommended-action">
+          <p className="text-[10px] uppercase tracking-wider text-fg-muted">
+            Recommended action
+          </p>
+          <p className="mt-0.5 text-xs text-fg-secondary">{recommendedAction}</p>
+        </div>
+      )}
+
+      {evidence.length > 0 && (
+        <div className="mt-4" data-testid="recommendation-evidence">
+          <p className="text-[10px] uppercase tracking-wider text-fg-muted">
+            Evidence
+          </p>
+          <dl className="mt-1 grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
+            {evidence.map((item, index) => (
+              <div key={`${item.kind}-${index}`} className="flex items-baseline justify-between gap-2">
+                <dt className="font-mono text-[10px] text-fg-muted">{item.kind}</dt>
+                <dd className="truncate text-xs text-fg-secondary" title={String(item.value)}>
+                  {item.value === null || item.value === undefined
+                    ? '—'
+                    : String(item.value)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+
+      {limitations.length > 0 && (
+        <div className="mt-4" data-testid="recommendation-limitations">
+          <p className="text-[10px] uppercase tracking-wider text-fg-muted">
+            Limitations
+          </p>
+          <ul className="mt-1 list-inside list-disc space-y-0.5 text-xs text-fg-muted">
+            {limitations.map((limitation, index) => (
+              <li key={`${limitation}-${index}`}>{limitation}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <p className="mt-4 text-[10px] uppercase tracking-wider text-fg-muted">
-        Read-only — Phase 7D.2 does not surface remediation actions.
+        Read-only — no remediation actions are surfaced here. Advisory findings
+        require owner validation before any change.
       </p>
     </SectionCard>
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9D.1 — canonical advisory extension accessors
+// ---------------------------------------------------------------------------
+
+function extString(
+  ext: Record<string, unknown> | undefined,
+  key: string,
+): string | null {
+  if (!ext) return null
+  const value = ext[key]
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+interface AdvisoryEvidenceItem {
+  kind: string
+  value: unknown
+}
+
+function extEvidenceList(
+  ext: Record<string, unknown> | undefined,
+): AdvisoryEvidenceItem[] {
+  if (!ext || !Array.isArray(ext['evidence'])) return []
+  const out: AdvisoryEvidenceItem[] = []
+  for (const item of ext['evidence']) {
+    if (!item || typeof item !== 'object') continue
+    const record = item as Record<string, unknown>
+    if (typeof record['kind'] !== 'string' || !record['kind']) continue
+    out.push({ kind: record['kind'], value: record['value'] ?? null })
+  }
+  return out
+}
+
+function extStringList(
+  ext: Record<string, unknown> | undefined,
+  key: string,
+): string[] {
+  if (!ext || !Array.isArray(ext[key])) return []
+  return (ext[key] as unknown[]).filter(
+    (v): v is string => typeof v === 'string' && v.trim().length > 0,
   )
 }
 
@@ -670,7 +820,11 @@ function accountBreakdown(
   // Ensure the "All" aggregate label shows even when there are zero rows
   if (buckets.size === 0) {
     const label =
-      envelope.provider === 'AZURE' ? 'All Azure Subscriptions' : 'All AWS Accounts'
+      envelope.provider === 'AZURE'
+        ? 'All Azure Subscriptions'
+        : envelope.provider === 'RACKSPACE'
+          ? 'All Rackspace Cloud Accounts'
+          : 'All AWS Accounts'
     return [{ key: label, label, title: label, value: '0' }]
   }
   return Array.from(buckets.entries())
