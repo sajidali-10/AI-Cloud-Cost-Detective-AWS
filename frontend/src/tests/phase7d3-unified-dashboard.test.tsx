@@ -290,10 +290,12 @@ afterEach(() => {
 // ===========================================================================
 
 describe('Phase 7D.3 — dashboardScope helpers', () => {
-  it('providerSlug returns "azure" for AZURE and "aws" for AWS', () => {
+  it('providerSlug returns "azure" for AZURE, "aws" for AWS and "rackspace" for RACKSPACE', () => {
     expect(providerSlug('AWS')).toBe('aws')
     expect(providerSlug('AZURE')).toBe('azure')
-    expect(providerSlug('RACKSPACE')).toBeNull()
+    // Phase 9D.1 — RACKSPACE is now a supported dashboard
+    // provider (canonical costs / resources / recommendations).
+    expect(providerSlug('RACKSPACE')).toBe('rackspace')
   })
 
   it('dashboardScopeCacheSegment always includes the provider prefix', () => {

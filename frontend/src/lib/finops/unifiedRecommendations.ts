@@ -129,9 +129,19 @@ const KNOWN_AZURE_SOURCES: Record<string, string> = {
   AZURE_ADVISOR: 'Azure Advisor',
 }
 
+// Phase 9D.1 — Rackspace canonical sources.  The Phase 9C.1
+// deterministic engine emits RACKSPACE_OPTIMIZATION; the billing
+// adapter emits RACKSPACE_BILLING (cost surfaces).
+const KNOWN_RACKSPACE_SOURCES: Record<string, string> = {
+  RACKSPACE_OPTIMIZATION: 'Rackspace Optimization',
+  RACKSPACE_BILLING: 'Rackspace Billing',
+  RACKSPACE_CLOUD_API: 'Rackspace Cloud API',
+}
+
 export function friendlySourceLabel(source: string): string {
   if (KNOWN_AWS_SOURCES[source]) return KNOWN_AWS_SOURCES[source]
   if (KNOWN_AZURE_SOURCES[source]) return KNOWN_AZURE_SOURCES[source]
+  if (KNOWN_RACKSPACE_SOURCES[source]) return KNOWN_RACKSPACE_SOURCES[source]
   // Generic humanisation: AZURE_FOO_BAR → "Azure Foo Bar".
   if (source.startsWith('AZURE_')) {
     const tail = source
@@ -221,6 +231,13 @@ export function friendlyAttribution(
         canonicalSelector: 'all',
       }
     }
+    if (provider === 'RACKSPACE') {
+      return {
+        label: 'All Rackspace Cloud Accounts',
+        maskedId: 'All Rackspace Cloud Accounts',
+        canonicalSelector: 'all',
+      }
+    }
     return {
       label: `All ${String(provider)} Accounts`,
       maskedId: `All ${String(provider)} Accounts`,
@@ -253,6 +270,16 @@ export function friendlyAttribution(
   if (provider === 'AWS' && selector.startsWith('acct:')) {
     return {
       label: `Account ${selector.slice('acct:'.length)}`,
+      maskedId: selector.slice('acct:'.length),
+      canonicalSelector: selector,
+    }
+  }
+  // Phase 9D.1 — Rackspace accounts share the AWS-style ``acct:<n>``
+  // selector form (the backend maps the local row id to the
+  // registered Cloud tenant).
+  if (provider === 'RACKSPACE' && selector.startsWith('acct:')) {
+    return {
+      label: 'Rackspace Cloud Account',
       maskedId: selector.slice('acct:'.length),
       canonicalSelector: selector,
     }

@@ -65,6 +65,8 @@ export function DashboardHero(props: DashboardHeroProps) {
   const tagline =
     props.provider === 'AZURE'
       ? 'Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
+      : props.provider === 'RACKSPACE'
+      ? 'Rackspace cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
       : 'AWS cost visibility, optimization and AI-powered FinOps analysis.'
   return (
     <section

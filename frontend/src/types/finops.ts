@@ -69,7 +69,10 @@ export interface CostReport {
   daily_trend: DailyCostPoint[]
   by_service: ServiceCost[]
   by_region: RegionCost[]
-  source: 'AWS_COST_EXPLORER'
+  // Phase 9D.1 — provider-aware source identifiers.  AWS keeps
+  // the legacy value; Azure / Rackspace carry their canonical
+  // billing source so the UI can label data provenance honestly.
+  source: 'AWS_COST_EXPLORER' | 'AZURE_COST_MANAGEMENT' | 'RACKSPACE_BILLING'
   // Phase 7C post-release hotfix #2 — cost completeness semantics.
   // The canonical envelope carries these fields so the frontend can
   // distinguish a true zero from a transient failure.  Defaults are

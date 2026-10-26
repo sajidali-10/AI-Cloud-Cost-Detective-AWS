@@ -34,12 +34,12 @@
 import type { AccountSelection, SelectableAccount } from '../accountContext'
 import type { ProviderKind } from '../providerContext'
 
-export type DashboardProvider = Extract<ProviderKind, 'AWS' | 'AZURE'>
+export type DashboardProvider = Extract<ProviderKind, 'AWS' | 'AZURE' | 'RACKSPACE'>
 export type DashboardSelection = AccountSelection
 
 export interface DashboardAccountMap {
   /** Lower-case provider slug — used for cache-key prefixes. */
-  slug: 'aws' | 'azure'
+  slug: 'aws' | 'azure' | 'rackspace'
   /** Upper-case wire form — matches the canonical API contract. */
   wire: DashboardProvider
   /** SelectableAccount rows already filtered to the active provider. */
@@ -48,13 +48,16 @@ export interface DashboardAccountMap {
 
 /**
  * Normalise the provider from `useProviderContext` into the
- * dashboard wire form.  RACKSPACE is not in scope for the
- * executive dashboard today; we treat it as out-of-range so the
- * caller's branch renders a friendly unavailable message rather
- * than a blank page.
+ * dashboard wire form.  Phase 9D.1 — RACKSPACE is now a fully
+ * supported dashboard provider (canonical costs, resources and
+ * recommendations all report SUPPORTED through
+ * ``/api/cloud/providers``); it is no longer treated as
+ * out-of-range.
  */
 export function asDashboardProvider(provider: ProviderKind): DashboardProvider | null {
-  if (provider === 'AWS' || provider === 'AZURE') return provider
+  if (provider === 'AWS' || provider === 'AZURE' || provider === 'RACKSPACE') {
+    return provider
+  }
   return null
 }
 
@@ -63,10 +66,12 @@ export function asDashboardProvider(provider: ProviderKind): DashboardProvider |
  * Returning a literal (not a `string`) keeps the type checker
  * honest at the call site.
  */
-export function providerSlug(provider: ProviderKind): 'aws' | 'azure' | null {
+export function providerSlug(provider: ProviderKind): 'aws' | 'azure' | 'rackspace' | null {
   const wire = asDashboardProvider(provider)
   if (wire === null) return null
-  return wire === 'AZURE' ? 'azure' : 'aws'
+  if (wire === 'AZURE') return 'azure'
+  if (wire === 'RACKSPACE') return 'rackspace'
+  return 'aws'
 }
 
 /**
@@ -85,7 +90,9 @@ export function friendlyScopeLabel(
   accounts: DashboardAccountMap,
 ): string {
   if (selection === 'all' || selection === null) {
-    return accounts.wire === 'AZURE' ? 'All Azure Subscriptions' : 'All AWS Accounts'
+    if (accounts.wire === 'AZURE') return 'All Azure Subscriptions'
+    if (accounts.wire === 'RACKSPACE') return 'All Rackspace Cloud Accounts'
+    return 'All AWS Accounts'
   }
   const row = findAccountRow(selection, accounts)
   if (row) return row.display_name
@@ -98,7 +105,9 @@ export function friendlyScopeLabel(
   if (selection.startsWith('acct:')) {
     return `Account ${selection.slice('acct:'.length)}`
   }
-  return accounts.wire === 'AZURE' ? 'Azure Subscription' : 'AWS Account'
+  if (accounts.wire === 'AZURE') return 'Azure Subscription'
+  if (accounts.wire === 'RACKSPACE') return 'Rackspace Cloud Account'
+  return 'AWS Account'
 }
 
 /**
@@ -120,9 +129,13 @@ export function friendlyScopeMaskedId(
  * carried and the Azure-specific copy the new dashboard carried.
  */
 export function providerSubtitle(provider: DashboardProvider): string {
-  return provider === 'AZURE'
-    ? 'Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
-    : 'AWS cost visibility, optimization and AI-powered FinOps analysis.'
+  if (provider === 'AZURE') {
+    return 'Azure cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
+  }
+  if (provider === 'RACKSPACE') {
+    return 'Rackspace cost visibility, resource inventory, optimization and AI-powered FinOps analysis.'
+  }
+  return 'AWS cost visibility, optimization and AI-powered FinOps analysis.'
 }
 
 /**

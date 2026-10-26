@@ -149,4 +149,89 @@ describe('CostsPage', () => {
       expect(calls.some((c) => c.includes(`month=${target}`))).toBe(true)
     })
   })
+
+  // Phase 9D.1 — Rackspace renders through the canonical
+  // /api/cloud/costs route with honest billing-cycle semantics:
+  // the ACTUAL source period is labelled as a billing cycle (never
+  // a calendar month), and unsupported dimensions (daily trend,
+  // regional breakdown, previous-period comparison) render a
+  // professional unavailable state instead of fabricated zeros.
+  it('renders Rackspace costs with billing-cycle wording and unavailable dimensions', async () => {
+    window.sessionStorage.setItem('cd.provider.selection.v1', 'RACKSPACE')
+    window.sessionStorage.setItem('cd.account.selection.v1', 'all')
+    const calls: string[] = []
+    const rackspaceEnvelope = {
+      report: {
+        provider: 'RACKSPACE',
+        scope: 'all',
+        scope_kind: 'all',
+        status: 'SUCCESS',
+        currency_status: 'OK',
+        account_id: null,
+        account_display_name: null,
+        period: { start: '2026-10-01', end: '2026-11-01', days: 31 },
+        previous_period: { start: '2026-09-01', end: '2026-10-01', days: 30 },
+        currency: 'USD',
+        total_cost: '2475.50',
+        previous_period_cost: null,
+        change_amount: null,
+        change_percent: null,
+        estimated: true,
+        daily_trend: [],
+        by_service: [
+          { service: 'Cloud Servers', amount: '1500.25', unit: 'USD' },
+          { service: 'Cloud Files', amount: '975.25', unit: 'USD' },
+        ],
+        by_region: [],
+        by_account: [
+          { account_id: '123456', display_name: 'Rackspace Cloud Account', amount: '2475.50', currency: 'USD' },
+        ],
+        account_errors: [],
+        successful_accounts: 1,
+        failed_accounts: 0,
+        source: 'RACKSPACE_BILLING',
+        previous_period_unavailable: true,
+      },
+      cache_status: 'MISS',
+      cached_at: '2026-10-26T10:00:00Z',
+      expires_at: null,
+    }
+    const transport = vi.fn(async (path: string) => {
+      calls.push(path)
+      if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
+      if (path.startsWith('/api/cloud/accounts/selectable/')) {
+        return mockJson(200, { items: [], count: 0 })
+      }
+      if (path.startsWith('/api/cloud/costs')) {
+        // Must be the canonical provider-neutral route with
+        // provider=RACKSPACE — never a legacy AWS route.
+        expect(path).toContain('provider=RACKSPACE')
+        return mockJson(200, rackspaceEnvelope)
+      }
+      return mockJson(404, {})
+    })
+    configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
+    wrap(<CostsPage />)
+
+    // Current billing-cycle total renders.
+    expect(await screen.findByText('$2.48K')).toBeInTheDocument()
+    // The page header / KPI label the ACTUAL source cycle — never a
+    // calendar month name.
+    const cycleLabels = await screen.findAllByText('Billing cycle Oct 1, 2026 – Oct 31, 2026')
+    expect(cycleLabels.length).toBeGreaterThan(0)
+    // Unsupported dimensions render the professional unavailable
+    // state — no fabricated chart, no zero-filled regions.
+    expect(screen.getByTestId('rackspace-daily-trend-unavailable')).toBeInTheDocument()
+    expect(screen.getByTestId('rackspace-region-unavailable')).toBeInTheDocument()
+    expect(screen.queryByTestId('cost-trend-chart')).not.toBeInTheDocument()
+    expect(screen.getByText('Not available for the current Rackspace Billing integration. Rackspace Billing reports estimated charges for the current billing cycle without a daily breakdown.')).toBeInTheDocument()
+    // Previous-period comparison is unsupported — an honest
+    // "unavailable", not a fabricated 0%.
+    expect(screen.getByText('Previous period unavailable')).toBeInTheDocument()
+    // The service breakdown (an authoritative dimension) renders.
+    expect(screen.getAllByText('Cloud Servers').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Cloud Files').length).toBeGreaterThan(0)
+    // Only the canonical route was queried for costs.
+    expect(calls.some((c) => c.startsWith('/api/aws/costs'))).toBe(false)
+  })
 })
