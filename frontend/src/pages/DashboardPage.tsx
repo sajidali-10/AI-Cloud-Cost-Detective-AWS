@@ -70,6 +70,7 @@ import {
   providerSubtitle,
   type DashboardProvider,
 } from '../lib/finops/dashboardScope'
+import { buildAccountSelector, friendlyAccountScopeErrorMessage } from '../lib/finops/subscriptionSelection'
 import {
   fetchCloudCostReport,
   adaptCloudCostReport,
@@ -105,6 +106,7 @@ import {
   parseDecimal,
 } from '../lib/format'
 import type {
+  BillingPeriod,
   CostReportResponse,
   RegionCost,
   ServiceCost,
@@ -176,20 +178,32 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
 
   const cacheProvider: CacheProvider =
     provider === 'AZURE' ? 'azure' : provider === 'RACKSPACE' ? 'rackspace' : 'aws'
-  const effectiveRegion = region === 'all' ? null : region
+  // Phase 9D.1 closure — Rackspace Billing answers only for the
+  // CURRENT billing cycle and has no authoritative regional cost
+  // dimension (charges are scoped to the billing account).  A
+  // month / region persisted while another provider was active
+  // must never reach a Rackspace cost query: force the effective
+  // period to the current month and the region to account-level
+  // (null).  AWS / Azure behaviour is unchanged.
+  const effectivePeriod: BillingPeriod =
+    provider === 'RACKSPACE' ? { kind: 'month', month: currentMonth } : period
+  const effectiveRegion: string | null =
+    provider === 'RACKSPACE' ? null : region === 'all' ? null : region
 
   // Build a provider-aware account map for friendly attribution.
   // Mirrors the pattern OptimizationPage established in Phase 7D.2:
-  //   * AWS rows  → selector "acct:<local-row-id>"
+  //   * AWS rows  → selector "acct:<cloud account_id>"
   //   * Azure rows → selector "sub:<guid>"
-  // The raw account_id carried by the recommendation payload is
-  // kept separately so the lookup can resolve recommendation rows.
+  //   * Rackspace rows → selector "acct:<cloud account_id>"
+  // Phase 9D.1 — attribution selectors go through the shared
+  // canonical mapping; the local database row id is a backend-only
+  // key and never becomes a cloud selector.
   const accountMap = useMemo(
     () =>
       accounts
         .filter((row): row is SelectableAccount => row != null)
         .map((row) => ({
-          selector: provider === 'AZURE' ? `sub:${row.account_id}` : `acct:${row.id}`,
+          selector: buildAccountSelector(row, provider),
           rawAccountId: row.account_id,
           displayName: row.display_name,
           provider,
@@ -243,7 +257,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
   // selections never share a cache entry.  This is the
   // "cache isolation" invariant from spec step 25.
   const scopeSegment = dashboardScopeCacheSegment(selection, provider)
-  const costsKey = `${scopeSegment}:costs:${periodToKey(period)}:${effectiveRegion ?? 'all'}`
+  const costsKey = `${scopeSegment}:costs:${periodToKey(effectivePeriod)}:${effectiveRegion ?? 'all'}`
   const resourcesKey = `${scopeSegment}:resources:gen${generation}`
   const recsKey = `${scopeSegment}:recommendations:gen${generation}`
 
@@ -258,7 +272,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
     costsKey,
     async () => {
       const startGen = generationRef.current
-      const response = await fetchCloudCostReport(period, {
+      const response = await fetchCloudCostReport(effectivePeriod, {
         provider,
         region: effectiveRegion,
         accountId: selection,
@@ -458,7 +472,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
         <SpendKpi
           report={cost.entry.data?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
           providerLabel={provider === 'AZURE' ? 'Total Spend' : 'Total Spend'}
           lastGood={cost.entry.lastGood?.report ?? null}
           stale={!!cost.entry.error && !!cost.entry.lastGood}
@@ -468,7 +482,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
         <ChangeKpi
           report={cost.entry.data?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
         />
         <ResourcesKpi
           resources={resources.entry.data ?? null}
@@ -508,7 +522,8 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
             message={
               cost.entry.lastGood
                 ? 'Showing last known good data while the upstream recovers.'
-                : `${providerCostSourceLabel(provider)} request failed.`
+                : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                  `${providerCostSourceLabel(provider)} request failed.`
             }
           />
         ) : provider === 'RACKSPACE' && cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
@@ -558,7 +573,12 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           ) : cost.entry.error && !cost.entry.data ? (
             <ErrorState
               title="Service breakdown unavailable"
-              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Service breakdown request failed.'}
+              message={
+                cost.entry.lastGood
+                  ? 'Showing last known good data.'
+                  : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                    'Service breakdown request failed.'
+              }
             />
           ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             <HorizontalBarChart
@@ -586,7 +606,12 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           ) : cost.entry.error && !cost.entry.data ? (
             <ErrorState
               title="Region breakdown unavailable"
-              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Region breakdown request failed.'}
+              message={
+                cost.entry.lastGood
+                  ? 'Showing last known good data.'
+                  : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                    'Region breakdown request failed.'
+              }
             />
           ) : provider === 'RACKSPACE' && cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             // Phase 9D.1 — regional granularity is an unsupported
@@ -628,6 +653,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           envelope={recommendationEnvelope}
           loading={recommendations.entry.status === 'loading'}
           error={recommendations.entry.error}
+          provider={provider}
         />
       </div>
     </div>
@@ -1020,7 +1046,11 @@ function ResourceSummaryCard({
       {loading && !resources ? (
         <LoadingSkeletonRows rows={4} />
       ) : error && !resources ? (
-        <ErrorState message={error.message} />
+        <ErrorState
+          message={
+            friendlyAccountScopeErrorMessage(error, provider) ?? error.message
+          }
+        />
       ) : resources ? (
         <div className="space-y-3" data-testid="dashboard-resource-summary">
           <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
@@ -1071,12 +1101,14 @@ interface OptimizationSummaryCardProps {
   envelope: ReturnType<typeof buildUnifiedEnvelope> | null
   loading: boolean
   error: Error | null
+  provider: DashboardProvider
 }
 
 function OptimizationSummaryCard({
   envelope,
   loading,
   error,
+  provider,
 }: OptimizationSummaryCardProps) {
   const topSources = useMemo(() => {
     if (!envelope) return [] as Array<{ key: string; label: string; count: number }>
@@ -1104,7 +1136,11 @@ function OptimizationSummaryCard({
       {loading && !envelope ? (
         <LoadingSkeletonRows rows={4} />
       ) : error && !envelope ? (
-        <ErrorState message={error.message} />
+        <ErrorState
+          message={
+            friendlyAccountScopeErrorMessage(error, provider) ?? error.message
+          }
+        />
       ) : envelope ? (
         <div className="space-y-3" data-testid="optimization-summary">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">

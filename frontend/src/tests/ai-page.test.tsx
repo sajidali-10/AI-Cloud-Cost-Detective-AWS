@@ -13,6 +13,8 @@ import { Router, Routes, useLocation, useNavigate } from '../lib/router'
 import { __resetApiForTests, configureApi } from '../lib/api'
 import { invalidateCache } from '../lib/finops/store'
 import { FinopsPeriodProvider } from '../lib/finops/period'
+import { ProviderProvider } from '../lib/providerContext'
+import { AccountProvider } from '../lib/accountContext'
 import { AIAnalystPage } from '../pages/AIAnalystPage'
 import {
   __setWebSocketFactoryForTests as __setWS,
@@ -261,9 +263,13 @@ function renderAnalyst(handlers: Parameters<typeof buildHarness>[0] = {}) {
     <ThemeProvider>
       <Router>
         <AuthProvider>
-          <FinopsPeriodProvider initialDays={30}>
-            <App />
-          </FinopsPeriodProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider initialDays={30}>
+                <App />
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </Router>
     </ThemeProvider>,
@@ -326,9 +332,13 @@ describe('AIAnalystPage', () => {
       <ThemeProvider>
         <Router>
           <AuthProvider>
-            <FinopsPeriodProvider initialDays={30}>
-              <App />
-            </FinopsPeriodProvider>
+            <ProviderProvider>
+              <AccountProvider>
+                <FinopsPeriodProvider initialDays={30}>
+                  <App />
+                </FinopsPeriodProvider>
+              </AccountProvider>
+            </ProviderProvider>
           </AuthProvider>
         </Router>
       </ThemeProvider>,
@@ -512,9 +522,13 @@ describe('AIAnalystPage', () => {
       <ThemeProvider>
         <Router>
           <AuthProvider>
-            <FinopsPeriodProvider initialDays={30}>
-              <ViewerApp />
-            </FinopsPeriodProvider>
+            <ProviderProvider>
+              <AccountProvider>
+                <FinopsPeriodProvider initialDays={30}>
+                  <ViewerApp />
+                </FinopsPeriodProvider>
+              </AccountProvider>
+            </ProviderProvider>
           </AuthProvider>
         </Router>
       </ThemeProvider>,

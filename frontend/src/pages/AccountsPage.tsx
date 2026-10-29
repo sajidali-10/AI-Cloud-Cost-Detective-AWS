@@ -27,6 +27,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiFetch, ApiError } from '../lib/api'
 import { useAuth } from '../lib/auth'
 import { useAccountContext } from '../lib/accountContext'
+import { accountMatchesSelector, type CanonicalProvider } from '../lib/finops/subscriptionSelection'
 import { useProviderContext } from '../lib/providerContext'
 
 interface CloudAccount {
@@ -339,7 +340,14 @@ export function AccountsPage() {
         'delete',
         `${row.display_name} permanently deleted`,
       )
-      if (selection === `acct:${row.id}`) {
+      // Phase 9D.1 — the selection carries the CLOUD-side account
+      // id (acct:<account_id> / sub:<guid>), not the local row id,
+      // so match on account_id through the shared helper.
+      const rowProvider: CanonicalProvider | null =
+        row.provider === 'AWS' || row.provider === 'AZURE' || row.provider === 'RACKSPACE'
+          ? row.provider
+          : null
+      if (rowProvider && accountMatchesSelector(row, selection, rowProvider)) {
         setSelection('all')
       }
       await refresh()

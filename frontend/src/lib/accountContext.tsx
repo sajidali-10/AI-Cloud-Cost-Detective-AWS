@@ -28,17 +28,19 @@ import {
 } from 'react'
 import { apiFetch } from './api'
 import { useProviderContext } from './providerContext'
+import { accountMatchesSelector } from './finops/subscriptionSelection'
 
-// Hotfix #2 — the Azure selector carries the canonical
-// subscription GUID (e.g. ``sub:<guid>``), NOT the local database
-// row id (``acct:<n>``).  AWS keeps ``acct:<n>`` because the AWS
-// route already maps local row id → role ARN via the legacy
-// Phase 7B resolver.  Azure routes use the GUID directly to look
-// up the subscription through ARM / Cost Management / Resource
-// Graph / Advisor.
+// Phase 9D.1 — the selector carries the CLOUD-side account id
+// for every provider: AWS and Rackspace emit
+// ``acct:<account_id>`` (the 12-digit AWS account number /
+// Rackspace account id carried by the registry row's
+// ``account_id`` — NEVER the local database row id, which is a
+// backend-only key), Azure emits ``sub:<subscription-guid>``
+// (ARM / Cost Management / Resource Graph / Advisor all resolve
+// the GUID).
 export type AccountSelection =
   | 'all'
-  | `acct:${number}`
+  | `acct:${string}`
   | `sub:${string}`
 
 export interface SelectableAccount {
@@ -70,7 +72,11 @@ function readStoredSelection(): AccountSelection {
     const raw = window.sessionStorage.getItem(STORAGE_KEY)
     if (!raw) return 'all'
     if (raw === 'all') return 'all'
-    if (/^acct:\d+$/.test(raw)) return raw as AccountSelection
+    // Phase 9D.1 — ``acct:`` selectors carry the cloud-side
+    // account id (AWS account number / Rackspace account id),
+    // which need not be numeric-only forever; accept any
+    // compact token.  Azure GUIDs ride under ``sub:``.
+    if (/^acct:[A-Za-z0-9][A-Za-z0-9_-]*$/.test(raw)) return raw as AccountSelection
     // Hotfix #2 — also accept the Azure canonical selector.
     if (/^sub:[0-9a-fA-F-]{8,}$/.test(raw)) return raw as AccountSelection
     return 'all'
@@ -201,6 +207,28 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     }
     return undefined
   }, [])
+
+  // Phase 9D.1 — session-rehydration guard (closure fix).  Once
+  // the rows for the ACTIVE provider have loaded, a persisted
+  // selection that refers to no row of THIS provider is stale: a
+  // pre-9D.1 database-row-id selector (``acct:7``), a selector
+  // that belongs to a different provider (``sub:<guid>`` under
+  // AWS / RACKSPACE), or a since-deleted account.  Reset to the
+  // provider-wide aggregate instead of submitting it to a
+  // canonical API where it can only fail with AccountNotFound.
+  // Only validates once rows exist — an empty list before the
+  // first fetch completes proves nothing either way.
+  useEffect(() => {
+    if (accounts.length === 0) return
+    if (selection === 'all') return
+    const stillValid = accounts.some((row) =>
+      accountMatchesSelector(row, selection, provider),
+    )
+    if (!stillValid) {
+      _setSelection('all')
+      writeStoredSelection('all')
+    }
+  }, [selection, accounts, provider])
 
   const value = useMemo<AccountContextValue>(() => {
     return {

@@ -35,6 +35,7 @@ import { useFinopsQuery } from '../lib/finops/store'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import { useFinopsPeriod } from '../lib/finops/period'
 import { useAccountContext } from '../lib/accountContext'
+import { buildAccountSelector } from '../lib/finops/subscriptionSelection'
 import { useProviderContext } from '../lib/providerContext'
 import {
   buildCloudRecommendationsCacheKey,
@@ -151,8 +152,12 @@ export function OptimizationPage() {
   // Build the accountMap for friendly attribution only (not sent
   // to the backend).  Each entry is the provider's *canonical*
   // selector string, mirroring what the AccountSelector emits:
-  //   * AWS  → acct:<local-row-id>
+  //   * AWS  → acct:<cloud account_id>
   //   * Azure → sub:<guid>
+  //   * Rackspace → acct:<cloud account_id>
+  // Phase 9D.1 — built through the shared ``buildAccountSelector``
+  // mapping; the local database row id is a backend-only key and
+  // never becomes a cloud selector.
   // We also store the raw account / subscription id so the lookup
   // can resolve the recommendation row's `account_id` field, which
   // carries the raw id (e.g. AWS account id `974053642038` or
@@ -160,8 +165,7 @@ export function OptimizationPage() {
   const accountMap: AccountMapEntry[] = useMemo(
     () =>
       accounts.map((a) => ({
-        selector:
-          provider === 'AZURE' ? `sub:${a.account_id}` : `acct:${a.id}`,
+        selector: buildAccountSelector(a, provider),
         rawAccountId: a.account_id,
         displayName: a.display_name,
         provider: provider,

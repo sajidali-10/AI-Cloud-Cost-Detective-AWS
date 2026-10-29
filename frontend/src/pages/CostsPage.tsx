@@ -69,6 +69,7 @@ import {
   parseDecimal,
 } from '../lib/format'
 import { regionRows, billingCycleLabel, providerCostSourceLabel, UnavailableDimensionNotice } from './DashboardPage'
+import { friendlyAccountScopeErrorMessage } from '../lib/finops/subscriptionSelection'
 
 function periodDisplay(period: BillingPeriod): string {
   return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
@@ -85,10 +86,21 @@ function providerSubtitle(provider: string): string {
 }
 
 export function CostsPage() {
-  const { period, region } = useFinopsPeriod()
+  const { period, region, currentMonth } = useFinopsPeriod()
   const { selection } = useAccountContext()
   const { provider, providerSlug, providerVersion } = useProviderContext()
-  const effectiveRegion = region === 'all' ? null : region
+  // Phase 9D.1 closure — Rackspace Billing answers only for the
+  // CURRENT billing cycle and has no authoritative regional cost
+  // dimension (charges are scoped to the billing account, not a
+  // datacenter).  A month / region persisted while another
+  // provider was active must never reach a Rackspace cost query:
+  // force the effective period to the current month and the
+  // region to account-level (null).  AWS / Azure behaviour is
+  // unchanged.
+  const effectivePeriod: BillingPeriod =
+    provider === 'RACKSPACE' ? { kind: 'month', month: currentMonth } : period
+  const effectiveRegion: string | null =
+    provider === 'RACKSPACE' ? null : region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
     : providerSlug === 'rackspace'
@@ -126,16 +138,16 @@ export function CostsPage() {
 
   const cost = useFinopsQuery<CostReportResponse>(
     useCanonical
-      ? buildCloudCostsCacheKey(period, effectiveRegion, selection, cacheProvider)
-      : buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
+      ? buildCloudCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider)
+      : buildCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider),
     () =>
       useCanonical
-        ? fetchCloudCostReport(period, {
+        ? fetchCloudCostReport(effectivePeriod, {
             provider,
             region: effectiveRegion,
             accountId: selection,
           }).then(adaptCloudCostReport)
-        : fetchCostReport(period, {
+        : fetchCostReport(effectivePeriod, {
             region: effectiveRegion,
             accountId: selection,
           }),
@@ -212,7 +224,10 @@ export function CostsPage() {
       {cost.entry.error && !cost.entry.data && !hasLastGood && (
         <ErrorState
           title="Could not load costs"
-          message={sanitiseUserMessage(cost.entry.error.message)}
+          message={
+            friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+            sanitiseUserMessage(cost.entry.error.message)
+          }
           onRetry={cost.refresh}
         />
       )}
@@ -222,7 +237,7 @@ export function CostsPage() {
           report={report}
           lastGood={cost.entry.lastGood?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
           stale={showStale}
           freshness={deriveDataFreshness(cost.entry.data)}
           labelOverride={provider === 'RACKSPACE' ? rackspaceCycleLabel : null}
@@ -230,7 +245,7 @@ export function CostsPage() {
         <ChangeKpi
           report={renderableReport}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
         />
         <TopServiceKpi
           report={renderableReport}
@@ -254,7 +269,10 @@ export function CostsPage() {
         ) : cost.entry.error && !cost.entry.data && !hasLastGood ? (
           <ErrorState
             title="Cost trend unavailable"
-            message={`${providerCostSourceLabel(provider)} request failed.`}
+            message={
+              friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+              `${providerCostSourceLabel(provider)} request failed.`
+            }
           />
         ) : provider === 'RACKSPACE' && renderableReport ? (
           // Phase 9D.1 — daily granularity is an unsupported

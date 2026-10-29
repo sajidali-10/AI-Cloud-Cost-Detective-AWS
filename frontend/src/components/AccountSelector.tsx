@@ -8,6 +8,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAccountContext, AccountSelection } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
+import {
+  buildAccountSelector,
+  accountMatchesSelector,
+  providerAccountNoun,
+  providerAggregateLabel,
+} from '../lib/finops/subscriptionSelection'
+import type { CanonicalProvider } from '../lib/finops/subscriptionSelection'
 
 interface AccountSelectorProps {
   className?: string
@@ -63,26 +70,34 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
   }, [open])
 
   const isAzure = provider === 'AZURE'
-  const aggregateLabel = isAzure ? 'All Azure Subscriptions' : 'All AWS Accounts'
-  const rowLabel = isAzure ? 'Azure Subscription' : 'AWS Account'
+  // Phase 9D.1 — provider-aware labels via the shared mapping
+  // helpers (single source of truth).  RACKSPACE renders
+  // "Rackspace Account" / "All Rackspace Cloud Accounts" — never
+  // the AWS wording the pre-9D.1 build showed.
+  const aggregateLabel = providerAggregateLabel(provider as CanonicalProvider)
+  const rowLabel = providerAccountNoun(provider as CanonicalProvider)
 
   const label = useMemo(() => {
     if (selection === 'all') return aggregateLabel
-    // Hotfix #2 — Azure selections are tagged ``sub:<guid>``.
-    // Find the matching row by its Azure subscription GUID and
-    // fall back to a generic ``Subscription <id>`` label when the
-    // row is no longer in the visible list (e.g. just-disabled).
+    // Find the matching row by its CLOUD-side account id (the
+    // canonical selector contract) — never by the local database
+    // row id.  Works for ``acct:<account_id>`` (AWS / Rackspace)
+    // and ``sub:<guid>`` (Azure) alike.
+    const found = visibleAccounts.find((a) =>
+      accountMatchesSelector(a, selection, provider as CanonicalProvider),
+    )
+    if (found) return `${found.display_name} — ${found.account_id}`
+    // Unknown / self-corrected selection — show the identifier
+    // shape without pretending it matched a registered row.
     if (isAzure && selection.startsWith('sub:')) {
       const guid = selection.slice('sub:'.length)
-      const found = visibleAccounts.find((a) => a.account_id === guid)
-      if (found) return `${found.display_name} — ${found.account_id}`
       return `Subscription ${guid}`
     }
-    const id = selection.replace(/^acct:/, '')
-    const found = visibleAccounts.find((a) => String(a.id) === id)
-    if (found) return `${found.display_name} — ${found.account_id}`
-    return `${isAzure ? 'Subscription' : 'Account'} ${id}`
-  }, [selection, visibleAccounts, aggregateLabel, isAzure])
+    if (selection.startsWith('acct:')) {
+      return `Account ${selection.slice('acct:'.length)}`
+    }
+    return selection
+  }, [selection, visibleAccounts, aggregateLabel, isAzure, provider])
 
   function pick(value: AccountSelection) {
     setSelection(value)
@@ -150,16 +165,12 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
             <li className="my-1 border-t border-border" />
           )}
           {visibleAccounts.map((acc) => {
-            // Hotfix #2 — Azure selections carry the canonical
-            // ``sub:<subscription-guid>`` selector; AWS keeps the
-            // legacy ``acct:<row-id>`` selector (the AWS route maps
-            // row id → role ARN).  The canonical GUID never collides
-            // with the local database row id so the canonical Azure
-            // APIs (Cost / Resources / Recommendations) resolve the
-            // right subscription.
-            const value = (isAzure
-              ? `sub:${acc.account_id}`
-              : `acct:${acc.id}`) as AccountSelection
+            // Phase 9D.1 — every provider selection goes through
+            // the shared canonical mapping: AWS and Rackspace emit
+            // ``acct:<cloud account_id>`` (the registry row's
+            // cloud-side id — NEVER the local database primary
+            // key), Azure emits ``sub:<subscription-guid>``.
+            const value = buildAccountSelector(acc, provider as CanonicalProvider)
             const testId = isAzure
               ? `azure-sub-option-${acc.id}`
               : `account-option-${acc.id}`
@@ -192,7 +203,9 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
             <li className="px-3 py-2 text-xs text-fg-muted">
               {isAzure
                 ? 'No Azure subscriptions registered yet. Ask an ADMIN to add one.'
-                : 'No AWS accounts registered yet. Ask an ADMIN to add one.'}
+                : provider === 'RACKSPACE'
+                  ? 'No Rackspace accounts registered yet. Ask an ADMIN to add one.'
+                  : 'No AWS accounts registered yet. Ask an ADMIN to add one.'}
             </li>
           )}
           {loading && (

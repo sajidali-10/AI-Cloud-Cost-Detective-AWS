@@ -156,12 +156,24 @@ export function dashboardScopeCacheSegment(
   if (provider === 'AZURE' && selection.startsWith('acct:')) {
     return 'azure:all'
   }
+  // Phase 9D.1 — coerce a stale Azure ``sub:<guid>`` under
+  // AWS / RACKSPACE to the aggregate segment too (symmetric
+  // self-correction; a cross-provider selector must never
+  // namespace a cache entry for the wrong provider).
+  if (provider !== 'AZURE' && selection.startsWith('sub:')) {
+    return `${provider.toLowerCase()}:all`
+  }
   return `${provider.toLowerCase()}:${selection}`
 }
 
 /**
  * Return the row from the selectable-account map that matches the
  * given selection, or null when there is no match.
+ *
+ * Phase 9D.1 — matching is on the CLOUD-side ``account_id`` for
+ * every provider (AWS account number, Azure subscription GUID,
+ * Rackspace account id).  The local database row id is a
+ * backend-only key and never identifies a selection here.
  */
 export function findAccountRow(
   selection: DashboardSelection,
@@ -169,16 +181,13 @@ export function findAccountRow(
 ): SelectableAccount | null {
   if (selection === 'all' || selection === null) return null
   const rows = accounts.rows
-  // For Azure selections (sub:<guid>) match by raw account_id
-  // (which is the GUID, NOT the local row id).  For AWS
-  // selections (acct:<n>) match by local row id.
   if (selection.startsWith('sub:')) {
     const guid = selection.slice('sub:'.length)
     return rows.find((r) => r.account_id === guid) ?? null
   }
   if (selection.startsWith('acct:')) {
-    const id = Number(selection.slice('acct:'.length))
-    return rows.find((r) => r.id === id) ?? null
+    const id = selection.slice('acct:'.length)
+    return rows.find((r) => r.account_id === id) ?? null
   }
   return null
 }

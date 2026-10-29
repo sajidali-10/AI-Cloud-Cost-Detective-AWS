@@ -143,7 +143,7 @@ describe('Hotfix #2 ROOT CAUSE A — Azure subscription selection', () => {
     expect(stored).not.toBe('acct:5')
   })
 
-  it('AccountSelector still emits acct:<id> for AWS rows (unchanged)', async () => {
+  it('AccountSelector emits acct:<cloud account_id> for AWS rows (Phase 9D.1 canonical contract)', async () => {
     const { AccountSelector } = await import('../components/AccountSelector')
     const { authDisabledElement } = await import('./helpers/auth-bootstrap')
     const { render, fireEvent, waitFor } = await import('@testing-library/react')
@@ -201,7 +201,9 @@ describe('Hotfix #2 ROOT CAUSE A — Azure subscription selection', () => {
     await waitFor(() => expect(screen.getByTestId('account-option-3')).toBeTruthy())
     fireEvent.click(screen.getByTestId('account-option-3'))
     const stored = window.sessionStorage.getItem('cd.account.selection.v1')
-    expect(stored).toBe('acct:3')
+    // Phase 9D.1 — the selection carries the CLOUD-side AWS
+    // account number, never the local database row id (3).
+    expect(stored).toBe('acct:123456789012')
   })
 
   it('stale acct:<n> selection under Azure self-corrects (never sent as acct:5)', () => {
