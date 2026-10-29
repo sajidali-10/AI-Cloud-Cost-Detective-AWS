@@ -31,6 +31,21 @@
 #         - RS-VOL-001 advisory (review semantics, no destructive actions)
 #         - ACTIVE servers produce zero recommendations (no false rightsizing)
 #
+#   Account-selector contract (dynamic, derived at runtime — the
+#   provider ``account_id`` is read from ``selectable/{provider}``;
+#   no registry row id, tenant number or AWS account is hardcoded)
+#     * RACKSPACE: acct:<account_id> scopes costs / resources /
+#       recommendations — all 200, scope echoed as single, never
+#       AccountNotFound (one automatic retry on 5xx is classified as
+#       an upstream transient)
+#     * AWS: one acct:<account_id> scoped costs call (smallest
+#       sufficient proof; avoids extra Cost Explorer spend)
+#     * AZURE: sub:<account_id> semantics preserved — selectable row
+#       carries a GUID subscription id and every canonical router maps
+#       AZURE -> ``sub:``; no extra Cost Management call is made here
+#       (live Azure surfaces are covered by the Phase 7D.5 gate and
+#       Cost Management has shown 429 throttling)
+#
 #   Frontend source contracts (static, no brittle assertions where
 #   component tests already provide stronger evidence)
 #     * RACKSPACE is a selectable provider in the frontend provider context
@@ -395,7 +410,156 @@ print(json.dumps({
 info "live envelope: $LIVE_INFO"
 
 # ---------------------------------------------------------------------------
-# Step 5: frontend source contracts (static, deterministic).
+# Step 5: account-selector contract — dynamic, derived at runtime.
+#
+# The selector is ALWAYS built from the provider ``account_id`` returned by
+# ``/api/cloud/accounts/selectable/{provider}`` — never from the registry
+# row ``id`` and never from a hardcoded tenant / account number.
+# ---------------------------------------------------------------------------
+
+bold ""
+bold "Account-selector contract (dynamic — provider account_id, never row id)"
+
+# Extracts the FIRST selectable item's provider account_id (never .id).
+read_selector_account_id() {
+    "$REPO_ROOT/backend/.venv/bin/python" -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+items = d.get('items') or []
+if not items:
+    sys.exit(1)
+row = items[0]
+account = row.get('account_id')
+if not account:
+    sys.exit(1)
+print(account)
+"
+}
+
+# One scoped canonical probe.  A single automatic retry on 5xx is
+# classified as an upstream transient (Rackspace Billing 500s recover);
+# probing never loops beyond that one retry.
+PROBE_CODE=000
+PROBE_JSON=""
+PROBE_RETRIED=0
+scoped_probe() {
+    local url="$1" raw code json attempt
+    PROBE_RETRIED=0
+    for attempt in 1 2; do
+        raw="$(auth -w '\n%{http_code}\n' "$url" 2>/dev/null)"
+        code="$(echo "$raw" | tail -1 | tr -d '[:space:]')"
+        json="$(echo "$raw" | sed '$d' | grep -m1 '^{')"
+        if [[ "$code" != 5?? ]]; then break; fi
+        if [[ $attempt -eq 1 ]]; then PROBE_RETRIED=1; sleep 3; fi
+    done
+    PROBE_CODE="$code"
+    PROBE_JSON="$json"
+}
+
+# Asserts the scoped envelope: HTTP 200, provider + status valid, and the
+# scope echoed back is exactly the selector we sent (scope_kind=single).
+# Failure text distinguishes a rejected selector (AccountNotFound).
+#   $1 = label, $2 = provider, $3 = selector
+assert_scoped_surface() {
+    local label="$1" provider="$2" selector="$3" verdict
+    if [[ "$PROBE_CODE" != "200" || -z "$PROBE_JSON" ]]; then
+        if [[ "$PROBE_JSON" == *AccountNotFound* ]]; then
+            bad "$label -> $PROBE_CODE AccountNotFound (selector rejected)"
+        else
+            bad "$label -> $PROBE_CODE (expected 200)"
+        fi
+        return
+    fi
+    verdict="$(printf '%s\n' "$PROBE_JSON" | "$REPO_ROOT/backend/.venv/bin/python" -c "
+import json, sys
+d = json.load(sys.stdin)
+env = d.get('report') or d.get('summary') or {}
+status = env.get('status')
+ok = (
+    env.get('provider') == '$provider'
+    and env.get('scope') == '$selector'
+    and env.get('scope_kind') == 'single'
+    and status in ('SUCCESS', 'NO_DATA', 'PARTIAL_SUCCESS')
+)
+if ok:
+    print('OK')
+else:
+    print('MISMATCH provider=%r scope=%r scope_kind=%r status=%r'
+          % (env.get('provider'), env.get('scope'),
+             env.get('scope_kind'), status))
+" 2>/dev/null)"
+    if [[ "$verdict" == "OK" ]]; then
+        if [[ $PROBE_RETRIED -eq 1 ]]; then
+            ok "$label -> 200, scope=$selector (recovered after one upstream-transient retry)"
+        else
+            ok "$label -> 200, scope=$selector"
+        fi
+    else
+        bad "$label envelope $verdict"
+    fi
+}
+
+# ---- RACKSPACE: full costs + resources + recommendations scoped sweep -----
+SEL_RS_JSON="$(auth "$API/api/cloud/accounts/selectable/RACKSPACE" 2>/dev/null | grep -m1 '^{')"
+RS_ACCOUNT_ID="$(printf '%s\n' "$SEL_RS_JSON" | read_selector_account_id 2>/dev/null)"
+if [[ -z "$RS_ACCOUNT_ID" ]]; then
+    bad "selector contract: selectable/RACKSPACE returned no usable provider account_id"
+else
+    ok "selector contract: selectable/RACKSPACE yields provider account_id (registry row id not used)"
+    RS_SELECTOR="acct:$RS_ACCOUNT_ID"
+    info "selector contract: RACKSPACE selector derived dynamically -> $RS_SELECTOR"
+    scoped_probe "$API/api/cloud/costs?provider=RACKSPACE&account_id=$RS_SELECTOR"
+    assert_scoped_surface "selector costs(RACKSPACE)" "RACKSPACE" "$RS_SELECTOR"
+    scoped_probe "$API/api/cloud/resources?provider=RACKSPACE&account_id=$RS_SELECTOR"
+    assert_scoped_surface "selector resources(RACKSPACE)" "RACKSPACE" "$RS_SELECTOR"
+    scoped_probe "$API/api/cloud/recommendations?provider=RACKSPACE&account_id=$RS_SELECTOR"
+    assert_scoped_surface "selector recommendations(RACKSPACE)" "RACKSPACE" "$RS_SELECTOR"
+fi
+
+# ---- AWS: smallest sufficient canonical proof (one scoped costs call) ----
+SEL_AWS_JSON="$(auth "$API/api/cloud/accounts/selectable/AWS" 2>/dev/null | grep -m1 '^{')"
+AWS_ACCOUNT_ID="$(printf '%s\n' "$SEL_AWS_JSON" | read_selector_account_id 2>/dev/null)"
+if [[ -z "$AWS_ACCOUNT_ID" ]]; then
+    bad "selector contract: selectable/AWS returned no usable provider account_id"
+else
+    ok "selector contract: selectable/AWS yields provider account_id (registry row id not used)"
+    AWS_SELECTOR="acct:$AWS_ACCOUNT_ID"
+    scoped_probe "$API/api/cloud/costs?provider=AWS&account_id=$AWS_SELECTOR"
+    assert_scoped_surface "selector costs(AWS)" "AWS" "$AWS_SELECTOR"
+fi
+
+# ---- AZURE: sub:<subscription account_id> semantics preserved -------------
+# No additional live Cost Management call is made here — live Azure
+# canonical surfaces are covered by the Phase 7D.5 gate and Cost
+# Management has shown 429 throttling.  The contract is asserted where it
+# is cheap and deterministic: the selectable payload + the static prefix
+# mapping in every canonical router.
+SEL_AZ_JSON="$(auth "$API/api/cloud/accounts/selectable/AZURE" 2>/dev/null | grep -m1 '^{')"
+AZ_ACCOUNT_ID="$(printf '%s\n' "$SEL_AZ_JSON" | read_selector_account_id 2>/dev/null)"
+if [[ -z "$AZ_ACCOUNT_ID" ]]; then
+    bad "selector contract: selectable/AZURE returned no usable subscription account_id"
+else
+    AZ_SELECTOR="sub:$AZ_ACCOUNT_ID"
+    if [[ "$AZ_ACCOUNT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        ok "selector contract: selectable/AZURE yields a GUID subscription account_id (sub:<guid> semantics intact)"
+    else
+        bad "selector contract: selectable/AZURE account_id is not a subscription GUID ($AZ_SELECTOR)"
+    fi
+fi
+
+for router in cloud_costs cloud_resources cloud_recommendations; do
+    if grep -qE '== "sub:"|startswith\("sub:"\)|AZURE: "sub:"' "$REPO_ROOT/backend/app/api/$router.py" 2>/dev/null; then
+        ok "selector contract: $router maps AZURE -> sub:<subscription account_id>"
+    else
+        bad "selector contract: $router lost the AZURE sub: selector mapping"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Step 6: frontend source contracts (static, deterministic).
 # ---------------------------------------------------------------------------
 
 bold ""
@@ -461,7 +625,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: focused frontend tests (strongest contract evidence).
+# Step 7: focused frontend tests (strongest contract evidence).
 # ---------------------------------------------------------------------------
 
 bold ""
