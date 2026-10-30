@@ -40,7 +40,13 @@ import { HorizontalBarChart, type HorizontalBarRow } from '../components/Horizon
 import { LoadingSkeleton, LoadingSkeletonRows } from '../components/LoadingSkeleton'
 import { ErrorState } from '../components/ErrorState'
 import { useFinopsQuery, invalidateFinopsCacheKeepLastGood } from '../lib/finops/store'
-import { fetchCostReport, buildCostsCacheKey } from '../lib/finops/costs'
+// Phase 9D.2 — ALL providers (AWS included) route through the
+// canonical ``/api/cloud/costs`` endpoint so individual-account
+// scopes speak the Phase 9D.1 canonical selector contract
+// (``acct:<AWS cloud account_id>``) and never the legacy registry
+// primary-key grammar of ``/api/aws/costs``.  The legacy AWS-only
+// endpoint remains a backend compatibility surface only — no
+// current frontend caller remains.
 import {
   fetchCloudCostReport,
   adaptCloudCostReport,
@@ -107,16 +113,16 @@ export function CostsPage() {
     ? ('rackspace' as const)
     : ('aws' as const)
 
-  // Phase 7C.2B: Azure routes through the provider-neutral
-  // ``/api/cloud/costs`` endpoint, which delegates to the Azure
-  // Cost Management adapter.  AWS keeps the legacy AWS-only
-  // endpoint to preserve every Phase 7A / 7B / 7C.1 regression
-  // contract.  Both shapes are normalised into the shared
-  // ``CostReportResponse`` model before reaching the components
-  // below — the UI is unchanged.
-  // Phase 9D.1: RACKSPACE also routes through the canonical
-  // endpoint (Rackspace Billing V2 via the Phase 9B.1 adapter).
-  const useCanonical = provider === 'AZURE' || provider === 'RACKSPACE'
+  // Phase 7C.2B: Azure routed through the provider-neutral
+  // ``/api/cloud/costs`` endpoint while AWS kept the legacy AWS-only
+  // endpoint.  Phase 9D.2 closure — the legacy AWS route resolves
+  // ``acct:<digits>`` against the registry PRIMARY KEY, so a
+  // canonical cloud selector like ``acct:974053642038`` 404s there.
+  // Every provider now routes through the canonical endpoint, which
+  // resolves ``acct:<id>`` by provider + cloud-side account_id:
+  // one selector contract, no DB row ids in the browser.
+  // Phase 9D.1: RACKSPACE routes through the canonical endpoint
+  // (Rackspace Billing V2 via the Phase 9B.1 adapter).
 
   // Phase 7B: invalidate stale data when the account switches.
   // Phase 7C.1: also invalidate on provider change.
@@ -137,20 +143,13 @@ export function CostsPage() {
   }, [selection, cacheProvider, providerVersion])
 
   const cost = useFinopsQuery<CostReportResponse>(
-    useCanonical
-      ? buildCloudCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider)
-      : buildCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider),
+    buildCloudCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider),
     () =>
-      useCanonical
-        ? fetchCloudCostReport(effectivePeriod, {
-            provider,
-            region: effectiveRegion,
-            accountId: selection,
-          }).then(adaptCloudCostReport)
-        : fetchCostReport(effectivePeriod, {
-            region: effectiveRegion,
-            accountId: selection,
-          }),
+      fetchCloudCostReport(effectivePeriod, {
+        provider,
+        region: effectiveRegion,
+        accountId: selection,
+      }).then(adaptCloudCostReport),
   )
 
   const report = cost.entry.data?.report ?? null

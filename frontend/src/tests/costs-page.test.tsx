@@ -38,10 +38,25 @@ function wrap(node: React.ReactNode) {
 // mocked fetch resolves.  findBy* / waitFor keep every DOM
 // assertion inside an act() boundary (RTL wraps both automatically).
 
-function makeCosts(totalCost: string, previousCost: string, changePercent: string | null = '0.05') {
+// Phase 9D.2 — the Costs page routes EVERY provider (AWS included)
+// through the canonical /api/cloud/costs envelope.  The AWS fixtures
+// below are canonical CloudCostReport bodies (adapted to the legacy
+// CostReportResponse shape by the page) — the legacy /api/aws/costs
+// registry-primary-key grammar must never be queried by the UI.
+function makeAwsCloudCosts(
+  totalCost: string,
+  previousCost: string,
+  changePercent: string | null = '0.05',
+) {
   return {
     report: {
-      account_id: '974053642038',
+      provider: 'AWS',
+      scope: 'all',
+      scope_kind: 'all',
+      status: 'SUCCESS',
+      currency_status: 'OK',
+      account_id: null,
+      account_display_name: null,
       period: { start: '2026-09-08', end: '2026-10-08', days: 30 },
       previous_period: { start: '2026-08-09', end: '2026-09-07', days: 30 },
       currency: 'USD',
@@ -63,6 +78,10 @@ function makeCosts(totalCost: string, previousCost: string, changePercent: strin
         { region: 'us-east-1', amount: '2300.00', unit: 'USD' },
         { region: 'global', amount: '20.00', unit: 'USD' },
       ],
+      by_account: [],
+      account_errors: [],
+      successful_accounts: 1,
+      failed_accounts: 0,
       source: 'AWS_COST_EXPLORER',
     },
     cache_status: 'HIT',
@@ -82,9 +101,17 @@ describe('CostsPage', () => {
   })
 
   it('renders real period data with KPI tiles', async () => {
+    const calls: string[] = []
     const transport = vi.fn(async (path: string) => {
+      calls.push(path)
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00', '0.5'))
+      if (path.startsWith('/api/cloud/costs')) {
+        // Phase 9D.2 — AWS individual/aggregate scope must speak the
+        // canonical selector contract: provider=AWS on
+        // /api/cloud/costs, never the legacy /api/aws/costs route.
+        expect(path).toContain('provider=AWS')
+        return mockJson(200, makeAwsCloudCosts('1500.00', '1000.00', '0.5'))
+      }
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
@@ -94,12 +121,13 @@ describe('CostsPage', () => {
       expect(screen.getByText('$1.50K')).toBeInTheDocument()
     })
     expect(await screen.findByText('+50.0%')).toBeInTheDocument()
+    expect(calls.some((c) => c.startsWith('/api/aws/costs'))).toBe(false)
   })
 
   it('renders "—" for missing previous cost (no divide by zero)', async () => {
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('100', '0', null))
+      if (path.startsWith('/api/cloud/costs')) return mockJson(200, makeAwsCloudCosts('100', '0', null))
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
@@ -116,7 +144,7 @@ describe('CostsPage', () => {
   it('renders the Cost Trend chart with daily points', async () => {
     const transport = vi.fn(async (path: string) => {
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00'))
+      if (path.startsWith('/api/cloud/costs')) return mockJson(200, makeAwsCloudCosts('1500.00', '1000.00'))
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })
@@ -129,7 +157,7 @@ describe('CostsPage', () => {
     const transport = vi.fn(async (path: string) => {
       calls.push(path)
       if (path === '/api/auth/info') return mockJson(200, { auth_enabled: false })
-      if (path.startsWith('/api/aws/costs')) return mockJson(200, makeCosts('1500.00', '1000.00'))
+      if (path.startsWith('/api/cloud/costs')) return mockJson(200, makeAwsCloudCosts('1500.00', '1000.00'))
       return mockJson(404, {})
     })
     configureApi({ getToken: () => null, onSessionExpired: () => {}, transport: transport as unknown as typeof fetch })

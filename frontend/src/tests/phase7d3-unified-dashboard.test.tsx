@@ -1765,7 +1765,7 @@ describe('Phase 9D.1 — Rackspace scope controls', () => {
   })
 
   it('AWS and Azure keep the historical Month selector and the regional cost selector', async () => {
-    // --- AWS (legacy /api/aws/costs route, unchanged behaviour) ---
+    // --- AWS (canonical /api/cloud/costs route, Phase 9D.2) ---
     setProviderAndSelection('AWS', 'all')
     const awsTransport = vi.fn(async (url: string) => {
       if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
@@ -1773,6 +1773,11 @@ describe('Phase 9D.1 — Rackspace scope controls', () => {
       if (url.includes('/api/aws/cloud-accounts/selectable')) {
         return mockJson(200, makeCloudAccountsSelectable('AWS'))
       }
+      // Phase 9D.2 — the Costs page queries ONLY the canonical
+      // route for AWS.  The legacy /api/aws/costs stub below is a
+      // tripwire: if the page regresses to it, the canonical stub
+      // is bypassed and the selector contract test in
+      // costs-page.test.tsx fails.
       if (url.includes('/api/aws/costs')) return makeCloudCosts('AWS', { total: '100.00' })
       if (url.includes('/api/cloud/costs?provider=AWS')) return makeCloudCosts('AWS', { total: '100.00' })
       return mockJson(404, {})
