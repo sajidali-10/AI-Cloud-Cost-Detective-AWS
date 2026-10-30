@@ -580,9 +580,14 @@ static_check "RACKSPACE is a valid selectable provider" \
     "src/lib/providerContext.tsx" \
     "VALID_PROVIDERS: ProviderKind\[\] = \['AWS', 'AZURE', 'RACKSPACE'\]"
 
-static_check "Costs UI routes RACKSPACE through the canonical /api/cloud/costs endpoint" \
+# Phase 9D.2 — the Costs page routes ALL providers (AWS included)
+# through the canonical endpoint, so the check now asserts the
+# unconditional canonical fetch (the RACKSPACE-specific
+# ``useCanonical`` conditional was removed with the legacy AWS
+# fallback).
+static_check "Costs UI routes ALL providers (incl. AWS, Phase 9D.2) through the canonical /api/cloud/costs endpoint" \
     "src/pages/CostsPage.tsx" \
-    "useCanonical = provider === 'AZURE' \|\| provider === 'RACKSPACE'"
+    "fetchCloudCostReport\\(effectivePeriod, \\{"
 
 static_check "Costs UI derives the Rackspace label from the source billing period" \
     "src/pages/CostsPage.tsx" \
