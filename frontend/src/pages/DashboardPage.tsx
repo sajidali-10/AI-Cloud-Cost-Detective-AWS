@@ -70,6 +70,7 @@ import {
   providerSubtitle,
   type DashboardProvider,
 } from '../lib/finops/dashboardScope'
+import { buildAccountSelector, friendlyAccountScopeErrorMessage } from '../lib/finops/subscriptionSelection'
 import {
   fetchCloudCostReport,
   adaptCloudCostReport,
@@ -105,6 +106,7 @@ import {
   parseDecimal,
 } from '../lib/format'
 import type {
+  BillingPeriod,
   CostReportResponse,
   RegionCost,
   ServiceCost,
@@ -174,21 +176,34 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
   const { selection, accounts } = useAccountContext()
   const { providerVersion } = useProviderContext()
 
-  const cacheProvider: CacheProvider = provider === 'AZURE' ? 'azure' : 'aws'
-  const effectiveRegion = region === 'all' ? null : region
+  const cacheProvider: CacheProvider =
+    provider === 'AZURE' ? 'azure' : provider === 'RACKSPACE' ? 'rackspace' : 'aws'
+  // Phase 9D.1 closure — Rackspace Billing answers only for the
+  // CURRENT billing cycle and has no authoritative regional cost
+  // dimension (charges are scoped to the billing account).  A
+  // month / region persisted while another provider was active
+  // must never reach a Rackspace cost query: force the effective
+  // period to the current month and the region to account-level
+  // (null).  AWS / Azure behaviour is unchanged.
+  const effectivePeriod: BillingPeriod =
+    provider === 'RACKSPACE' ? { kind: 'month', month: currentMonth } : period
+  const effectiveRegion: string | null =
+    provider === 'RACKSPACE' ? null : region === 'all' ? null : region
 
   // Build a provider-aware account map for friendly attribution.
   // Mirrors the pattern OptimizationPage established in Phase 7D.2:
-  //   * AWS rows  → selector "acct:<local-row-id>"
+  //   * AWS rows  → selector "acct:<cloud account_id>"
   //   * Azure rows → selector "sub:<guid>"
-  // The raw account_id carried by the recommendation payload is
-  // kept separately so the lookup can resolve recommendation rows.
+  //   * Rackspace rows → selector "acct:<cloud account_id>"
+  // Phase 9D.1 — attribution selectors go through the shared
+  // canonical mapping; the local database row id is a backend-only
+  // key and never becomes a cloud selector.
   const accountMap = useMemo(
     () =>
       accounts
         .filter((row): row is SelectableAccount => row != null)
         .map((row) => ({
-          selector: provider === 'AZURE' ? `sub:${row.account_id}` : `acct:${row.id}`,
+          selector: buildAccountSelector(row, provider),
           rawAccountId: row.account_id,
           displayName: row.display_name,
           provider,
@@ -242,7 +257,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
   // selections never share a cache entry.  This is the
   // "cache isolation" invariant from spec step 25.
   const scopeSegment = dashboardScopeCacheSegment(selection, provider)
-  const costsKey = `${scopeSegment}:costs:${periodToKey(period)}:${effectiveRegion ?? 'all'}`
+  const costsKey = `${scopeSegment}:costs:${periodToKey(effectivePeriod)}:${effectiveRegion ?? 'all'}`
   const resourcesKey = `${scopeSegment}:resources:gen${generation}`
   const recsKey = `${scopeSegment}:recommendations:gen${generation}`
 
@@ -257,7 +272,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
     costsKey,
     async () => {
       const startGen = generationRef.current
-      const response = await fetchCloudCostReport(period, {
+      const response = await fetchCloudCostReport(effectivePeriod, {
         provider,
         region: effectiveRegion,
         accountId: selection,
@@ -327,6 +342,25 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
 
   const activeMonthLabel = period.kind === 'month' ? monthLabel(period.month) : monthLabel(currentMonth)
 
+  // Phase 9D.1 — Rackspace Billing answers only for the CURRENT
+  // billing cycle; the canonical envelope carries the ACTUAL source
+  // period.  Derive the display label from the report (falling back
+  // to the last-known-good snapshot) so the dashboard never calls a
+  // billing cycle "This Month" / a calendar month name.
+  const rackspaceReportSource =
+    cost.entry.data?.report ?? cost.entry.lastGood?.report ?? null
+  const rackspaceCycleLabel = rackspaceReportSource
+    ? billingCycleLabel(rackspaceReportSource.period)
+    : FALLBACK_CYCLE_LABEL
+  // The header context item already carries the "Billing cycle"
+  // label — pass the bare date range so the value is not
+  // "Billing cycle: Billing cycle Oct 3 – …".
+  const rackspaceCycleRange = rackspaceReportSource
+    ? billingCycleRange(rackspaceReportSource.period)
+    : FALLBACK_CYCLE_LABEL
+  const headerPeriodLabel =
+    provider === 'RACKSPACE' ? rackspaceCycleRange : activeMonthLabel
+
   const refreshAll = () => {
     cost.refresh()
     resources.refresh()
@@ -378,7 +412,10 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
               label={provider === 'AZURE' ? 'Subscription' : 'Account'}
               value={scopeLabel}
             />
-            <ContextItem label="Month" value={activeMonthLabel} />
+            <ContextItem
+              label={provider === 'RACKSPACE' ? 'Billing cycle' : 'Month'}
+              value={headerPeriodLabel}
+            />
             <ContextItem
               label="Status"
               value={
@@ -435,20 +472,22 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
         <SpendKpi
           report={cost.entry.data?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
           providerLabel={provider === 'AZURE' ? 'Total Spend' : 'Total Spend'}
           lastGood={cost.entry.lastGood?.report ?? null}
           stale={!!cost.entry.error && !!cost.entry.lastGood}
           freshness={deriveDataFreshness(cost.entry.data)}
+          labelOverride={provider === 'RACKSPACE' ? rackspaceCycleLabel : null}
         />
         <ChangeKpi
           report={cost.entry.data?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
         />
         <ResourcesKpi
           resources={resources.entry.data ?? null}
           loading={resources.entry.status === 'loading'}
+          provider={provider}
         />
         <OptimizationKpi
           envelope={recommendationEnvelope}
@@ -463,7 +502,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
       {/* Spend Trend */}
       <SectionCard
         title="Spend Trend"
-        description={`Daily spend · ${activeMonthLabel}`}
+        description={`Daily spend · ${provider === 'RACKSPACE' ? rackspaceCycleRange : activeMonthLabel}`}
         actions={
           <StatusBadge tone={cost.entry.data?.cache_status === 'HIT' ? 'neutral' : 'info'}>
             Cache: {cost.entry.data?.cache_status ?? '—'}
@@ -483,8 +522,20 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
             message={
               cost.entry.lastGood
                 ? 'Showing last known good data while the upstream recovers.'
-                : `${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} request failed.`
+                : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                  `${providerCostSourceLabel(provider)} request failed.`
             }
+          />
+        ) : provider === 'RACKSPACE' && cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
+          // Phase 9D.1 — daily granularity is an unsupported
+          // dimension for Rackspace Billing; the envelope carries
+          // an empty ``daily_trend`` by contract.  Never render a
+          // fabricated trend — show the professional unavailable
+          // state instead (distinct from zero / empty / error).
+          <UnavailableDimensionNotice
+            testId="rackspace-daily-trend-unavailable"
+            title="Daily spend trend not available"
+            message="Not available for the current Rackspace Billing integration. Rackspace Billing reports estimated charges for the current billing cycle without a daily breakdown."
           />
         ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
           <CostTrendChart
@@ -499,7 +550,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           // empty dataset.
           <ErrorState
             title="Cost data unavailable"
-            message={`${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} returned no successful data.`}
+            message={`${providerCostSourceLabel(provider)} returned no successful data.`}
           />
         ) : (
           <EmptyChartState label="No spend data" />
@@ -522,7 +573,12 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           ) : cost.entry.error && !cost.entry.data ? (
             <ErrorState
               title="Service breakdown unavailable"
-              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Service breakdown request failed.'}
+              message={
+                cost.entry.lastGood
+                  ? 'Showing last known good data.'
+                  : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                    'Service breakdown request failed.'
+              }
             />
           ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             <HorizontalBarChart
@@ -550,7 +606,21 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           ) : cost.entry.error && !cost.entry.data ? (
             <ErrorState
               title="Region breakdown unavailable"
-              message={cost.entry.lastGood ? 'Showing last known good data.' : 'Region breakdown request failed.'}
+              message={
+                cost.entry.lastGood
+                  ? 'Showing last known good data.'
+                  : friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+                    'Region breakdown request failed.'
+              }
+            />
+          ) : provider === 'RACKSPACE' && cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
+            // Phase 9D.1 — regional granularity is an unsupported
+            // dimension for Rackspace Billing (charges are scoped to
+            // the billing account, not a datacenter).
+            <UnavailableDimensionNotice
+              testId="rackspace-region-unavailable"
+              title="Regional cost breakdown not available"
+              message="Not available for the current Rackspace Billing integration. Rackspace Billing scopes charges to the billing account, not to individual datacenters."
             />
           ) : cost.entry.data && deriveCostCompleteness(cost.entry.data.report).kind !== 'unavailable' ? (
             <HorizontalBarChart
@@ -583,6 +653,7 @@ function UnifiedDashboard({ provider }: UnifiedDashboardProps) {
           envelope={recommendationEnvelope}
           loading={recommendations.entry.status === 'loading'}
           error={recommendations.entry.error}
+          provider={provider}
         />
       </div>
     </div>
@@ -631,6 +702,7 @@ export function SpendKpi({
   lastGood,
   stale,
   freshness,
+  labelOverride,
 }: {
   report: CostReportResponse['report'] | null
   loading: boolean
@@ -645,8 +717,13 @@ export function SpendKpi({
   stale?: boolean
   /** Phase 7D.3.3 — server-emitted cache-freshness signal. */
   freshness?: ReturnType<typeof deriveDataFreshness>
+  /** Phase 9D.1 — provider-inherent period label.  Rackspace
+   *  billing cycles are NOT calendar months; the caller passes the
+   *  actual source-cycle label so the KPI never claims "This
+   *  Month" for a billing cycle. */
+  labelOverride?: string | null
 }) {
-  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+  const label = labelOverride ?? (period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`)
   const completeness = deriveCostCompleteness(report)
   const fresh = freshness ?? deriveDataFreshness(null)
   if (loading && !report) {
@@ -789,9 +866,11 @@ function ChangeKpi({
 function ResourcesKpi({
   resources,
   loading,
+  provider,
 }: {
   resources: CloudResourceListResponse | null
   loading: boolean
+  provider: DashboardProvider
 }) {
   const counts = useMemo(() => computeResourceCounts(resources), [resources])
   if (loading && !resources) {
@@ -806,7 +885,7 @@ function ResourcesKpi({
       ? subs[0].display_name
       : resources.summary.scope_kind === 'all'
         ? `${resources.summary.scope}`
-        : `${subs.length} subscriptions`
+        : `${subs.length} ${provider === 'AZURE' ? 'subscriptions' : 'accounts'}`
   return (
     <div data-testid="resources-total-kpi">
       <MetricCard
@@ -943,7 +1022,13 @@ function ResourceSummaryCard({
   return (
     <SectionCard
       title="Resource Summary"
-      description={provider === 'AZURE' ? 'Azure inventory snapshot' : 'AWS inventory snapshot'}
+      description={
+        provider === 'AZURE'
+          ? 'Azure inventory snapshot'
+          : provider === 'RACKSPACE'
+            ? 'Rackspace inventory snapshot'
+            : 'AWS inventory snapshot'
+      }
       actions={
         <Link
           to="/resources"
@@ -961,7 +1046,11 @@ function ResourceSummaryCard({
       {loading && !resources ? (
         <LoadingSkeletonRows rows={4} />
       ) : error && !resources ? (
-        <ErrorState message={error.message} />
+        <ErrorState
+          message={
+            friendlyAccountScopeErrorMessage(error, provider) ?? error.message
+          }
+        />
       ) : resources ? (
         <div className="space-y-3" data-testid="dashboard-resource-summary">
           <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
@@ -975,7 +1064,7 @@ function ResourceSummaryCard({
                 ? '—'
                 : subs.length === 1
                   ? subs[0].display_name
-                  : `${subs.length} subscriptions`}
+                  : `${subs.length} ${provider === 'AZURE' ? 'subscriptions' : 'accounts'}`}
             </span>
           </div>
           {topTypes.length === 0 ? (
@@ -1012,12 +1101,14 @@ interface OptimizationSummaryCardProps {
   envelope: ReturnType<typeof buildUnifiedEnvelope> | null
   loading: boolean
   error: Error | null
+  provider: DashboardProvider
 }
 
 function OptimizationSummaryCard({
   envelope,
   loading,
   error,
+  provider,
 }: OptimizationSummaryCardProps) {
   const topSources = useMemo(() => {
     if (!envelope) return [] as Array<{ key: string; label: string; count: number }>
@@ -1045,7 +1136,11 @@ function OptimizationSummaryCard({
       {loading && !envelope ? (
         <LoadingSkeletonRows rows={4} />
       ) : error && !envelope ? (
-        <ErrorState message={error.message} />
+        <ErrorState
+          message={
+            friendlyAccountScopeErrorMessage(error, provider) ?? error.message
+          }
+        />
       ) : envelope ? (
         <div className="space-y-3" data-testid="optimization-summary">
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -1190,6 +1285,88 @@ function collectPartialDomains(
     })
   }
   return out
+}
+
+// ===========================================================================
+//  Phase 9D.1 — Rackspace billing-cycle helpers
+// ===========================================================================
+
+/** Human label for the upstream cost system that produced a report. */
+export function providerCostSourceLabel(provider: DashboardProvider): string {
+  if (provider === 'AZURE') return 'Azure Cost Management'
+  if (provider === 'RACKSPACE') return 'Rackspace Billing'
+  return 'AWS Cost Explorer'
+}
+
+const MONTHS_SHORT = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]
+
+function parseIsoDateUtc(value: string): Date | null {
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+function formatShortDate(d: Date): string {
+  return `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`
+}
+
+/** Shared fallback when the envelope has not carried a source
+ *  period yet (loading / error).  Title-case per the Phase 9D.1
+ *  wording contract — never label a billing cycle as a calendar
+ *  month. */
+const FALLBACK_CYCLE_LABEL = 'Current Billing Cycle'
+
+/** The bare date range of the source billing cycle, e.g.
+ *  ``Oct 3 – Oct 26, 2026``.  Used under a "Billing cycle"
+ *  context label so the value is not redundant. */
+export function billingCycleRange(period: { start: string; end: string }): string {
+  const start = parseIsoDateUtc(period.start)
+  const endExclusive = parseIsoDateUtc(period.end)
+  if (!start || !endExclusive) return FALLBACK_CYCLE_LABEL
+  // The canonical end is EXCLUSIVE — display the last covered day.
+  const end = new Date(endExclusive.getTime() - 86_400_000)
+  return `${formatShortDate(start)} – ${formatShortDate(end)}`
+}
+
+/**
+ * Phase 9D.1 — Rackspace Billing answers only for the CURRENT
+ * billing cycle.  The canonical envelope exposes the ACTUAL source
+ * period (``start`` inclusive, ``end`` exclusive); render that
+ * window instead of the requested calendar month so the UI never
+ * mislabels a billing cycle as a calendar month.
+ */
+export function billingCycleLabel(period: { start: string; end: string }): string {
+  const range = billingCycleRange(period)
+  if (range === FALLBACK_CYCLE_LABEL) return range
+  return `Billing cycle ${range}`
+}
+
+/**
+ * Phase 9D.1 — professional unavailable state for dimensions a
+ * provider genuinely cannot serve (Rackspace daily trend / regional
+ * breakdown).  Never fabricates zeros or an empty chart.
+ */
+export function UnavailableDimensionNotice({
+  title,
+  message,
+  testId,
+}: {
+  title: string
+  message: string
+  testId?: string
+}) {
+  return (
+    <div
+      role="status"
+      data-testid={testId}
+      className="flex h-[180px] flex-col items-center justify-center gap-1 rounded-md border border-border bg-surface-2 px-6 text-center"
+    >
+      <span className="text-xs font-medium text-fg-secondary">{title}</span>
+      <span className="max-w-md text-[11px] text-fg-muted">{message}</span>
+    </div>
+  )
 }
 
 function EmptyChartState({ label }: { label: string }) {

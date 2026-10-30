@@ -31,6 +31,7 @@ import { useAccountContext } from '../lib/accountContext'
 import { useProviderContext } from '../lib/providerContext'
 import { ProviderCapabilityNotice } from '../components/ProviderCapabilityNotice'
 import { AzureResourcesView } from './AzureResourcesView'
+import { RackspaceResourcesView } from './RackspaceResourcesView'
 import { invalidateFinopsCache } from '../lib/finops/store'
 import type {
   ResourcesResponse,
@@ -96,6 +97,20 @@ export function ResourcesPage() {
   if (provider === 'AZURE') {
     return (
       <AzureResourcesView
+        selection={selection}
+        cacheProvider={cacheProvider}
+        providerVersion={providerVersion}
+      />
+    )
+  }
+
+  // Phase 9D.1 — Rackspace canonical resources are wired through
+  // /api/cloud/resources.  Render the dedicated Rackspace
+  // inventory view when Rackspace is selected; the AWS view below
+  // is unchanged.
+  if (provider === 'RACKSPACE') {
+    return (
+      <RackspaceResourcesView
         selection={selection}
         cacheProvider={cacheProvider}
         providerVersion={providerVersion}

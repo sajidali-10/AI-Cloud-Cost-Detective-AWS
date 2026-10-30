@@ -291,13 +291,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // how to render (e.g. AccessDenied).
   }, [])
 
-  useEffect(() => {
-    configureApi({
-      getToken,
-      onSessionExpired: handleSessionExpired,
-      onForbidden: handleForbidden,
-    })
-  }, [getToken, handleSessionExpired, handleForbidden])
+  // Wire the api client SYNCHRONOUSLY during render — never inside
+  // a useEffect.
+  //
+  // React mount ordering runs CHILD effects before the PARENT's
+  // effects.  When this wiring lived in a useEffect, the
+  // AccountProvider's first-mount selectable-account fetch (a
+  // child effect) executed while the api client still held its
+  // cold-start default `getToken = () => null`, so the request
+  // left without an Authorization header and the backend answered
+  // 401 → accounts=[] → "0 registered" on every full page load
+  // (Phase 9D.1 production defect).  SPA navigation was unaffected
+  // because wiring was already in place by then.
+  //
+  // Calling configureApi() in the render body guarantees the
+  // bearer-token getter is bound BEFORE any descendant effect can
+  // fire: providers (AccountProvider / FinopsPeriodProvider),
+  // pages, and hooks.  The call is idempotent — it only rebinds
+  // module-level callbacks — and the callbacks above are stable
+  // ([]-deps useCallback), so repeated renders re-wire identical
+  // closures.  No token value is read, stored, or logged here;
+  // `getToken` defers the storage read until an actual request.
+  configureApi({
+    getToken,
+    onSessionExpired: handleSessionExpired,
+    onForbidden: handleForbidden,
+  })
 
   // ----- bootstrap -----
   useEffect(() => {

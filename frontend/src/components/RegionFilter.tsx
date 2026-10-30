@@ -6,6 +6,7 @@
 // global services.
 
 import { useFinopsPeriod } from '../lib/finops/period'
+import { useProviderContext } from '../lib/providerContext'
 import { FilterSelect } from './FilterBar'
 
 export interface RegionOption {
@@ -21,6 +22,16 @@ export interface RegionFilterProps {
 
 export function RegionFilter({ options, disabled = false, testId = 'region-filter' }: RegionFilterProps) {
   const { region, setRegion } = useFinopsPeriod()
+  const { provider } = useProviderContext()
+  // Phase 9D.1 — the current Rackspace canonical cost integration
+  // has no authoritative regional cost dimension (charges are
+  // scoped to the billing account, not a datacenter).  The cost
+  // Region control is hidden for RACKSPACE so it can never imply a
+  // regional cost breakdown that does not exist; queries stay
+  // account-level (region=null).  AWS / Azure behaviour unchanged.
+  if (provider === 'RACKSPACE') {
+    return null
+  }
   return (
     <span className="inline-flex items-center rounded-md border border-border bg-surface text-fg-secondary">
       <FilterSelect

@@ -68,7 +68,8 @@ import {
   formatSignedChange,
   parseDecimal,
 } from '../lib/format'
-import { regionRows } from './DashboardPage'
+import { regionRows, billingCycleLabel, providerCostSourceLabel, UnavailableDimensionNotice } from './DashboardPage'
+import { friendlyAccountScopeErrorMessage } from '../lib/finops/subscriptionSelection'
 
 function periodDisplay(period: BillingPeriod): string {
   return period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
@@ -79,22 +80,32 @@ function providerSubtitle(provider: string): string {
     return 'Browse Azure cost data by subscription, service and region'
   }
   if (provider === 'RACKSPACE') {
-    return 'Browse Rackspace cost data (coming soon)'
+    return 'Browse Rackspace billing data for the current billing cycle, by service'
   }
   return 'Browse AWS cost data by account, service and region'
 }
 
 export function CostsPage() {
-  const { period, region } = useFinopsPeriod()
+  const { period, region, currentMonth } = useFinopsPeriod()
   const { selection } = useAccountContext()
   const { provider, providerSlug, providerVersion } = useProviderContext()
-  const effectiveRegion = region === 'all' ? null : region
+  // Phase 9D.1 closure — Rackspace Billing answers only for the
+  // CURRENT billing cycle and has no authoritative regional cost
+  // dimension (charges are scoped to the billing account, not a
+  // datacenter).  A month / region persisted while another
+  // provider was active must never reach a Rackspace cost query:
+  // force the effective period to the current month and the
+  // region to account-level (null).  AWS / Azure behaviour is
+  // unchanged.
+  const effectivePeriod: BillingPeriod =
+    provider === 'RACKSPACE' ? { kind: 'month', month: currentMonth } : period
+  const effectiveRegion: string | null =
+    provider === 'RACKSPACE' ? null : region === 'all' ? null : region
   const cacheProvider = providerSlug === 'azure'
     ? ('azure' as const)
     : providerSlug === 'rackspace'
     ? ('rackspace' as const)
     : ('aws' as const)
-  const periodText = periodDisplay(period)
 
   // Phase 7C.2B: Azure routes through the provider-neutral
   // ``/api/cloud/costs`` endpoint, which delegates to the Azure
@@ -103,7 +114,9 @@ export function CostsPage() {
   // contract.  Both shapes are normalised into the shared
   // ``CostReportResponse`` model before reaching the components
   // below — the UI is unchanged.
-  const useCanonical = provider === 'AZURE'
+  // Phase 9D.1: RACKSPACE also routes through the canonical
+  // endpoint (Rackspace Billing V2 via the Phase 9B.1 adapter).
+  const useCanonical = provider === 'AZURE' || provider === 'RACKSPACE'
 
   // Phase 7B: invalidate stale data when the account switches.
   // Phase 7C.1: also invalidate on provider change.
@@ -125,22 +138,33 @@ export function CostsPage() {
 
   const cost = useFinopsQuery<CostReportResponse>(
     useCanonical
-      ? buildCloudCostsCacheKey(period, effectiveRegion, selection, cacheProvider)
-      : buildCostsCacheKey(period, effectiveRegion, selection, cacheProvider),
+      ? buildCloudCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider)
+      : buildCostsCacheKey(effectivePeriod, effectiveRegion, selection, cacheProvider),
     () =>
       useCanonical
-        ? fetchCloudCostReport(period, {
-            provider: 'AZURE',
+        ? fetchCloudCostReport(effectivePeriod, {
+            provider,
             region: effectiveRegion,
             accountId: selection,
           }).then(adaptCloudCostReport)
-        : fetchCostReport(period, {
+        : fetchCostReport(effectivePeriod, {
             region: effectiveRegion,
             accountId: selection,
           }),
   )
 
   const report = cost.entry.data?.report ?? null
+  // Phase 9D.1 — Rackspace Billing answers only for the CURRENT
+  // billing cycle; the canonical envelope carries the ACTUAL source
+  // period.  Derive the display label from the report (falling back
+  // to the last-known-good snapshot) so the page never labels a
+  // billing cycle as a calendar month.
+  const reportSource = report ?? cost.entry.lastGood?.report ?? null
+  const rackspaceCycleLabel = reportSource
+    ? billingCycleLabel(reportSource.period)
+    : 'Current Billing Cycle'
+  const periodText =
+    provider === 'RACKSPACE' ? rackspaceCycleLabel : periodDisplay(period)
   const regionOptions = useMemo(
     () => buildRegionOptions(cost.entry.data?.report.by_region.map((r) => r.region) ?? []),
     [cost.entry.data],
@@ -200,7 +224,10 @@ export function CostsPage() {
       {cost.entry.error && !cost.entry.data && !hasLastGood && (
         <ErrorState
           title="Could not load costs"
-          message={sanitiseUserMessage(cost.entry.error.message)}
+          message={
+            friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+            sanitiseUserMessage(cost.entry.error.message)
+          }
           onRetry={cost.refresh}
         />
       )}
@@ -210,14 +237,15 @@ export function CostsPage() {
           report={report}
           lastGood={cost.entry.lastGood?.report ?? null}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
           stale={showStale}
           freshness={deriveDataFreshness(cost.entry.data)}
+          labelOverride={provider === 'RACKSPACE' ? rackspaceCycleLabel : null}
         />
         <ChangeKpi
           report={renderableReport}
           loading={cost.entry.status === 'loading'}
-          period={period}
+          period={effectivePeriod}
         />
         <TopServiceKpi
           report={renderableReport}
@@ -241,7 +269,21 @@ export function CostsPage() {
         ) : cost.entry.error && !cost.entry.data && !hasLastGood ? (
           <ErrorState
             title="Cost trend unavailable"
-            message={`${provider === 'AZURE' ? 'Azure Cost Management' : 'AWS Cost Explorer'} request failed.`}
+            message={
+              friendlyAccountScopeErrorMessage(cost.entry.error, provider) ??
+              `${providerCostSourceLabel(provider)} request failed.`
+            }
+          />
+        ) : provider === 'RACKSPACE' && renderableReport ? (
+          // Phase 9D.1 — daily granularity is an unsupported
+          // dimension for Rackspace Billing; the envelope carries
+          // an empty ``daily_trend`` by contract.  Never render a
+          // fabricated trend — show the professional unavailable
+          // state instead (distinct from zero / empty / error).
+          <UnavailableDimensionNotice
+            testId="rackspace-daily-trend-unavailable"
+            title="Daily spend trend not available"
+            message="Not available for the current Rackspace Billing integration. Rackspace Billing reports estimated charges for the current billing cycle without a daily breakdown."
           />
         ) : renderableReport ? (
           <CostTrendChart
@@ -292,7 +334,9 @@ export function CostsPage() {
           }
           actions={
             <StatusBadge tone="neutral">
-              {renderableReport?.by_region.length ?? 0} regions
+              {provider === 'RACKSPACE'
+                ? 'Not available'
+                : `${renderableReport?.by_region.length ?? 0} regions`}
             </StatusBadge>
           }
         >
@@ -302,6 +346,15 @@ export function CostsPage() {
             <ErrorState
               title="Region breakdown unavailable"
               message="Region breakdown request failed."
+            />
+          ) : provider === 'RACKSPACE' && renderableReport ? (
+            // Phase 9D.1 — regional granularity is an unsupported
+            // dimension for Rackspace Billing (charges are scoped
+            // to the billing account, not a datacenter).
+            <UnavailableDimensionNotice
+              testId="rackspace-region-unavailable"
+              title="Regional cost breakdown not available"
+              message="Not available for the current Rackspace Billing integration. Rackspace Billing scopes charges to the billing account, not to individual datacenters."
             />
           ) : renderableReport ? (
             <HorizontalBarChart
@@ -349,6 +402,7 @@ function SpendKpi({
   period,
   stale,
   freshness,
+  labelOverride,
 }: {
   report: CostReportResponse['report'] | null
   lastGood: CostReportResponse['report'] | null
@@ -356,8 +410,15 @@ function SpendKpi({
   period: BillingPeriod
   stale: boolean
   freshness?: ReturnType<typeof deriveDataFreshness>
+  /** Phase 9D.1 — provider-inherent period label.  Rackspace
+   *  billing cycles are NOT calendar months; the caller passes the
+   *  actual source-cycle label so the KPI never claims a calendar
+   *  month for a billing cycle. */
+  labelOverride?: string | null
 }) {
-  const label = period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`
+  const label =
+    labelOverride ??
+    (period.kind === 'month' ? monthLabel(period.month) : `Last ${period.days} days`)
   const completeness = deriveCostCompleteness(report)
   const fresh = freshness ?? deriveDataFreshness(null)
   // Phase 7D.3.3 — if the report is unavailable but the server

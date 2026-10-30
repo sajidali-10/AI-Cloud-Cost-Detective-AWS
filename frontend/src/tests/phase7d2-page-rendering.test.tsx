@@ -208,7 +208,7 @@ afterEach(async () => {
 describe('Phase 7D.2 — page-level: AWS scopes', () => {
   it('renders the unified page for AWS QA-Dev', async () => {
     window.sessionStorage.setItem('cd.provider.selection.v1', 'AWS')
-    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:11')
+    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:974053642038')
     configureApi({
       getToken: () => null,
       onSessionExpired: () => {},
@@ -259,7 +259,7 @@ describe('Phase 7D.2 — page-level: AWS scopes', () => {
 
   it('AWS Production scope attribution is friendly (no acct:<n>)', async () => {
     window.sessionStorage.setItem('cd.provider.selection.v1', 'AWS')
-    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:12')
+    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:999999999999')
     configureApi({
       getToken: () => null,
       onSessionExpired: () => {},
@@ -475,7 +475,7 @@ describe('Phase 7D.2 — page-level: no stale Phase 7C wording', () => {
 describe('Phase 7D.2 — page-level: read-only safety', () => {
   it('Page does not surface remediation controls (Apply / Resize / Stop / Delete)', async () => {
     window.sessionStorage.setItem('cd.provider.selection.v1', 'AWS')
-    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:11')
+    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:974053642038')
     configureApi({
       getToken: () => null,
       onSessionExpired: () => {},

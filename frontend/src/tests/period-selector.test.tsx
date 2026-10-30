@@ -5,6 +5,8 @@ import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { ThemeProvider } from '../lib/theme'
 import { AuthProvider } from '../lib/auth'
+import { ProviderProvider } from '../lib/providerContext'
+import { AccountProvider } from '../lib/accountContext'
 import { FinopsPeriodProvider, useFinopsPeriod } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { PeriodSelector } from '../components/PeriodSelector'
@@ -40,12 +42,16 @@ function wrap(node: React.ReactNode, opts: { initialPeriod?: { kind: 'month'; mo
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
-          <FinopsPeriodProvider
-            {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
-            initialRegion="all"
-          >
-            {node}
-          </FinopsPeriodProvider>
+          <ProviderProvider>
+            <AccountProvider>
+              <FinopsPeriodProvider
+                {...(opts.initialPeriod ? { initialPeriod: opts.initialPeriod } : {})}
+                initialRegion="all"
+              >
+                {node}
+              </FinopsPeriodProvider>
+            </AccountProvider>
+          </ProviderProvider>
         </AuthProvider>
       </ThemeProvider>
     </MemoryRouter>,

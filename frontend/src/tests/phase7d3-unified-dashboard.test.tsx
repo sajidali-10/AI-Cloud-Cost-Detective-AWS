@@ -25,7 +25,7 @@
 //     keeps the others live — the dashboard never goes blank.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor, act } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, act, fireEvent } from '@testing-library/react'
 import { ThemeProvider } from '../lib/theme'
 import { AuthProvider } from '../lib/auth'
 import { AccountProvider } from '../lib/accountContext'
@@ -34,6 +34,18 @@ import { FinopsPeriodProvider } from '../lib/finops/period'
 import { configureApi, __resetApiForTests } from '../lib/api'
 import { invalidateCache, invalidateFinopsCache } from '../lib/finops/store'
 import { DashboardPage } from '../pages/DashboardPage'
+import { CostsPage } from '../pages/CostsPage'
+import { AccountSelector } from '../components/AccountSelector'
+import { buildMonthList } from '../types/finops'
+import {
+  buildAccountSelector,
+  accountMatchesSelector,
+  providerAccountNoun,
+  providerAggregateLabel,
+  canonicalAccountParam,
+  canonicalCacheSegment,
+  friendlyAccountScopeErrorMessage,
+} from '../lib/finops/subscriptionSelection'
 import { MemoryRouter } from '../lib/router'
 import {
   __resetDashboardGenerationForTests,
@@ -290,10 +302,12 @@ afterEach(() => {
 // ===========================================================================
 
 describe('Phase 7D.3 — dashboardScope helpers', () => {
-  it('providerSlug returns "azure" for AZURE and "aws" for AWS', () => {
+  it('providerSlug returns "azure" for AZURE, "aws" for AWS and "rackspace" for RACKSPACE', () => {
     expect(providerSlug('AWS')).toBe('aws')
     expect(providerSlug('AZURE')).toBe('azure')
-    expect(providerSlug('RACKSPACE')).toBeNull()
+    // Phase 9D.1 — RACKSPACE is now a supported dashboard
+    // provider (canonical costs / resources / recommendations).
+    expect(providerSlug('RACKSPACE')).toBe('rackspace')
   })
 
   it('dashboardScopeCacheSegment always includes the provider prefix', () => {
@@ -323,7 +337,13 @@ describe('Phase 7D.3 — dashboardScope helpers', () => {
       /acct:|sub:/i,
     )
     const awsAccounts = { slug: 'aws' as const, wire: 'AWS' as const, rows: makeCloudAccountsSelectable('AWS').items as never }
-    expect(friendlyScopeLabel('acct:10', awsAccounts)).toBe('AWS QA-Dev Account')
+    // Phase 9D.1 — AWS selections carry the CLOUD-side account id
+    // (acct:<account_id>), never the local database row id.
+    expect(friendlyScopeLabel('acct:111111111111', awsAccounts)).toBe('AWS QA-Dev Account')
+    expect(friendlyScopeLabel('acct:222222222222', awsAccounts)).toBe('AWS Production Account')
+    // A stale database-row-id selector matches no row — the label
+    // falls back without leaking the raw selector form.
+    expect(friendlyScopeLabel('acct:10', awsAccounts)).toBe('Account 10')
     expect(friendlyScopeLabel('all', awsAccounts)).toBe('All AWS Accounts')
   })
 })
@@ -488,8 +508,14 @@ describe('Phase 7D.3 — provider switching', () => {
     expect(dashboardScopeCacheSegment('sub:11111111-2222-3333-4444-555555555555', 'AZURE')).toBe(
       'azure:sub:11111111-2222-3333-4444-555555555555',
     )
+    // Phase 9D.1 — a stale Azure ``sub:<guid>`` under AWS (or
+    // RACKSPACE) self-corrects to the aggregate namespace: it
+    // must never namespace a cache entry for the wrong provider.
     expect(dashboardScopeCacheSegment('sub:11111111-2222-3333-4444-555555555555', 'AWS')).toBe(
-      'aws:sub:11111111-2222-3333-4444-555555555555',
+      'aws:all',
+    )
+    expect(dashboardScopeCacheSegment('sub:11111111-2222-3333-4444-555555555555', 'RACKSPACE')).toBe(
+      'rackspace:all',
     )
   })
 
@@ -620,22 +646,23 @@ describe('Phase 7D.3 — scope switching', () => {
       expect(screen.getAllByText(/All AWS Accounts/).length).toBeGreaterThan(0)
     })
 
-    // Switch to QA (acct:10).
+    // Switch to QA (acct:<cloud account_id> — the Phase 9D.1
+    // canonical AWS selector, never the DB row id).
     cleanup()
     invalidateFinopsCache()
     if (typeof window !== 'undefined') {
-      window.sessionStorage.setItem('cd.account.selection.v1', 'acct:10')
+      window.sessionStorage.setItem('cd.account.selection.v1', 'acct:111111111111')
     }
     wrapRoutes(<DashboardPage />)
     await waitFor(() => {
       expect(screen.getAllByText(/AWS QA-Dev Account/).length).toBeGreaterThan(0)
     })
 
-    // Switch to Production (acct:11).
+    // Switch to Production (acct:<cloud account_id>).
     cleanup()
     invalidateFinopsCache()
     if (typeof window !== 'undefined') {
-      window.sessionStorage.setItem('cd.account.selection.v1', 'acct:11')
+      window.sessionStorage.setItem('cd.account.selection.v1', 'acct:222222222222')
     }
     wrapRoutes(<DashboardPage />)
     await waitFor(() => {
@@ -1080,5 +1107,774 @@ describe('Phase 7D.3 — cache isolation', () => {
     const cur = `${dashboardScopeCacheSegment('all', 'AWS')}:costs:month:2026-10:all`
     const prev = `${dashboardScopeCacheSegment('all', 'AWS')}:costs:month:2026-09:all`
     expect(cur).not.toBe(prev)
+  })
+})
+
+// ===========================================================================
+//  Section H — Phase 9D.1 — provider account-scope closure (browser fix)
+// ===========================================================================
+//
+// The proven selector contract, locked down end-to-end:
+//
+//   * AWS       → acct:<provider account_id>  (the 12-digit AWS
+//     account number — NEVER the local database row id)
+//   * RACKSPACE → acct:<provider account_id>  (the Rackspace
+//     account id — NEVER the local database row id; the proven
+//     row is database id 7 = account_id 708274 → acct:708274)
+//   * AZURE     → sub:<provider account_id>   (subscription GUID)
+//
+// Plus the closure UX invariants: stale-selection recovery,
+// provider-aware labels, the Rackspace fixed billing-cycle scope
+// (no historical Month / regional cost controls), the
+// AccountNotFound professional message, and the Rackspace
+// dashboard leaving the Loading state when the canonical APIs
+// succeed.
+
+// Live provider-switch probe — captures the provider context so a
+// test can flip the active provider on a mounted component.
+let providerProbe: ReturnType<typeof useProviderContext> | null = null
+function ProviderProbe() {
+  providerProbe = useProviderContext()
+  return null
+}
+
+const MONTH_LIST = buildMonthList()
+const CURRENT_MONTH = MONTH_LIST[MONTH_LIST.length - 1]
+// A month guaranteed to differ from the current one (≥2 back in
+// the 12-month list) — used to prove a persisted historical month
+// never reaches a Rackspace cost query.
+const HISTORICAL_MONTH = MONTH_LIST[MONTH_LIST.length - 3]
+
+function makeRackspaceProviders() {
+  return {
+    providers: [
+      {
+        provider: 'AWS',
+        is_registered: true,
+        is_enabled: true,
+        credential_strategies: [],
+        capabilities: [],
+        supported_regions: [],
+        supported_lookback_days: [],
+        status: 'OK',
+      },
+      {
+        provider: 'AZURE',
+        is_registered: true,
+        is_enabled: true,
+        credential_strategies: ['AZURE_WORKLOAD_FEDERATION'],
+        capabilities: [],
+        supported_regions: [],
+        supported_lookback_days: [],
+        status: 'OK',
+      },
+      {
+        provider: 'RACKSPACE',
+        is_registered: true,
+        is_enabled: true,
+        credential_strategies: ['RACKSPACE_API_KEY'],
+        capabilities: [],
+        supported_regions: [],
+        supported_lookback_days: [],
+        status: 'OK',
+      },
+    ],
+    count: 3,
+  }
+}
+
+// The PROVEN Rackspace selectable row: the local database row id
+// is 7 while the provider-side Rackspace account id is 708274.
+// The canonical selector MUST be acct:708274 — acct:7 can only
+// fail with AccountNotFound.
+function makeRackspaceSelectable() {
+  return {
+    items: [
+      {
+        id: 7,
+        account_id: '708274',
+        display_name: 'Rackspace Cloud Account',
+        provider: 'RACKSPACE',
+        enabled: true,
+        is_management: false,
+      },
+    ],
+    count: 1,
+  }
+}
+
+function makeRackspaceCosts() {
+  return mockJson(200, {
+    report: {
+      provider: 'RACKSPACE',
+      scope: 'all',
+      scope_kind: 'all',
+      status: 'SUCCESS',
+      currency_status: 'OK',
+      account_id: null,
+      account_display_name: null,
+      period: { start: '2026-10-01', end: '2026-11-01', days: 31 },
+      previous_period: { start: '2026-09-01', end: '2026-10-01', days: 30 },
+      currency: 'USD',
+      total_cost: '2475.50',
+      previous_period_cost: null,
+      change_amount: null,
+      change_percent: null,
+      estimated: true,
+      daily_trend: [],
+      by_service: [{ service: 'Cloud Servers', amount: '1500.25', unit: 'USD' }],
+      by_region: [],
+      by_account: [
+        { account_id: '708274', display_name: 'Rackspace Cloud Account', amount: '2475.50', currency: 'USD' },
+      ],
+      account_errors: [],
+      successful_accounts: 1,
+      failed_accounts: 0,
+      source: 'RACKSPACE_BILLING',
+      previous_period_unavailable: true,
+    },
+    cache_status: 'MISS',
+    cached_at: '2026-10-26T10:00:00Z',
+    expires_at: null,
+  })
+}
+
+function makeRackspaceResources() {
+  return mockJson(200, {
+    summary: {
+      provider: 'RACKSPACE',
+      scope: 'all',
+      scope_kind: 'all',
+      status: 'SUCCESS',
+      total_resources: 12,
+      by_type: [
+        { key: 'SERVER', count: 7 },
+        { key: 'VOLUME', count: 5 },
+      ],
+      by_location: [{ key: 'DFW', count: 12 }],
+      by_resource_group: [],
+      by_subscription: [],
+      subscription_errors: [],
+      source: 'RACKSPACE_INVENTORY',
+    },
+    resources: [],
+  })
+}
+
+function makeRackspaceRecommendations() {
+  return mockJson(200, {
+    summary: {
+      provider: 'RACKSPACE',
+      scope: 'all',
+      scope_kind: 'all',
+      status: 'SUCCESS',
+      savings_status: 'EMPTY',
+      currency: null,
+      total_recommendations: 3,
+      recommendations_with_savings: 0,
+      recommendations_without_savings: 3,
+      potential_annual_savings: null,
+      potential_savings: null,
+      savings_period: 'MONTHLY',
+      savings_by_currency: [],
+      by_impact: [],
+      by_resource_type: [],
+      by_subscription: [],
+      by_resource_group: [],
+      by_type: [],
+      by_subcategory: [],
+      subscription_errors: [],
+      by_account: [],
+      by_source: [],
+      by_action: [],
+      account_errors: [],
+      source: 'RACKSPACE_OPTIMIZATION',
+    },
+    recommendations: [],
+  })
+}
+
+// A full Rackspace route set for CostsPage / DashboardPage tests.
+// `costsOverride` lets a test inject an AccountNotFound failure.
+function installRackspaceRoutes(opts: {
+  costsOverride?: (url: string) => Response | null
+} = {}) {
+  const calls: string[] = []
+  const transport = vi.fn(async (url: string) => {
+    calls.push(url)
+    if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+    if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+    if (url.includes('/api/cloud/accounts/selectable/RACKSPACE')) {
+      return mockJson(200, makeRackspaceSelectable())
+    }
+    if (url.includes('/api/cloud/costs')) {
+      const override = opts.costsOverride?.(url)
+      if (override) return override
+      return makeRackspaceCosts()
+    }
+    if (url.includes('/api/cloud/resources')) return makeRackspaceResources()
+    if (url.includes('/api/cloud/recommendations')) return makeRackspaceRecommendations()
+    return mockJson(404, {})
+  })
+  configureApi({
+    getToken: () => null,
+    onSessionExpired: () => {},
+    transport: transport as unknown as typeof fetch,
+  })
+  return {
+    transport,
+    calls,
+    costsCalls: () => calls.filter((c) => c.includes('/api/cloud/costs')),
+  }
+}
+
+function setProviderAndSelection(provider: 'AWS' | 'AZURE' | 'RACKSPACE', selection: string) {
+  window.sessionStorage.setItem('cd.provider.selection.v1', provider)
+  window.sessionStorage.setItem('cd.account.selection.v1', selection)
+}
+
+// ---------------------------------------------------------------------------
+//  H1 — canonical mapping (pure unit tests)
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — canonical selectable-account mapping', () => {
+  it('Rackspace row (DB id 7, account_id 708274) selects acct:708274 — never the DB row id', () => {
+    const row = { account_id: '708274' }
+    expect(buildAccountSelector(row, 'RACKSPACE')).toBe('acct:708274')
+    expect(buildAccountSelector(row, 'RACKSPACE')).not.toBe('acct:7')
+    expect(accountMatchesSelector(row, 'acct:708274', 'RACKSPACE')).toBe(true)
+    // A pre-9D.1 database-row-id selector matches nothing.
+    expect(accountMatchesSelector(row, 'acct:7', 'RACKSPACE')).toBe(false)
+    // A stale Azure selector never matches a Rackspace row.
+    expect(
+      accountMatchesSelector(row, 'sub:11111111-2222-3333-4444-555555555555', 'RACKSPACE'),
+    ).toBe(false)
+  })
+
+  it('AWS rows select acct:<cloud account_id> — never the local DB id', () => {
+    const row = { account_id: '974053642038' }
+    expect(buildAccountSelector(row, 'AWS')).toBe('acct:974053642038')
+    expect(buildAccountSelector(row, 'AWS')).not.toBe('acct:10')
+    expect(accountMatchesSelector(row, 'acct:974053642038', 'AWS')).toBe(true)
+    expect(accountMatchesSelector(row, 'acct:10', 'AWS')).toBe(false)
+  })
+
+  it('Azure rows select sub:<subscription-guid>', () => {
+    const row = { account_id: '11111111-2222-3333-4444-555555555555' }
+    expect(buildAccountSelector(row, 'AZURE')).toBe(
+      'sub:11111111-2222-3333-4444-555555555555',
+    )
+    expect(
+      accountMatchesSelector(row, 'sub:11111111-2222-3333-4444-555555555555', 'AZURE'),
+    ).toBe(true)
+    // A stale acct:<n> never matches an Azure row.
+    expect(accountMatchesSelector(row, 'acct:5', 'AZURE')).toBe(false)
+  })
+
+  it('stale cross-provider selectors are never submitted to canonical APIs', () => {
+    // A stale Azure sub:<guid> must never reach AWS / RACKSPACE.
+    expect(
+      canonicalAccountParam('sub:11111111-2222-3333-4444-555555555555', 'RACKSPACE'),
+    ).toBeUndefined()
+    expect(
+      canonicalAccountParam('sub:11111111-2222-3333-4444-555555555555', 'AWS'),
+    ).toBeUndefined()
+    // A stale acct:<n> must never reach AZURE.
+    expect(canonicalAccountParam('acct:7', 'AZURE')).toBeUndefined()
+    // Cache segments self-correct the same way.
+    expect(
+      canonicalCacheSegment('sub:11111111-2222-3333-4444-555555555555', 'rackspace'),
+    ).toBe('all')
+    expect(
+      canonicalCacheSegment('sub:11111111-2222-3333-4444-555555555555', 'aws'),
+    ).toBe('all')
+    expect(canonicalCacheSegment('acct:7', 'azure')).toBe('all')
+  })
+
+  it('provider-aware account nouns and aggregate labels', () => {
+    expect(providerAccountNoun('AWS')).toBe('AWS Account')
+    expect(providerAccountNoun('AZURE')).toBe('Azure Subscription')
+    expect(providerAccountNoun('RACKSPACE')).toBe('Rackspace Account')
+    expect(providerAggregateLabel('AWS')).toBe('All AWS Accounts')
+    expect(providerAggregateLabel('AZURE')).toBe('All Azure Subscriptions')
+    expect(providerAggregateLabel('RACKSPACE')).toBe('All Rackspace Cloud Accounts')
+  })
+
+  it('AccountNotFound maps to professional text — the raw backend selector never leaks', () => {
+    // The exact backend wording for a scope miss.
+    const raw = "no RACKSPACE account matches selection='acct:7'"
+    const friendly = friendlyAccountScopeErrorMessage({ message: raw }, 'RACKSPACE')
+    expect(friendly).toBeTruthy()
+    expect(friendly).toMatch(/no longer available/)
+    expect(friendly).not.toMatch(/acct:7/)
+    expect(friendly).not.toMatch(/no RACKSPACE account/i)
+
+    // The errorCode path maps too.
+    const byCode = friendlyAccountScopeErrorMessage(
+      { message: 'Request failed (404)', errorCode: 'AccountNotFound' },
+      'AWS',
+    )
+    expect(byCode).toMatch(/AWS Account/)
+    expect(byCode).toMatch(/no longer available/)
+
+    // Azure wording says "subscription".
+    const azure = friendlyAccountScopeErrorMessage(
+      { message: "no AZURE account matches selection='acct:5'" },
+      'AZURE',
+    )
+    expect(azure).toMatch(/Azure Subscription/)
+    expect(azure).toMatch(/choose another subscription/)
+
+    // Disabled accounts get their own professional wording.
+    expect(
+      friendlyAccountScopeErrorMessage({ message: 'x', errorCode: 'AccountDisabled' }, 'RACKSPACE'),
+    ).toMatch(/disabled/)
+
+    // Non-account failures pass through untouched (null) so the
+    // caller keeps its existing message.
+    expect(
+      friendlyAccountScopeErrorMessage({ message: 'Backend unavailable' }, 'AWS'),
+    ).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  H2 — AccountSelector provider contract (UI)
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — AccountSelector provider contract', () => {
+  it('Rackspace row (DB id 7 + account_id 708274) stores acct:708274 with the Rackspace Account label', async () => {
+    setProviderAndSelection('RACKSPACE', 'all')
+    const transport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/cloud/accounts/selectable/RACKSPACE')) {
+        return mockJson(200, makeRackspaceSelectable())
+      }
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+
+    wrapRoutes(<AccountSelector />)
+    const trigger = await screen.findByTestId('account-selector-button')
+    // Provider-aware labels — never AWS wording under Rackspace.
+    expect(trigger.textContent).toContain('Rackspace Account')
+    expect(trigger.textContent).toContain('All Rackspace Cloud Accounts')
+
+    // Open the dropdown and pick the proven row (DB id 7).
+    fireEvent.click(trigger)
+    const row = await screen.findByTestId('account-option-7')
+    expect(row.textContent).toContain('708274')
+    fireEvent.click(row)
+
+    // The stored selection carries the CLOUD-side account id.
+    const stored = window.sessionStorage.getItem('cd.account.selection.v1')
+    expect(stored).toBe('acct:708274')
+    expect(stored).not.toBe('acct:7')
+    // The button shows the friendly row label (never a bare DB id).
+    await waitFor(() => {
+      expect(screen.getByTestId('account-selector-button').textContent).toContain(
+        'Rackspace Cloud Account — 708274',
+      )
+    })
+  })
+
+  it('provider-aware button labels: AWS Account / Azure Subscription / Rackspace Account', async () => {
+    const transport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/aws/cloud-accounts/selectable')) {
+        return mockJson(200, makeCloudAccountsSelectable('AWS'))
+      }
+      if (url.includes('/api/cloud/accounts/selectable/AZURE')) {
+        return mockJson(200, makeCloudAccountsSelectable('AZURE'))
+      }
+      if (url.includes('/api/cloud/accounts/selectable/RACKSPACE')) {
+        return mockJson(200, makeRackspaceSelectable())
+      }
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+
+    // AWS
+    setProviderAndSelection('AWS', 'all')
+    wrapRoutes(<AccountSelector />)
+    let trigger = await screen.findByTestId('account-selector-button')
+    await waitFor(() => {
+      expect(trigger.textContent).toContain('AWS Account')
+      expect(trigger.textContent).toContain('All AWS Accounts')
+    })
+    cleanup()
+
+    // AZURE
+    setProviderAndSelection('AZURE', 'all')
+    wrapRoutes(<AccountSelector />)
+    trigger = await screen.findByTestId('account-selector-button')
+    await waitFor(() => {
+      expect(trigger.textContent).toContain('Azure Subscription')
+      expect(trigger.textContent).toContain('All Azure Subscriptions')
+    })
+    cleanup()
+
+    // RACKSPACE
+    setProviderAndSelection('RACKSPACE', 'all')
+    wrapRoutes(<AccountSelector />)
+    trigger = await screen.findByTestId('account-selector-button')
+    await waitFor(() => {
+      expect(trigger.textContent).toContain('Rackspace Account')
+      expect(trigger.textContent).toContain('All Rackspace Cloud Accounts')
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  H3 — stale selection recovery
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — stale selection recovery', () => {
+  it('a rehydrated stale acct:<db-id> selector under RACKSPACE self-corrects to the aggregate', async () => {
+    // Pre-9D.1 session: the persisted selector is the local DB
+    // row id (acct:7), not the cloud account id (acct:708274).
+    setProviderAndSelection('RACKSPACE', 'acct:7')
+    const { costsCalls } = installRackspaceRoutes({
+      costsOverride: (url) => {
+        // The real backend answer for a DB-id selector.
+        if (decodeURIComponent(url).includes('account_id=acct:7')) {
+          return mockJson(404, {
+            error_code: 'AccountNotFound',
+            message: "no RACKSPACE account matches selection='acct:7'",
+          })
+        }
+        return null
+      },
+    })
+
+    wrapRoutes(<CostsPage />)
+
+    // The rehydration guard resets the stale selector to the
+    // provider-wide aggregate once the provider rows load.
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('all')
+    })
+
+    // An aggregate costs request (no account_id) goes out and
+    // succeeds — the page recovers with real data.
+    await waitFor(() => {
+      expect(costsCalls().some((c) => !decodeURIComponent(c).includes('account_id='))).toBe(true)
+    })
+    expect(await screen.findByText('$2.48K')).toBeInTheDocument()
+
+    // The raw backend selector error never reaches the browser UI.
+    const text = document.body.textContent ?? ''
+    expect(text).not.toMatch(/no RACKSPACE account matches selection/)
+    expect(text).not.toMatch(/AccountNotFound/)
+  })
+
+  it('switching provider resets the selection so a stale account context never crosses providers', async () => {
+    setProviderAndSelection('AWS', 'all')
+    const transport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/aws/cloud-accounts/selectable')) {
+        return mockJson(200, makeCloudAccountsSelectable('AWS'))
+      }
+      if (url.includes('/api/cloud/accounts/selectable/RACKSPACE')) {
+        return mockJson(200, makeRackspaceSelectable())
+      }
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+
+    wrapRoutes(
+      <>
+        <ProviderProbe />
+        <AccountSelector />
+      </>,
+    )
+
+    // Select the AWS QA-Dev account (DB id 10, cloud id 111111111111).
+    fireEvent.click(await screen.findByTestId('account-selector-button'))
+    fireEvent.click(await screen.findByTestId('account-option-10'))
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('acct:111111111111')
+    })
+
+    // Switch provider AWS → RACKSPACE (the Cloud Context bar's
+    // imperative setProvider path).
+    await act(async () => {
+      providerProbe?.setProvider('RACKSPACE')
+    })
+
+    // The specific selection is invalidated and the selector
+    // renders the Rackspace aggregate with the Rackspace noun.
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('all')
+    })
+    await waitFor(() => {
+      const button = screen.getByTestId('account-selector-button')
+      expect(button.textContent).toContain('All Rackspace Cloud Accounts')
+      expect(button.textContent).toContain('Rackspace Account')
+      // The stale AWS row label is gone.
+      expect(button.textContent).not.toContain('AWS QA-Dev Account')
+    })
+  })
+
+  it('switching provider Azure ↔ Rackspace never carries a stale subscription selector across providers', async () => {
+    setProviderAndSelection('AZURE', 'all')
+    const transport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/cloud/accounts/selectable/AZURE')) {
+        return mockJson(200, makeCloudAccountsSelectable('AZURE'))
+      }
+      if (url.includes('/api/cloud/accounts/selectable/RACKSPACE')) {
+        return mockJson(200, makeRackspaceSelectable())
+      }
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: transport as unknown as typeof fetch,
+    })
+
+    wrapRoutes(
+      <>
+        <ProviderProbe />
+        <AccountSelector />
+      </>,
+    )
+
+    // Select the MCPP Subscription (DB id 5, subscription GUID).
+    fireEvent.click(await screen.findByTestId('account-selector-button'))
+    fireEvent.click(await screen.findByTestId('azure-sub-option-5'))
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe(
+        'sub:11111111-2222-3333-4444-555555555555',
+      )
+    })
+
+    // Switch provider AZURE → RACKSPACE.  The Azure subscription
+    // selector is invalidated: a sub:<guid> can never cross into
+    // a provider whose canonical route would reject it with
+    // AccountNotFound.
+    await act(async () => {
+      providerProbe?.setProvider('RACKSPACE')
+    })
+
+    await waitFor(() => {
+      expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('all')
+    })
+    await waitFor(() => {
+      const button = screen.getByTestId('account-selector-button')
+      expect(button.textContent).toContain('All Rackspace Cloud Accounts')
+      expect(button.textContent).toContain('Rackspace Account')
+      // The stale Azure row label is gone.
+      expect(button.textContent).not.toContain('MCPP Subscription')
+    })
+
+    // Switch back RACKSPACE → AZURE: still the aggregate, with
+    // the Azure noun — the switch is symmetric and never
+    // resurrects the earlier subscription selection.
+    await act(async () => {
+      providerProbe?.setProvider('AZURE')
+    })
+    await waitFor(() => {
+      const button = screen.getByTestId('account-selector-button')
+      expect(button.textContent).toContain('All Azure Subscriptions')
+      expect(button.textContent).toContain('Azure Subscription')
+      // The stale Rackspace wording is gone.
+      expect(button.textContent).not.toContain('Rackspace Account')
+    })
+    expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe('all')
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  H4 — Rackspace scope controls (Month / Region)
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — Rackspace scope controls', () => {
+  it('Rackspace Costs hides the historical Month selector and the regional cost selector', async () => {
+    setProviderAndSelection('RACKSPACE', 'all')
+    // Persist a HISTORICAL month + a region from another
+    // provider's session — neither may reach a Rackspace query.
+    window.sessionStorage.setItem(
+      'accd.finops.period',
+      JSON.stringify({ kind: 'month', month: HISTORICAL_MONTH }),
+    )
+    window.sessionStorage.setItem('accd.finops.region', 'us-east-1')
+
+    const { costsCalls } = installRackspaceRoutes()
+
+    // Mount WITHOUT initialPeriod/initialRegion so the stored
+    // historical month + region are actually rehydrated.
+    render(
+      <MemoryRouter>
+        <ThemeProvider>
+          <AuthProvider>
+            <ProviderProvider>
+              <AccountProvider>
+                <FinopsPeriodProvider>
+                  <CostsPage />
+                </FinopsPeriodProvider>
+              </AccountProvider>
+            </ProviderProvider>
+          </AuthProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    )
+
+    // The static current-cycle control replaces the month <select>.
+    expect(await screen.findByTestId('period-selector-fixed-cycle')).toHaveTextContent(
+      'Current Billing Cycle',
+    )
+    expect(screen.queryByTestId('period-selector-input')).toBeNull()
+    expect(screen.queryByTestId('period-selector')).not.toBeNull()
+    // No regional cost selector at all.
+    expect(screen.queryByTestId('region-filter')).toBeNull()
+
+    // The costs request used the CURRENT month and NO region —
+    // the persisted historical month / region never leak.
+    await waitFor(() => {
+      expect(costsCalls().length).toBeGreaterThan(0)
+    })
+    for (const url of costsCalls()) {
+      expect(url).toContain(`month=${CURRENT_MONTH}`)
+      expect(url).not.toContain(`month=${HISTORICAL_MONTH}`)
+      expect(decodeURIComponent(url)).not.toContain('region=')
+    }
+
+    // Current Billing Cycle semantics: the ACTUAL source cycle is
+    // labelled as a billing cycle — never a calendar month.
+    expect(
+      (await screen.findAllByText('Billing cycle Oct 1, 2026 – Oct 31, 2026')).length,
+    ).toBeGreaterThan(0)
+  })
+
+  it('AWS and Azure keep the historical Month selector and the regional cost selector', async () => {
+    // --- AWS (legacy /api/aws/costs route, unchanged behaviour) ---
+    setProviderAndSelection('AWS', 'all')
+    const awsTransport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/aws/cloud-accounts/selectable')) {
+        return mockJson(200, makeCloudAccountsSelectable('AWS'))
+      }
+      if (url.includes('/api/aws/costs')) return makeCloudCosts('AWS', { total: '100.00' })
+      if (url.includes('/api/cloud/costs?provider=AWS')) return makeCloudCosts('AWS', { total: '100.00' })
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: awsTransport as unknown as typeof fetch,
+    })
+    wrapRoutes(<CostsPage />)
+    const awsSelect = await screen.findByTestId('period-selector-input')
+    expect(awsSelect.tagName).toBe('SELECT')
+    expect(screen.getByTestId('region-filter')).toBeInTheDocument()
+    cleanup()
+
+    // --- AZURE (canonical route, unchanged behaviour) ---
+    setProviderAndSelection('AZURE', 'all')
+    const azureTransport = vi.fn(async (url: string) => {
+      if (url.includes('/api/auth/info')) return mockJson(200, { auth_enabled: false })
+      if (url.includes('/api/cloud/providers')) return mockJson(200, makeRackspaceProviders())
+      if (url.includes('/api/cloud/accounts/selectable/AZURE')) {
+        return mockJson(200, makeCloudAccountsSelectable('AZURE'))
+      }
+      if (url.includes('/api/cloud/costs')) return makeCloudCosts('AZURE', { total: '5.00' })
+      return mockJson(404, {})
+    })
+    configureApi({
+      getToken: () => null,
+      onSessionExpired: () => {},
+      transport: azureTransport as unknown as typeof fetch,
+    })
+    wrapRoutes(<CostsPage />)
+    const azureSelect = await screen.findByTestId('period-selector-input')
+    expect(azureSelect.tagName).toBe('SELECT')
+    expect(screen.getByTestId('region-filter')).toBeInTheDocument()
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  H5 — account-scope failure UX (AccountNotFound)
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — account-scope failure UX', () => {
+  it('AccountNotFound renders the professional message — the raw backend selector error is never exposed', async () => {
+    // A VALID selected Rackspace account (acct:708274) whose
+    // canonical cost request nonetheless fails with the
+    // backend's AccountNotFound wording.
+    setProviderAndSelection('RACKSPACE', 'acct:708274')
+    installRackspaceRoutes({
+      costsOverride: () =>
+        mockJson(404, {
+          error_code: 'AccountNotFound',
+          message: "no RACKSPACE account matches selection='acct:708274'",
+        }),
+    })
+
+    wrapRoutes(<CostsPage />)
+
+    // The professional, provider-aware message appears.
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(/The selected Rackspace Account is no longer available/).length,
+      ).toBeGreaterThan(0)
+    })
+
+    // The raw backend selector error never reaches the browser UI.
+    const text = document.body.textContent ?? ''
+    expect(text).not.toMatch(/no RACKSPACE account matches selection/)
+    expect(text).not.toMatch(/AccountNotFound/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  H6 — Rackspace dashboard readiness
+// ---------------------------------------------------------------------------
+
+describe('Phase 9D.1 — Rackspace dashboard readiness', () => {
+  it('the Rackspace dashboard exits Loading when the canonical APIs succeed', async () => {
+    setProviderAndSelection('RACKSPACE', 'all')
+    installRackspaceRoutes()
+
+    wrapRoutes(<DashboardPage />)
+
+    // The unified dashboard mounts for RACKSPACE.
+    await waitFor(() => {
+      expect(
+        document.querySelector('[data-testid="unified-dashboard"]')?.getAttribute('data-provider'),
+      ).toBe('RACKSPACE')
+    })
+
+    // The status badge leaves Loading/Refreshing once the
+    // canonical costs / resources / recommendations all succeed.
+    await waitFor(() => {
+      const badge = screen.getByTestId('dashboard-status-badge')
+      expect(badge.textContent ?? '').not.toMatch(/Loading|Refreshing/)
+    })
+
+    // The canonical data renders: spend, resources, recommendations.
+    expect(await screen.findByText('$2.48K')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByTestId('resources-total-kpi')).toHaveTextContent('12')
+    })
+    expect(screen.getByTestId('optimization-count')).toHaveTextContent('3')
   })
 })

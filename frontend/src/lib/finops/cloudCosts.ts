@@ -199,7 +199,10 @@ export function adaptCloudCostReport(
       })),
       source: (r.source === 'AZURE_COST_MANAGEMENT'
         ? 'AZURE_COST_MANAGEMENT'
-        : 'AWS_COST_EXPLORER') as 'AWS_COST_EXPLORER',
+        : r.source === 'RACKSPACE_BILLING'
+          ? 'RACKSPACE_BILLING'
+          : 'AWS_COST_EXPLORER') as
+        'AWS_COST_EXPLORER' | 'AZURE_COST_MANAGEMENT' | 'RACKSPACE_BILLING',
       // Hotfix #2 — propagate completeness semantics.
       status: r.status,
       currency_status: r.currency_status,
