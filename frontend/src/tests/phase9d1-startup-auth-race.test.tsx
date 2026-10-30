@@ -34,8 +34,9 @@
 // effect — so the first selectable request is authenticated.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from '../lib/router'
+import { AccountSelector } from '../components/AccountSelector'
 import { ThemeProvider } from '../lib/theme'
 import { AuthProvider, __authTestInternals, type AuthUser } from '../lib/auth'
 import { ProviderProvider, clearStoredProviderForTests } from '../lib/providerContext'
@@ -236,7 +237,7 @@ function seedValidSession(): void {
   })
 }
 
-function renderStack(Probe: () => null) {
+function renderStack(Probe: () => null, node?: JSX.Element) {
   return render(
     <MemoryRouter>
       <ThemeProvider>
@@ -244,6 +245,7 @@ function renderStack(Probe: () => null) {
           <ProviderProvider>
             <AccountProvider>
               <Probe />
+              {node}
             </AccountProvider>
           </ProviderProvider>
         </AuthProvider>
@@ -341,6 +343,52 @@ describe('Phase 9D.1 — authenticated account discovery on fresh startup', () =
     expect(probe.latest().names).toEqual(['Rackspace Production'])
     expect(probe.latest().error).toBeNull()
     expect(calls.some((c) => c.path.includes('selectable') && c.auth === 'NO')).toBe(false)
+    expect(__authTestInternals.readStoredSession()).not.toBeNull()
+  })
+
+  it('AWS: a persisted individual selection is NOT reset to the aggregate on fresh mount', async () => {
+    // Companion ordering defect closed with the race fix: on a full
+    // page load the selector's provider-change effect fired on mount
+    // and reset the sessionStorage-rehydrated selection to the
+    // aggregate.  Covered here with the REAL <AccountSelector />
+    // component — persisted valid selection must resolve to the
+    // account row's display name, not fall back to "All AWS …".
+    seedValidSession()
+    window.sessionStorage.setItem('cd.account.selection.v1', 'acct:123456789012')
+    const calls: RecordedCall[] = []
+    vi.stubGlobal('fetch', buildRecordingFetch(calls))
+    const probe = makeProbe()
+
+    renderStack(probe.Probe, <AccountSelector />)
+
+    await waitFor(() => {
+      expect(
+        selectableCalls(calls, '/api/aws/cloud-accounts/selectable').length,
+      ).toBeGreaterThan(0)
+    })
+    // NOTE: with the real <AccountSelector /> mounted, its own
+    // "refetch when empty" effect can legitimately co-issue a
+    // second selectable fetch alongside AccountProvider's forced
+    // first-mount fetch (pre-existing coalescing semantics,
+    // unchanged by this fix).  The contract that matters: EVERY
+    // selectable request — first included — carries Authorization.
+    const selCalls = selectableCalls(calls, '/api/aws/cloud-accounts/selectable')
+    expect(selCalls[0].auth).toBe('YES')
+    expect(selCalls.every((c) => c.auth === 'YES')).toBe(true)
+
+    await waitFor(() => {
+      expect(probe.latest().count).toBe(2)
+    })
+    const buttonText = await screen
+      .findByTestId('account-selector-button')
+      .then((el) => el.textContent ?? '')
+    expect(buttonText).toContain('AWS QA-Dev')
+    expect(buttonText).toContain('123456789012')
+    expect(buttonText).not.toContain('All AWS Accounts')
+    // The persisted choice itself must survive the mount.
+    expect(window.sessionStorage.getItem('cd.account.selection.v1')).toBe(
+      'acct:123456789012',
+    )
     expect(__authTestInternals.readStoredSession()).not.toBeNull()
   })
 

@@ -38,7 +38,23 @@ export function AccountSelector({ className = '' }: AccountSelectorProps) {
 
   // When the provider changes, drop any stale specific selection
   // so a stale AWS id never follows the user into an Azure page.
+  //
+  // The effect MUST NOT fire on the very first mount (same rule
+  // AccountContext applies to its own provider-change effect):
+  // a dependencies-only-fire-on-change effect still runs once on
+  // mount, and on a full page load the AccountContext `useState`
+  // initialiser has just rehydrated a persisted selection from
+  // sessionStorage — resetting it here clobbered every individual
+  // account choice back to the "All …" aggregate on every reload
+  // (observed in the Phase 9D.1 browser acceptance after the
+  // authenticated-startup fix: individual selection was reflected
+  // immediately but lost on the next hard navigation).
+  const isFirstProviderMountRef = useRef<boolean>(true)
   useEffect(() => {
+    if (isFirstProviderMountRef.current) {
+      isFirstProviderMountRef.current = false
+      return
+    }
     if (selection !== 'all') {
       setSelection('all')
     }
